@@ -1,4 +1,4 @@
-import { isOpenRouterUrl, OPENROUTER_ATTRIBUTION_HEADERS } from "../openrouter-attribution.js";
+import { OPENROUTER_ATTRIBUTION_HEADERS } from "../openrouter-attribution.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { resolveCompletionContinuation } from "../completion-continuation.js";
 import { createHash, randomBytes } from "node:crypto";
@@ -17,15 +17,17 @@ import {
 } from "node:fs/promises";
 import { createServer } from "node:net";
 import { constants as osConstants } from "node:os";
-import { Agent as HttpAgent, createServer as createHttpServer, request as requestHttp, type IncomingMessage } from "node:http";
-import { Agent as HttpsAgent, request as requestHttps } from "node:https";
-import { getCACertificates } from "node:tls";
-import { pipeline } from "node:stream/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { parseOpenCodeReasoningMode, type OpenCodeReasoningMode } from "./reasoning-mode.js";
 import { createOpenCodeCompanyObservability } from "./company-observability.js";
 import { startOpenCodePerformanceDiagnostics } from "./performance-diagnostics.js";
+import { startOpenCodeProviderProxy } from "./provider-proxy.js";
+import { createUsageCaptureSink, type UsageCaptureSink } from "./usage-capture.js";
+import {
+  PROVIDER_REQUEST_USAGE_KIND, usageCaptureEnabled,
+  type ProviderRequestUsageRecord,
+} from "../../contracts/usage-capture.js";
 import { PROVIDER_PERFORMANCE_ENV } from "../../contracts/provider-performance.js";
 import { annotateOmittedProviderText, parseOpenCodeSseFrames } from "./sse-frames.js";
 import { githubCredentialEnvironment } from "../../github-credential-environment.js";
@@ -221,6 +223,8 @@ interface OpenCodeRuntime {
   trace: ProviderTraceFileSink | null;
   sensitiveValues: readonly string[];
   performanceDiagnostics: Awaited<ReturnType<typeof startOpenCodePerformanceDiagnostics>> | null;
+  /** Provider proxy usage observations; null when PAPERCLIP_USAGE_CAPTURE disables capture. */
+  usageCapture: UsageCaptureSink | null;
   close(input?: {
     finalizeTrace?: boolean;
     reason?: string | null;
@@ -587,6 +591,9 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#dynamicToolHandler = input.dynamicToolHandler;
     this.#completionFeedback = input.completionFeedback;
     this.#now = input.now;
+    // Deliver provider usage records as they complete; the buffer below only
+    // covers records that race this wiring.
+    input.runtime.usageCapture?.onRecord((record) => this.#emitUsageRecord(record));
     this.#sendFullContext = input.snapshot === null && this.#conversationMode !== "prepared";
     this.#sourceSequence = input.snapshot?.lastSourceSequence ?? 0;
     this.#activeTurnId = input.snapshot?.activeTurnId ?? null;
@@ -1070,6 +1077,10 @@ class OpenCodeHarnessSession implements HarnessSession {
     // getting dropped as a late frame.
     for (const requestId of [...this.#pendingRuntimeRequests.keys()])
       this.#settlePendingRuntimeRequest(requestId);
+    // Last chance for in-flight proxy records before the stream closes. A
+    // record completing after this is dropped by the closed queue, like any
+    // other late frame.
+    for (const record of this.#runtime.usageCapture?.take() ?? []) this.#emitUsageRecord(record);
     this.#events.close();
     await Promise.all([this.#runtime.close(), this.#companyObservability?.close()]);
   }
@@ -2219,6 +2230,15 @@ class OpenCodeHarnessSession implements HarnessSession {
     );
   }
 
+  #emitUsageRecord(record: ProviderRequestUsageRecord): void {
+    // Usage records ride the existing diagnostic channel (payload.kind =
+    // "provider_request") rather than a new eventType: the PRP eventType
+    // enum is closed across schema versions. They carry no turn identity —
+    // a record can complete just after its turn went terminal — and
+    // `harness.diagnostic` is exempt from the terminal-turn gate.
+    this.#emit("harness.diagnostic", { kind: PROVIDER_REQUEST_USAGE_KIND, request: record });
+  }
+
   #emit(
     eventType: PrpEvent["eventType"],
     payload: Record<string, unknown>,
@@ -2257,6 +2277,9 @@ class OpenCodeHarnessSession implements HarnessSession {
       const performance = this.#runtime.performanceDiagnostics?.take(this.#performanceBoundaryMs);
       this.#performanceBoundaryMs = this.#now().getTime();
       if (performance) this.#emit("harness.diagnostic", performance, refs);
+      // Records that raced their delivery callback are flushed here so the
+      // last request of a turn cannot sit in the sink across turns.
+      for (const record of this.#runtime.usageCapture?.take() ?? []) this.#emitUsageRecord(record);
     }
     const sourceSeq = ++this.#sourceSequence;
     const event: PrpEvent = {
@@ -2282,111 +2305,6 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#transcript.push(structuredClone(event));
     this.#events.push(event);
   }
-}
-
-/** Retain the reusable gateway key in the runner; the harness gets a session-scoped capability. */
-async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: string, environment: NodeJS.ProcessEnv) {
-  const upstreamUrl = new URL(`${baseUrl.replace(/\/+$/, "")}/chat/completions`);
-  const token = randomBytes(32).toString("base64url");
-  // Agent-local settings keep one runtime's transport configuration out of other sessions.
-  const proxyEnv = {
-    HTTP_PROXY: environment.http_proxy ?? environment.HTTP_PROXY ?? environment.all_proxy ?? environment.ALL_PROXY,
-    HTTPS_PROXY: environment.https_proxy ?? environment.HTTPS_PROXY ?? environment.http_proxy ?? environment.HTTP_PROXY ?? environment.all_proxy ?? environment.ALL_PROXY,
-    NO_PROXY: environment.no_proxy ?? environment.NO_PROXY,
-  };
-  const ca = [...getCACertificates("default")];
-  if (environment.SSL_CERT_FILE) ca.push(await readFile(environment.SSL_CERT_FILE, "utf8"));
-  if (environment.SSL_CERT_DIR) {
-    for (const entry of await readdir(environment.SSL_CERT_DIR, { withFileTypes: true })) {
-      if (!entry.isDirectory()) {
-        const certificate = await readFile(join(environment.SSL_CERT_DIR, entry.name), "utf8");
-        if (certificate.includes("-----BEGIN CERTIFICATE-----")) ca.push(certificate);
-      }
-    }
-  }
-  const agent = upstreamUrl.protocol === "https:" ? new HttpsAgent({ proxyEnv, ca }) : new HttpAgent({ proxyEnv });
-  const controllers = new Set<AbortController>();
-  const server = createHttpServer((request, response) => {
-    const controller = new AbortController();
-    controllers.add(controller);
-    response.once("close", () => controller.abort());
-    void (async () => {
-      if (request.headers.authorization !== `Bearer ${token}`) {
-        response.writeHead(401).end();
-        return;
-      }
-      if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
-        response.writeHead(404).end();
-        return;
-      }
-      const chunks: Buffer[] = [];
-      let bytes = 0;
-      for await (const chunk of request) {
-        bytes += chunk.length;
-        if (bytes > 16 * 1024 * 1024) {
-          response.writeHead(413).end();
-          return;
-        }
-        chunks.push(Buffer.from(chunk));
-      }
-      const body = Buffer.concat(chunks);
-      let payload: Record<string, unknown>;
-      try { payload = JSON.parse(body.toString("utf8")); }
-      catch { response.writeHead(400).end(); return; }
-      if (!payload || typeof payload !== "object" || payload.model !== model ||
-        ["models", "route", "plugins", "transforms"].some(field => Object.hasOwn(payload, field))) {
-        response.writeHead(400).end();
-        return;
-      }
-      const upstream = await new Promise<IncomingMessage>((resolve, reject) => {
-        const outgoing = (upstreamUrl.protocol === "https:" ? requestHttps : requestHttp)(upstreamUrl, {
-          method: "POST",
-          agent,
-          headers: { ...(isOpenRouterUrl(baseUrl) ? OPENROUTER_ATTRIBUTION_HEADERS : {}), "Content-Type": "application/json", "Content-Length": body.length, ...(key ? { Authorization: `Bearer ${key}` } : {}) },
-          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(600_000)]),
-        }, resolve);
-        outgoing.once("error", reject);
-        outgoing.end(body);
-      });
-      // Never forward authentication to a redirect destination.
-      const status = upstream.statusCode ?? 502;
-      if (status >= 300 && status < 400) {
-        upstream.destroy();
-        throw new Error("Provider redirects are not supported");
-      }
-      const headers: Record<string, string> = {};
-      for (const name of ["content-type", "content-encoding", "cache-control", "retry-after"]) {
-        const value = upstream.headers[name];
-        if (typeof value === "string") headers[name] = value;
-      }
-      response.writeHead(status, headers);
-      await pipeline(upstream, response);
-    })().catch(() => {
-      if (!response.headersSent) response.writeHead(502).end("Provider request failed");
-      else response.destroy();
-    }).finally(() => controllers.delete(controller));
-  });
-  try {
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
-    });
-  } catch (error) { agent.destroy(); throw error; }
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    server.close();
-    agent.destroy();
-    throw new Error("Could not bind OpenCode provider proxy");
-  }
-  return {
-    baseURL: `http://127.0.0.1:${address.port}/v1`,
-    token,
-    close: async () => {
-      for (const controller of controllers) controller.abort();
-      agent.destroy();
-      await new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections(); });
-    },
-  };
 }
 
 async function startRuntime(input: {
@@ -2470,8 +2388,14 @@ async function startRuntime(input: {
     : modelProvider === "paperclip" && input.options.environment?.PAPERCLIP_AI_PROVIDER_URL
       ? { baseUrl: input.options.environment.PAPERCLIP_AI_PROVIDER_URL, key: input.options.environment.PAPERCLIP_AI_PROVIDER_KEY ?? "" }
       : null;
+  // Usage capture rides the provider proxy. It is on by default; the kill
+  // switch (PAPERCLIP_USAGE_CAPTURE=0/off) must leave the proxy path exactly
+  // as it was without capture, so the sink is not even constructed.
+  const usageCapture = usageCaptureEnabled(providerEnvironment)
+    ? createUsageCaptureSink({ app: "opencode", model: input.options.model })
+    : null;
   const providerProxy = providerRoute
-    ? await startOpenCodeProviderProxy(providerRoute.baseUrl, providerRoute.key, providerModelId, providerEnvironment).catch(async error => {
+    ? await startOpenCodeProviderProxy(providerRoute.baseUrl, providerRoute.key, providerModelId, providerEnvironment, usageCapture).catch(async error => {
         await bridge.close().catch(() => {});
         await removeIsolatedHome(isolatedHome).catch(() => {});
         throw error;
@@ -2693,6 +2617,7 @@ async function startRuntime(input: {
       trace: input.trace,
       sensitiveValues,
       performanceDiagnostics,
+      usageCapture,
       close: async (closeInput = {}) => {
         await providerProxy?.close();
         await bridge.close().catch(() => {});
