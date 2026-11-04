@@ -63,6 +63,7 @@ import { bindAntigravityCredentialTurn, bindAntigravityTransportRetirement, prep
 import { copyBackGrokAuth } from "@paperclipai/adapter-grok-local/server";
 
 import { inferOpenAiCompatibleBiller, type AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
+import { logger } from "../../middleware/logger.js";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { parseCodexCliVersion } from "./codex-runtime-compatibility.js";
 import { createNativeToolTrace, type NativeToolTrace } from "./native-tool-trace.js";
@@ -8916,7 +8917,16 @@ async function executePaperclipNativeSessionWithinScope(
       sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'provider_request'`,
     )).orderBy(heartbeatRunEvents.seq);
     for (const row of usageHistory) {
-      await usageRequestLogs.recordForRun(usageBinding, record(record(row.payload).prpEvent).payload);
+      // A transient insert failure must not abort the sweep or the run; the
+      // completion-time sweep re-covers anything missed here.
+      try {
+        await usageRequestLogs.recordForRun(usageBinding, record(record(row.payload).prpEvent).payload);
+      } catch (error) {
+        logger.warn(
+          { error, runId: usageBinding.runId },
+          "usage request log record failed without affecting run outcome",
+        );
+      }
     }
   }
   const producerOwnsUsage = usesNativeUsageDelivery({ runnerd: input.useRunnerd === true,
@@ -9043,7 +9053,15 @@ async function executePaperclipNativeSessionWithinScope(
         if (event.eventType === "harness.diagnostic") {
           await recordNativeProviderPerformanceSpans(trace, parseProviderPerformanceSpans(event.payload, Date.now()));
           // Non-usage diagnostic payloads are rejected by the parser; no record is written for them.
-          await usageRequestLogs.recordForRun(usageBinding, event.payload);
+          // Insert failures must not propagate into the event pump; the completion-time sweep re-covers them.
+          try {
+            await usageRequestLogs.recordForRun(usageBinding, event.payload);
+          } catch (error) {
+            logger.warn(
+              { error, runId: usageBinding.runId },
+              "usage request log record failed without affecting run outcome",
+            );
+          }
         }
         const textKind = !firstTokenRecorded ? observeDeliverableText(event) : null;
         if (textKind) {
