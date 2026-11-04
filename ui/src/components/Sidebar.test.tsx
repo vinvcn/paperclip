@@ -311,7 +311,9 @@ describe("Sidebar", () => {
     expect(container.querySelector('[data-testid="sidebar-projects"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="sidebar-agents"]')?.getAttribute("data-streamlined")).toBe("undefined");
     expect(container.textContent).toContain("Organization");
-    expect(labels).toEqual(expect.arrayContaining(["Org", "Connectors", "Timeline", "Costs", "Activity", "Settings"]));
+    expect(labels).toEqual(expect.arrayContaining(["Org", "Connectors", "Timeline", "Costs", "Usage", "Activity", "Settings"]));
+    // Usage sits directly after Costs in the Org group (usage-request-logs spec).
+    expect(labels.indexOf("Usage")).toBe(labels.indexOf("Costs") + 1);
     expect(labels).not.toContain("Audit");
     expect(labels).not.toContain("Projects");
     expect(container.querySelector('a[href="/agents"]')).toBeNull();

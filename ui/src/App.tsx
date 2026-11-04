@@ -94,6 +94,7 @@ const ApprovalDetail = lazy(() => import("./pages/ApprovalDetail").then((module)
 const CompanyActivity = lazy(() => import("./pages/audit/CompanyActivity").then((module) => ({ default: module.CompanyActivity })));
 const AuditHub = lazy(() => import("./pages/audit/AuditHub").then((module) => ({ default: module.AuditHub })));
 const Costs = lazy(() => import("./pages/Costs").then((module) => ({ default: module.Costs })));
+const Usage = lazy(() => import("./pages/Usage").then((module) => ({ default: module.Usage })));
 const WhatNeedsMe = lazy(() => import("./pages/WhatNeedsMe").then((module) => ({ default: module.WhatNeedsMe })));
 const DecisionQueuePage = lazy(() => import("./pages/DecisionQueuePage").then((module) => ({ default: module.DecisionQueuePage })));
 const BoardChat = lazy(() => import("./pages/BoardChat").then((module) => ({ default: module.BoardChat })));
@@ -379,6 +380,9 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       <Route path="activity/costs" element={<AuditHub section="costs" />} />
       <Route path="activity/budgets" element={<AuditHub section="budgets" />} />
       <Route path="activity/timeline" element={<AuditHub section="timeline" />} />
+      {/* Usage is a first-class surface in both shells: the streamlined Audit
+          hub has no request-log section for it to redirect into. */}
+      <Route path="usage" element={<Usage />} />
       {streamlinedUiEnabled ? (
         <>
           <Route path="audit" element={<AuditCompatibilityRedirect to="/activity" forceAgentMode />} />
