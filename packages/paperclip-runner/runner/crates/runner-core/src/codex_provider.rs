@@ -1449,6 +1449,10 @@ impl CodexProvider {
                             | "thread/status/changed"
                             | "turn/diff/updated"
                             | "turn/plan/updated"
+                            // A usage record can complete just after its turn
+                            // went terminal; it is data for the settled run,
+                            // never new work, and carries no turn identity.
+                            | "paperclip/providerRequestUsage"
                         );
                         if names_other_turn || !safe_tail_method {
                             return Err(LocalRunnerError::invalid(format!(
@@ -1458,7 +1462,9 @@ impl CodexProvider {
                         }
                         if matches!(
                             method.as_str(),
-                            "thread/tokenUsage/updated" | "paperclip/resumeUsageSnapshot"
+                            "thread/tokenUsage/updated"
+                                | "paperclip/resumeUsageSnapshot"
+                                | "paperclip/providerRequestUsage"
                         ) {
                             accounting.push((method, params));
                             continue;
