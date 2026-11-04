@@ -17,7 +17,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
 import { PROVIDER_REQUEST_USAGE_KIND, usageProviderAndBillerFromModel } from "../vendor/paperclip-runner/index.js";
-import { usageRequestLogService } from "./usage-request-logs.js";
+import { sweepRunUsageRequestLogEvents, usageRequestLogService } from "./usage-request-logs.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -207,5 +207,95 @@ describeEmbeddedPostgres("usage request log persistence", () => {
     expect(latest).toHaveLength(2);
     expect(latest[0]!.occurredAt.getTime()).toBeGreaterThan(latest[1]!.occurredAt.getTime());
     expect(await service.latest(otherCompanyId, 20)).toHaveLength(1);
+  });
+
+  describe("sweepRunUsageRequestLogEvents", () => {
+    let sweepRunId: string;
+
+    beforeAll(async () => {
+      sweepRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: sweepRunId,
+        companyId,
+        agentId,
+        issueId,
+        invocationSource: "on_demand",
+        status: "running",
+        contextSnapshot: {},
+      });
+    });
+
+    /** Commit a durable harness.diagnostic row the way the coordinator stores it. */
+    function durableDiagnostic(seq: number, requestId: string, overrides: Record<string, unknown> = {}) {
+      return {
+        companyId,
+        runId: sweepRunId,
+        agentId,
+        seq,
+        eventType: "harness.diagnostic",
+        stream: "system",
+        level: "info",
+        payload: {
+          prpEvent: {
+            eventType: "harness.diagnostic",
+            payload: usageEvent(requestId, overrides),
+          },
+        },
+      };
+    }
+
+    it("records committed durable provider_request diagnostics, skipping other events and runs", async () => {
+      const lateRequestId = randomUUID();
+      const nullUsageRequestId = randomUUID();
+      await db.insert(heartbeatRunEvents).values([
+        durableDiagnostic(1, lateRequestId),
+        // A null counter (NIM responses omit cache creation) must stay a
+        // null column, not invalidate the whole usage block.
+        durableDiagnostic(2, nullUsageRequestId, {
+          usage: { inputTokens: 26916, cachedInputTokens: 0, cacheWriteTokens: null, outputTokens: 521 },
+        }),
+        // Non-usage diagnostics and other runs must be ignored.
+        {
+          ...durableDiagnostic(3, randomUUID()),
+          payload: { prpEvent: { eventType: "harness.diagnostic", payload: { kind: "other" } } },
+        },
+        { ...durableDiagnostic(4, randomUUID()), runId, eventType: "turn.started", payload: { prpEvent: { eventType: "turn.started", payload: {} } } },
+      ]);
+      const binding = { companyId, runId: sweepRunId, agentId, issueId };
+      const recorded = await sweepRunUsageRequestLogEvents(db, binding);
+      expect(recorded).toBe(2);
+      const rows = await db.select().from(usageRequestLogs)
+        .where(and(eq(usageRequestLogs.companyId, companyId), eq(usageRequestLogs.runId, sweepRunId)));
+      expect(rows).toHaveLength(2);
+      const byRequestId = new Map(rows.map(row => [row.requestId, row]));
+      expect(byRequestId.get(lateRequestId)).toMatchObject({
+        inputTokens: 120,
+        cachedInputTokens: 80,
+        cacheWriteTokens: 5,
+        outputTokens: 30,
+      });
+      expect(byRequestId.get(nullUsageRequestId)).toMatchObject({
+        inputTokens: 26916,
+        cachedInputTokens: 0,
+        cacheWriteTokens: null,
+        outputTokens: 521,
+      });
+    });
+
+    it("replays without duplicating rows already recorded by the live consumer or a prior sweep", async () => {
+      const binding = { companyId, runId: sweepRunId, agentId, issueId };
+      const service = usageRequestLogService(db);
+      // The live consumer already recorded this request before the sweep.
+      const liveRequestId = randomUUID();
+      expect(await service.recordForRun(binding, usageEvent(liveRequestId))).toBe(true);
+      await db.insert(heartbeatRunEvents).values(durableDiagnostic(5, liveRequestId));
+      const recorded = await sweepRunUsageRequestLogEvents(db, binding);
+      expect(recorded).toBe(0);
+      // A second full sweep is also a no-op.
+      expect(await sweepRunUsageRequestLogEvents(db, binding)).toBe(0);
+      const rows = await db.select().from(usageRequestLogs)
+        .where(and(eq(usageRequestLogs.companyId, companyId), eq(usageRequestLogs.requestId, liveRequestId)));
+      expect(rows).toHaveLength(1);
+    });
   });
 });

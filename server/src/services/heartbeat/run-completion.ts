@@ -1,4 +1,5 @@
 import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
+import { sweepRunUsageRequestLogEvents } from "../usage-request-logs.js";
 import { nativeTaskSessionPublicationHandled } from "../native-runtime/native-task-session-publication.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
 import { measureRunPhase } from "../execution-preparation-timing.js";
@@ -548,6 +549,24 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           "provider trace finalization failed without affecting run outcome",
         );
       }
+    }
+
+    // The executor's live usage consumer stops once the run reaches a
+    // terminal status, so a provider_request record that committed to the
+    // durable log after that point is only persisted by replaying the log
+    // here. Idempotent per request id; must not affect the run outcome.
+    try {
+      await sweepRunUsageRequestLogEvents(db, {
+        companyId: run.companyId,
+        runId: run.id,
+        agentId: run.agentId,
+        issueId,
+      });
+    } catch (error) {
+      logger.warn(
+        { error, runId: run.id },
+        "usage request log sweep failed without affecting run outcome",
+      );
     }
 
     const status =
