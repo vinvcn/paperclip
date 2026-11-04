@@ -175,6 +175,7 @@ export const validatePrpEvent = runner.validatePrpEvent;
 export const parseProviderPerformanceSpans = runner.parseProviderPerformanceSpans;
 export const parseProviderRequestUsageRecord = runner.parseProviderRequestUsageRecord;
 export const usageCaptureEnabled = runner.usageCaptureEnabled;
+export const usageProviderAndBillerFromModel = runner.usageProviderAndBillerFromModel;
 export const PROVIDER_REQUEST_USAGE_KIND = runner.PROVIDER_REQUEST_USAGE_KIND;
 export const validatePrpStructuredRunResult =
   runner.validatePrpStructuredRunResult;

@@ -5863,6 +5863,19 @@ for (const segment of costSummaryPaths) {
   });
 }
 
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/usage/logs",
+  tags: ["usage"],
+  summary: "Usage request log: newest provider request rows",
+  description: "One row per provider HTTP call the runner proxy observed. Requires the same access as cost reads. P1 returns the newest rows with an optional limit; filters and pagination follow.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({ limit: z.coerce.number().int().min(1).max(500).optional() }),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
 registry.registerPath({ method: "post", path: "/api/companies/{companyId}/costs/retry-accounting", tags: ["costs"],
   summary: "Retry recording a run's saved cost data",
   description: "Requires company cost-read and board write access. Viewers and agents cannot retry. Replays accounting evidence only; never starts provider work or invents missing usage.",
