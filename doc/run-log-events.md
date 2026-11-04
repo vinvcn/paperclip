@@ -126,10 +126,14 @@ prompt, completion, or response body content. The native session executor
 materializes these events into the `usage_request_logs` table (idempotent per
 request ID); the event row itself stays in the run log. Capture is on by
 default and `PAPERCLIP_USAGE_CAPTURE=0` or `off` disables it entirely,
-leaving the proxy as an unobserved passthrough. In a runnerd topology the
-Rust event translation rebuilds payloads and drops this custom kind, so
-capture is effective on the in-process topology only.
-
+leaving the proxy as an unobserved passthrough. Capture works in both
+topologies: the in-process path hands the record to the native session
+executor directly, and in a runnerd topology the opencode-app-server-proxy
+forwards it as a `paperclip/providerRequestUsage` notification that the Rust
+event bridge (`provider_events.rs`) passes through losslessly as a
+`harness.diagnostic` event. Only traffic that never flows through the OpenCode
+provider proxy — including runner builds that predate this notification — goes
+unrecorded.
 
 `native.recovery.execution_reclaimed` records an atomic same-run recovery claim
 that restores a released task execution binding. The claim locks the task,

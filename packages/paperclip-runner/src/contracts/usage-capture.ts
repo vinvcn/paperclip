@@ -4,9 +4,13 @@
  * contract: content-free, bounded, and re-validated before any durable write.
  *
  * P1 boundary (ADR-0002): only traffic that flows through the OpenCode driver's
- * provider proxy is observed. In a runnerd topology the Rust event translation
- * rebuilds payloads and drops unknown fields, so these records only survive on
- * the in-process (native session executor) path where this deployment runs.
+ * provider proxy is observed. Records reach the server in both topologies: the
+ * in-process path hands them to the native session executor directly, and in a
+ * runnerd topology the opencode-app-server-proxy forwards them as a
+ * `paperclip/providerRequestUsage` notification that the Rust event bridge
+ * (runner-core provider_events.rs) passes through losslessly. Runner builds
+ * older than that notification, and traffic bypassing the proxy, are not
+ * captured.
  */
 
 /** Open-code compatible usage block fields the proxy understands (P1). */
