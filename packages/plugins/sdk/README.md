@@ -1440,12 +1440,11 @@ an earlier checkout status. Prepare and removal retries retain their IDs.
   local work. Providers may reject modes or strategies they do not support.
   `worktreeParentDir`, `provisionCommand`, `runtimeProvisionCommand` and
   `teardownCommand` carry the resolved project/issue workspace strategy when it
-  sets them. Each is optional and nullable: it is omitted when the strategy
-  leaves it empty, and Core sends none of them to providers that declare no
-  strategy support. Treat a missing field as "use the provider default". Core
-  stores the resolved fields with the workspace and replays them on retries,
-  reconciliation and restoration, so a provider sees the same checkout layout
-  and hooks on every attempt.
+  sets them. Each is optional and nullable: Core omits a field when the
+  strategy leaves it empty. Treat a missing field as "use the provider
+  default". Core stores the resolved fields with the workspace and replays them
+  on retries, reconciliation and restoration, so a provider sees the same
+  checkout layout and hooks on every attempt.
 - `inspect` reports tracked, untracked, and ignored/local-only changes, the
   current commit, merge state, and whether remote storage can recover it. Use
   `null` when a remote recovery or merge check is unknown.
