@@ -32,6 +32,7 @@ import {
 } from "./opencode-proxy-command.js";
 import { OpenCodeProxyUsageLedger } from "./opencode-proxy-usage.js";
 import { parseProviderPerformanceSpans, PROVIDER_PERFORMANCE_DIAGNOSTIC } from "../contracts/provider-performance.js";
+import { PROVIDER_REQUEST_USAGE_KIND } from "../contracts/usage-capture.js";
 
 type RpcMessage = {
   id?: string | number;
@@ -315,6 +316,16 @@ async function pumpEvents(opened: HarnessSession): Promise<void> {
         send({method: "paperclip/providerPerformance", params: {
           threadId: opened.ids().driverSessionId, turnId: event.turnId,
           spans: parseProviderPerformanceSpans(payload, Date.now()),
+        }});
+        continue;
+      }
+      // Usage records carry no turn identity — a record can complete just
+      // after its turn went terminal — so turnId stays undefined here and the
+      // Rust side must never gate this notification on turn state.
+      if (payload.kind === PROVIDER_REQUEST_USAGE_KIND) {
+        send({method: "paperclip/providerRequestUsage", params: {
+          threadId: opened.ids().driverSessionId, turnId: event.turnId,
+          request: payload.request,
         }});
         continue;
       }
