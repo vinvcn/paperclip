@@ -113,6 +113,23 @@ no credentials, account identity, file path, or credential fingerprint. The
 consumer can use the event to read the updated credentials through its existing
 private credential channel. This run-log event stays in the instance database.
 
+## Provider request usage records
+
+The OpenCode provider proxy observes each accepted chat-completions exchange and
+records it as a `harness.diagnostic` event whose payload carries
+`kind: "provider_request"` and a bounded `request` object: runner-generated
+request ID, app, provider, biller, model, start/end epoch milliseconds,
+time-to-first-byte, upstream HTTP status (null when the upstream never
+answered), the upstream request ID when present, and the usage token counts
+when the upstream response already carried a usage block. It contains no
+prompt, completion, or response body content. The native session executor
+materializes these events into the `usage_request_logs` table (idempotent per
+request ID); the event row itself stays in the run log. Capture is on by
+default and `PAPERCLIP_USAGE_CAPTURE=0` or `off` disables it entirely,
+leaving the proxy as an unobserved passthrough. In a runnerd topology the
+Rust event translation rebuilds payloads and drops this custom kind, so
+capture is effective on the in-process topology only.
+
 
 `native.recovery.execution_reclaimed` records an atomic same-run recovery claim
 that restores a released task execution binding. The claim locks the task,
