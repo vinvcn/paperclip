@@ -720,6 +720,25 @@ pub fn normalize_codex_notification(method: &str, params: &Value) -> Vec<Normali
                 );
             }
         }
+        "paperclip/providerRequestUsage" => {
+            // Per-request usage records ride the diagnostic channel as
+            // { kind: "provider_request", request }. The request object is
+            // forwarded as a sanitized, bounded value instead of a struct:
+            // the field contract lives in the TypeScript driver and is
+            // re-validated field-by-field by the server before any durable
+            // write, so mirroring it here would silently drop future fields.
+            if let Some(request) = params.get("request").filter(|request| request.is_object()) {
+                push(
+                    &mut events,
+                    "harness.diagnostic",
+                    EventPriority::P1,
+                    json!({
+                        "kind": "provider_request",
+                        "request": bounded_sanitized_value(&sanitize_value(request), MAX_TEXT_CHARS),
+                    }),
+                );
+            }
+        }
         "thread/compacted" => push(
             &mut events,
             "context.compacted",
@@ -1528,6 +1547,59 @@ mod tests {
             ]})
         )
         .is_empty());
+    }
+
+    #[test]
+    fn provider_request_usage_notifications_forward_the_record_losslessly() {
+        let request = json!({
+            "requestId":"req-1","app":"paperclip","provider":"openrouter","biller":"openrouter",
+            "model":"openrouter/z-ai/glm-4.6","startedAtMs":1000,"endedAtMs":1250,
+            "ttftMs":180,"httpStatus":200,"providerRequestId":"upstream-9",
+            "usage":{"inputTokens":10,"cachedInputTokens":2,"cacheWriteTokens":0,"outputTokens":30},
+        });
+        let events = normalize_codex_notification(
+            "paperclip/providerRequestUsage",
+            &json!({"threadId":"root","turnId":"turn-1","request":request}),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "harness.diagnostic");
+        assert_eq!(events[0].priority, EventPriority::P1);
+        assert_eq!(events[0].payload["kind"], "provider_request");
+        assert_eq!(events[0].payload["request"], request);
+
+        // Hostile or oversized content is bounded before it rides the PRP
+        // channel; well-formed content-free records are untouched.
+        let hostile = normalize_codex_notification(
+            "paperclip/providerRequestUsage",
+            &json!({"threadId":"root","request":{
+                "requestId":"req-2","app":"paperclip","provider":"openrouter","biller":"openrouter",
+                "model":"openrouter/z-ai/glm-4.6","startedAtMs":0,"endedAtMs":1,
+                "ttftMs":null,"httpStatus":null,"providerRequestId":null,"usage":null,
+                "note":"x".repeat(5_000),"apiKey":"sk-secret",
+            }}),
+        );
+        assert_eq!(hostile.len(), 1);
+        let serialized = hostile[0].payload.to_string();
+        assert!(!serialized.contains("sk-secret"));
+        assert!(hostile[0].payload["request"]["note"]
+            .as_str()
+            .unwrap()
+            .ends_with("…[truncated]"));
+        assert_eq!(hostile[0].payload["request"]["usage"], Value::Null);
+        assert_eq!(
+            hostile[0].payload["request"]["model"],
+            "openrouter/z-ai/glm-4.6"
+        );
+
+        // A malformed request can never become a durable usage event.
+        assert!(normalize_codex_notification(
+            "paperclip/providerRequestUsage",
+            &json!({"threadId":"root","request":"junk"})
+        )
+        .is_empty());
+        assert!(
+            normalize_codex_notification("paperclip/providerRequestUsage", &json!({})).is_empty()
+        );
     }
 
     #[test]

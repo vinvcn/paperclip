@@ -1552,6 +1552,9 @@ fn sensitive_key(key: &str, value: &Value) -> bool {
             | "cachewritetokens"
             // The qualified ACPX sidecar uses these numeric billing aliases.
             // Strings under the same names remain credentials, not counters.
+            // A null is the driver's "provider did not report this counter"
+            // signal (e.g. cacheWriteTokens when the response omits the
+            // field), not a credential; mirror the tokenBudget precedent.
             | "cachedreadtokens"
             | "cachedwritetokens"
             | "thoughttokens"
@@ -1560,7 +1563,7 @@ fn sensitive_key(key: &str, value: &Value) -> bool {
             | "posttokens"
             | "tokensused"
     ) {
-        return !value.is_number();
+        return !(value.is_number() || value.is_null());
     }
     let credential_name = [
         "value",
@@ -3057,6 +3060,23 @@ mod tests {
             sanitize_value(&json!({"inputTokens": "plain-provider-secret"})),
             json!({"inputTokens": "[REDACTED]"})
         );
+        // A null is the driver's "provider did not report this counter"
+        // signal, not a credential: it must survive durable persistence.
+        for key in [
+            "inputTokens",
+            "outputTokens",
+            "cacheReadTokens",
+            "cacheWriteTokens",
+            "cachedReadTokens",
+            "cachedWriteTokens",
+            "thoughtTokens",
+            "totalTokens",
+        ] {
+            assert_eq!(
+                sanitize_value(&json!({key: Value::Null})),
+                json!({key: Value::Null})
+            );
+        }
         for key in [
             "cachedReadTokens",
             "cachedWriteTokens",

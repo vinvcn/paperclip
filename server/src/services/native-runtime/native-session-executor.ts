@@ -63,6 +63,7 @@ import { bindAntigravityCredentialTurn, bindAntigravityTransportRetirement, prep
 import { copyBackGrokAuth } from "@paperclipai/adapter-grok-local/server";
 
 import { inferOpenAiCompatibleBiller, type AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
+import { logger } from "../../middleware/logger.js";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { parseCodexCliVersion } from "./codex-runtime-compatibility.js";
 import { createNativeToolTrace, type NativeToolTrace } from "./native-tool-trace.js";
@@ -239,6 +240,7 @@ import {
 } from "./status-arbiter.js";
 import { conflict, HttpError } from "../../errors.js";
 import { redactSensitiveText } from "../../redaction.js";
+import { usageRequestLogService } from "../usage-request-logs.js";
 import { resolvePaperclipRunnerBinary, resolveRemotePaperclipRunnerBinary } from "./native-codex-runner.js";
 import {
   createNativeRunTrace,
@@ -8897,6 +8899,36 @@ async function executePaperclipNativeSessionWithinScope(
     for (const row of history) turnAccounting.observe(record(row.payload).prpEvent as PrpEvent);
   }
   let fallbackUsageRecorder: ReturnType<typeof createRunUsageRecorder> | undefined;
+  // Provider proxy usage records (payload.kind = "provider_request") ride the
+  // diagnostic event channel. Re-materialize the ones already in the durable
+  // event log so a resumed run does not lose its request log, then keep
+  // recording live events below. Insertion is idempotent per request id.
+  const usageRequestLogs = usageRequestLogService(input.db);
+  const usageBinding = {
+    companyId: input.execution.binding.companyId,
+    runId: input.execution.binding.runId,
+    agentId: input.execution.binding.agentId,
+    issueId: input.execution.binding.issueId,
+  };
+  if (input.execution.provider.kind === "opencode") {
+    const usageHistory = await input.db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.companyId, usageBinding.companyId), eq(heartbeatRunEvents.runId, usageBinding.runId),
+      eq(heartbeatRunEvents.eventType, "harness.diagnostic"),
+      sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'provider_request'`,
+    )).orderBy(heartbeatRunEvents.seq);
+    for (const row of usageHistory) {
+      // A transient insert failure must not abort the sweep or the run; the
+      // completion-time sweep re-covers anything missed here.
+      try {
+        await usageRequestLogs.recordForRun(usageBinding, record(record(row.payload).prpEvent).payload);
+      } catch (error) {
+        logger.warn(
+          { error, runId: usageBinding.runId },
+          "usage request log record failed without affecting run outcome",
+        );
+      }
+    }
+  }
   const producerOwnsUsage = usesNativeUsageDelivery({ runnerd: input.useRunnerd === true,
     remote: input.runnerExecutionTarget?.kind === "remote", provider: input.execution.provider });
   const producerUsage = producerOwnsUsage ? await createNativeUsageDelivery(input.db, {
@@ -9020,6 +9052,16 @@ async function executePaperclipNativeSessionWithinScope(
         }
         if (event.eventType === "harness.diagnostic") {
           await recordNativeProviderPerformanceSpans(trace, parseProviderPerformanceSpans(event.payload, Date.now()));
+          // Non-usage diagnostic payloads are rejected by the parser; no record is written for them.
+          // Insert failures must not propagate into the event pump; the completion-time sweep re-covers them.
+          try {
+            await usageRequestLogs.recordForRun(usageBinding, event.payload);
+          } catch (error) {
+            logger.warn(
+              { error, runId: usageBinding.runId },
+              "usage request log record failed without affecting run outcome",
+            );
+          }
         }
         const textKind = !firstTokenRecorded ? observeDeliverableText(event) : null;
         if (textKind) {

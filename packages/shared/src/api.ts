@@ -57,6 +57,7 @@ export const API = {
   secretProviderConfigs: `${API_PREFIX}/secret-provider-configs`,
   secretProviderConfigDiscoveryPreview: `${API_PREFIX}/companies/:companyId/secret-provider-configs/discovery/preview`,
   costs: `${API_PREFIX}/costs`,
+  usage: `${API_PREFIX}/companies/:companyId/usage`,
   activity: `${API_PREFIX}/activity`,
   dashboard: `${API_PREFIX}/dashboard`,
   sidebarBadges: `${API_PREFIX}/sidebar-badges`,
