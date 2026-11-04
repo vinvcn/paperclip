@@ -16,7 +16,7 @@ Hosted browser dispatch reserves a separate scoped hold, rechecks authority at
 the paid POST, and retains unknown charges until terminal accounting. The parent
 run reservation does not authorize or replace this separate browser cost cap.
 
-Review date: 2026-10-12. Source commit: `f981fa3cc10cb8663a87dec60345fbff46d54d0a`.
+Review date: 2026-11-05. Source commit: `2730e4a0417f96cc86270580d79ba1a435a73351`.
 
 This is a source-reviewed baseline of representative operations and known gaps.
 Each capability needs operation-level review before its entire scope can be
@@ -38,6 +38,7 @@ API: `present` — representative operation IDs:
 
 - `GET /api/companies/{companyId}/costs/summary`.
 - `GET /api/companies/{companyId}/costs/by-agent`.
+- `GET /api/companies/{companyId}/usage/logs`.
 
 Agent access: `available` — REST / native call_api / CLI cost.
 
