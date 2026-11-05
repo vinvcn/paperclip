@@ -7,10 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Usage } from "./Usage";
 import { ApiError } from "../api/client";
 import { formatDateTime } from "../lib/utils";
-import type { UsageRequestLogRow } from "@paperclipai/shared";
+import type { UsageRequestLogRow, UsageSummary } from "@paperclipai/shared";
 
 const usageLogsMock = vi.hoisted(() => vi.fn());
-vi.mock("../api/usage", () => ({ usageApi: { logs: usageLogsMock } }));
+const usageSummaryMock = vi.hoisted(() => vi.fn());
+vi.mock("../api/usage", () => ({ usageApi: { logs: usageLogsMock, summary: usageSummaryMock } }));
 
 const setBreadcrumbsMock = vi.hoisted(() => vi.fn());
 
@@ -56,6 +57,21 @@ function row(overrides: Partial<UsageRequestLogRow> = {}): UsageRequestLogRow {
   };
 }
 
+function summary(overrides: Partial<UsageSummary> = {}): UsageSummary {
+  return {
+    companyId: "company-1",
+    totalRequests: 12,
+    freshInputTokens: 1500,
+    cachedInputTokens: 500,
+    cacheWriteTokens: 200,
+    outputTokens: 800,
+    tokensProcessed: 3000,
+    cacheHitRate: 0.25,
+    unpricedCount: 12,
+    ...overrides,
+  };
+}
+
 describe("Usage page", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot> | null = null;
@@ -73,12 +89,20 @@ describe("Usage page", () => {
     return queryClient;
   }
 
+  /** Read one summary metric by its label, as the cards present it. */
+  function metricValue(label: string): string | null {
+    const dt = [...container.querySelectorAll("dt")].find((el) => el.textContent === label);
+    return dt?.nextElementSibling?.textContent ?? null;
+  }
+
   beforeEach(() => {
     container = document.createElement("div");
     document.body.appendChild(container);
     companyState.selectedCompanyId = "company-1";
     usageLogsMock.mockReset();
     usageLogsMock.mockResolvedValue([]);
+    usageSummaryMock.mockReset();
+    usageSummaryMock.mockResolvedValue(summary());
   });
 
   afterEach(() => {
@@ -130,6 +154,45 @@ describe("Usage page", () => {
     expect(second.textContent).toContain("claude-sonnet-4-5");
     expect(second.textContent).toContain("502");
     expect(second.textContent).toContain("12.4s");
+  });
+
+  it("fetches the usage summary endpoint for the selected company", async () => {
+    renderPage();
+    await act(async () => {
+      await vi.waitFor(() => expect(usageSummaryMock).toHaveBeenCalledExactlyOnceWith("company-1"));
+    });
+  });
+
+  it("renders the summary cards with formatted totals inside one bordered block", async () => {
+    usageLogsMock.mockResolvedValue([row()]);
+    renderPage();
+    await act(async () => {
+      await vi.waitFor(() => expect(metricValue("Total requests")).toBe("12"));
+    });
+    // Headline row: Total Cost is a placeholder until cost attribution lands.
+    expect(metricValue("Total cost")).toBe("—");
+    expect(metricValue("Total requests")).toBe("12");
+    expect(metricValue("Tokens processed")).toBe("3.0k");
+    expect(metricValue("Cache hit rate")).toBe("25.0%");
+    // Secondary row.
+    expect(metricValue("Fresh input")).toBe("1.5k");
+    expect(metricValue("Output")).toBe("800");
+    expect(metricValue("Cache write")).toBe("200");
+    expect(metricValue("Cache hit")).toBe("500");
+    // Both rows live in one bordered block (4+4), per the approved mock.
+    const blocks = [...container.querySelectorAll("dl")];
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]!.querySelectorAll("dt")).toHaveLength(4);
+    expect(blocks[1]!.querySelectorAll("dt")).toHaveLength(4);
+  });
+
+  it("renders the cache hit rate as an em dash when the denominator is zero", async () => {
+    usageSummaryMock.mockResolvedValue(summary({ cacheHitRate: null, freshInputTokens: 0, cachedInputTokens: 0 }));
+    renderPage();
+    await act(async () => {
+      await vi.waitFor(() => expect(metricValue("Cache hit rate")).not.toBeNull());
+    });
+    expect(metricValue("Cache hit rate")).toBe("—");
   });
 
   it("renders missing status and duration as em dashes", async () => {
