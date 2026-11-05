@@ -83,10 +83,17 @@ export function usageRequestRetentionService(db: Db, options: UsageRequestRetent
         return totalDeleted;
       }
     }
-    logger.warn(
-      { totalDeleted, chunkSize, maxChunks },
-      "Usage request log retention hit its chunk cap; the scheduler re-drives the remainder",
-    );
+    // Reaching the cap is not by itself evidence of a remainder: a backlog
+    // that divides `maxChunks * chunkSize` exactly drains to nothing on this
+    // very sweep. Warn only when an expired row actually survived — its
+    // deadline is still in the past — for the scheduler to re-drive.
+    const deadline = await nextRetentionDeadline();
+    if (deadline !== null && deadline < now.getTime()) {
+      logger.warn(
+        { totalDeleted, chunkSize, maxChunks },
+        "Usage request log retention hit its chunk cap; the scheduler re-drives the remainder",
+      );
+    }
     return totalDeleted;
   }
 

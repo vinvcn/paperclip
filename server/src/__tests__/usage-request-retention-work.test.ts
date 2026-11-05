@@ -7,9 +7,17 @@ import { registerUsageRequestRetentionWork } from "../services/usage-request-ret
 const state = vi.hoisted(() => ({
   cleanup: vi.fn(async () => 0),
   next: vi.fn<() => Promise<number | null>>(),
+  probe: undefined as undefined | (() => string),
+  unregister: vi.fn(),
 }));
 vi.mock("../services/usage-request-retention.js", () => ({
   usageRequestRetentionService: () => ({ cleanupExpired: state.cleanup, nextRetentionDeadline: state.next }),
+}));
+vi.mock("../services/idle-local-work.js", () => ({
+  registerIdleLocalWorkProbe: (probe: () => string) => {
+    state.probe = probe;
+    return state.unregister;
+  },
 }));
 let coordinator: ReturnType<typeof createDeliveryWorkCoordinator> | undefined;
 afterEach(async () => {
@@ -18,14 +26,16 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 
-it("sweeps on its deadline, stays quiet between obligations, and re-probes after each run", async () => {
+it("sweeps on its deadline, stays quiet between obligations, and discharges the sleep blocker", async () => {
   vi.useFakeTimers();
   const owner = installDatabaseWorkSignals({ execute: vi.fn(async () => []) });
   const onError = vi.fn();
   coordinator = createDeliveryWorkCoordinator({ owner, canRun: () => true, onError });
   state.next.mockResolvedValue(null);
   const worker = registerUsageRequestRetentionWork(owner as unknown as Db, coordinator, () => true);
+  expect(state.probe!()).toBe("unknown");
   await worker.ready;
+  expect(state.probe!()).toBe("none");
   expect(coordinator.nextWakeAt()).toBeNull();
   const initial = state.cleanup.mock.calls.length;
   // With no deadline the worker stays quiet; only the deadline probe ran once.
@@ -38,6 +48,7 @@ it("sweeps on its deadline, stays quiet between obligations, and re-probes after
   state.next.mockResolvedValue(deadline);
   worker.wake();
   await vi.advanceTimersByTimeAsync(0);
+  expect(state.probe!()).toBe("present");
   expect(coordinator.nextWakeAt()).toBe(deadline);
   const scheduled = state.cleanup.mock.calls.length;
   await vi.advanceTimersByTimeAsync(59_999);
@@ -45,7 +56,9 @@ it("sweeps on its deadline, stays quiet between obligations, and re-probes after
   state.next.mockResolvedValue(null);
   await vi.advanceTimersByTimeAsync(1);
   expect(state.cleanup).toHaveBeenCalledTimes(scheduled + 1);
+  expect(state.probe!()).toBe("none");
   expect(coordinator.nextWakeAt()).toBeNull();
   await worker.stop();
+  expect(state.unregister).toHaveBeenCalledOnce();
   expect(onError).not.toHaveBeenCalled();
 });

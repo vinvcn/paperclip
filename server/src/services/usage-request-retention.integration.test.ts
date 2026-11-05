@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -14,6 +14,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
 import { PROVIDER_REQUEST_USAGE_KIND, usageProviderAndBillerFromModel } from "../vendor/paperclip-runner/index.js";
+import { logger } from "../middleware/logger.js";
 import { DELIVERY_QUEUES, subscribeDeliveryWork } from "./delivery-work-notifications.js";
 import { usageRequestLogService } from "./usage-request-logs.js";
 import {
@@ -202,11 +203,42 @@ describeEmbeddedPostgres("usage request log retention sweep", () => {
     })));
 
     // Two chunks of 10 run; the remainder stays pending with a past deadline.
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
     expect(await retention.cleanupExpired(now)).toBe(20);
+    expect(warn).toHaveBeenCalledTimes(1);
     expect(await retention.nextRetentionDeadline()).toBeLessThanOrEqual(Date.now());
+    warn.mockRestore();
 
     expect(await retention.cleanupExpired(now)).toBe(5);
     expect(await retention.nextRetentionDeadline()).toBeNull();
+  });
+
+  it("does not report a chunk cap when the backlog divides the cap exactly", async () => {
+    // 20 rows over two chunks of 10: the cap is reached but the sweep drains
+    // every expired row, so the "hit its chunk cap" warning would be a false
+    // alarm — nothing is left for the scheduler to re-drive.
+    const retention = usageRequestRetentionService(db, { chunkSize: 10, maxChunks: 2 });
+    const now = new Date();
+    const expiredAt = new Date(now.getTime() - 91 * 86_400_000);
+    await db.insert(usageRequestLogs).values(Array.from({ length: 20 }, () => ({
+      companyId,
+      runId,
+      app: "opencode",
+      provider: "openrouter",
+      biller: "openrouter",
+      model: "openai/gpt-5.2",
+      requestId: randomUUID(),
+      occurredAt: expiredAt,
+    })));
+
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    try {
+      expect(await retention.cleanupExpired(now)).toBe(20);
+      expect(await retention.nextRetentionDeadline()).toBeNull();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("never touches cost_events, not even receipts older than any window", async () => {
