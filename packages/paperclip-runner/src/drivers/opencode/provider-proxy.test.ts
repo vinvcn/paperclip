@@ -58,6 +58,11 @@ async function post(
 }
 
 const chatBody = JSON.stringify({ model: "openai/gpt-5.2", messages: [{ role: "user", content: "hi" }] });
+const streamChatBody = JSON.stringify({ model: "openai/gpt-5.2", messages: [{ role: "user", content: "hi" }], stream: true });
+
+function sseResponse(frames: string[]) {
+  return frames.join("");
+}
 
 beforeEach(() => {
   upstreamRequests = [];
@@ -154,6 +159,117 @@ describe("OpenCode provider proxy usage observation", () => {
       const [record] = capture.take();
       expect(record.httpStatus).toBe(200);
       expect(record.usage).toBeNull();
+    } finally {
+      await completeProxy(proxy);
+    }
+  });
+
+  it("injects stream_options.include_usage into streamed requests and reads the final usage frame", async () => {
+    await useUpstream((_req, res, body) => {
+      const payload = JSON.parse(body) as { stream_options?: { include_usage?: boolean } };
+      // The proxy must ask the upstream for usage even though the client did not.
+      expect(payload.stream_options?.include_usage).toBe(true);
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.end(sseResponse([
+        'data: {"id":"c1","choices":[{"delta":{"content":"abc"}}]}\n\n',
+        'data: {"id":"c1","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}\n\n',
+        "data: [DONE]\n\n",
+      ]));
+    });
+    const capture = sink();
+    const proxy = await proxyFor(capture);
+    try {
+      const response = await post(proxy, streamChatBody);
+      expect(response.status).toBe(200);
+      await response.text();
+      const [record] = capture.take();
+      expect(record.httpStatus).toBe(200);
+      expect(record.usage).toEqual({ inputTokens: 7, cachedInputTokens: null, cacheWriteTokens: null, outputTokens: 3 });
+      expect(record.usageMissing).toBe(false);
+    } finally {
+      await completeProxy(proxy);
+    }
+  });
+
+  it("retries once without the injected include_usage when the upstream rejects it, succeeding with usage_missing", async () => {
+    await useUpstream((_req, res, body) => {
+      const payload = JSON.parse(body) as { stream_options?: { include_usage?: boolean } };
+      if (payload.stream_options?.include_usage) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "stream_options.include_usage is not supported" } }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.end(sseResponse([
+        'data: {"id":"c1","choices":[{"delta":{"content":"abc"}}]}\n\n',
+        "data: [DONE]\n\n",
+      ]));
+    });
+    const capture = sink();
+    const proxy = await proxyFor(capture);
+    try {
+      const response = await post(proxy, streamChatBody);
+      // The rejected first attempt is invisible to the client; the retry answers.
+      expect(response.status).toBe(200);
+      await response.text();
+      expect(upstreamRequests).toHaveLength(2);
+      expect(JSON.parse(upstreamRequests[0]!.body).stream_options?.include_usage).toBe(true);
+      // The retry forwards the client's original body untouched.
+      expect(upstreamRequests[1]!.body).toBe(streamChatBody);
+      const records = capture.take();
+      expect(records).toHaveLength(1);
+      const record = records[0]!;
+      expect(record.httpStatus).toBe(200);
+      expect(record.usage).toBeNull();
+      expect(record.usageMissing).toBe(true);
+    } finally {
+      await completeProxy(proxy);
+    }
+  });
+
+  it("keeps a client-provided stream_options untouched and does not retry when the upstream rejects it", async () => {
+    const clientUsageBody = JSON.stringify({
+      model: "openai/gpt-5.2",
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+    await useUpstream((_req, res) => {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "nope" } }));
+    });
+    const capture = sink();
+    const proxy = await proxyFor(capture);
+    try {
+      const response = await post(proxy, clientUsageBody);
+      expect(response.status).toBe(400);
+      await response.text();
+      expect(upstreamRequests).toHaveLength(1);
+      expect(upstreamRequests[0]!.body).toBe(clientUsageBody);
+      const [record] = capture.take();
+      expect(record.httpStatus).toBe(400);
+      expect(record.usageMissing).toBe(false);
+    } finally {
+      await completeProxy(proxy);
+    }
+  });
+
+  it("leaves non-streaming request bodies free of stream_options", async () => {
+    await useUpstream((_req, res, body) => {
+      const payload = JSON.parse(body) as { stream_options?: unknown };
+      expect(payload.stream_options).toBeUndefined();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ choices: [], usage: { prompt_tokens: 5, completion_tokens: 1 } }));
+    });
+    const capture = sink();
+    const proxy = await proxyFor(capture);
+    try {
+      const response = await post(proxy, chatBody);
+      expect(response.status).toBe(200);
+      await response.text();
+      const [record] = capture.take();
+      expect(record.usage).toEqual({ inputTokens: 5, cachedInputTokens: null, cacheWriteTokens: null, outputTokens: 1 });
+      expect(record.usageMissing).toBe(false);
     } finally {
       await completeProxy(proxy);
     }
@@ -268,6 +384,13 @@ describe("OpenCode provider proxy usage observation", () => {
       const response = await post(proxy, chatBody);
       expect(response.status).toBe(200);
       expect(await response.text()).toBe(payload);
+      // A stream:true body is forwarded untouched too: with the kill switch
+      // off no stream_options are injected, so the upstream sees the exact
+      // request bytes the client sent.
+      const streamResponse = await post(proxy, streamChatBody);
+      expect(streamResponse.status).toBe(200);
+      expect(await streamResponse.text()).toBe(payload);
+      expect(upstreamRequests.map(({ body }) => body)).toEqual([chatBody, streamChatBody]);
     } finally {
       await completeProxy(proxy);
     }

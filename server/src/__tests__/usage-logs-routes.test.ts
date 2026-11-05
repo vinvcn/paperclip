@@ -5,12 +5,25 @@ import type { Db } from "@paperclipai/db";
 import { usageRoutes } from "../routes/usage.js";
 import { errorHandler } from "../middleware/error-handler.js";
 
-const mocks = vi.hoisted(() => ({ latest: vi.fn(), decide: vi.fn() }));
-vi.mock("../services/usage-request-logs.js", () => ({ usageRequestLogService: () => ({ latest: mocks.latest }) }));
+const mocks = vi.hoisted(() => ({ latest: vi.fn(), summary: vi.fn(), decide: vi.fn() }));
+vi.mock("../services/usage-request-logs.js", () => ({ usageRequestLogService: () => ({ latest: mocks.latest, summary: mocks.summary }) }));
 vi.mock("../services/index.js", () => ({ accessService: () => ({ decide: mocks.decide }) }));
 
 const companyId = "11111111-1111-4111-8111-111111111111";
-const path = `/api/companies/${companyId}/usage/logs`;
+const logsPath = `/api/companies/${companyId}/usage/logs`;
+const summaryPath = `/api/companies/${companyId}/usage/summary`;
+
+const summaryFixture = {
+  companyId,
+  totalRequests: 12,
+  freshInputTokens: 1500,
+  cachedInputTokens: 500,
+  cacheWriteTokens: 200,
+  outputTokens: 800,
+  tokensProcessed: 3000,
+  cacheHitRate: 0.25,
+  unpricedCount: 12,
+};
 
 function app(type: "board" | "agent" = "board", role = "member") {
   const instance = express();
@@ -30,13 +43,14 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.decide.mockResolvedValue({ allowed: true });
   mocks.latest.mockResolvedValue([]);
+  mocks.summary.mockResolvedValue(summaryFixture);
 });
 
 describe("usage request log route authorization", () => {
   it("returns the latest rows for board readers with the cost-scope read decision", async () => {
     const rows = [{ requestId: "r1" }];
     mocks.latest.mockResolvedValue(rows);
-    const response = await request(app()).get(`${path}?limit=5`);
+    const response = await request(app()).get(`${logsPath}?limit=5`);
     expect(response.status).toBe(200);
     expect(response.body).toEqual(rows);
     expect(mocks.latest).toHaveBeenCalledExactlyOnceWith(companyId, 5);
@@ -47,19 +61,52 @@ describe("usage request log route authorization", () => {
   });
 
   it("defaults the limit to 20 and rejects invalid limits before reading rows", async () => {
-    expect((await request(app()).get(path)).status).toBe(200);
+    expect((await request(app()).get(logsPath)).status).toBe(200);
     expect(mocks.latest).toHaveBeenLastCalledWith(companyId, 20);
     for (const limit of ["0", "-1", "501", "abc", "2.5"]) {
-      expect((await request(app()).get(`${path}?limit=${limit}`)).status).toBe(400);
+      expect((await request(app()).get(`${logsPath}?limit=${limit}`)).status).toBe(400);
     }
     expect(mocks.latest).toHaveBeenCalledTimes(1);
   });
 
   it("rejects agents, foreign companies and denied cost-scope readers without reading rows", async () => {
-    expect((await request(app("agent")).get(path)).status).toBe(403);
+    expect((await request(app("agent")).get(logsPath)).status).toBe(403);
     expect((await request(app()).get("/api/companies/other/usage/logs")).status).toBe(403);
     mocks.decide.mockResolvedValue({ allowed: false });
-    expect((await request(app()).get(path)).status).toBe(403);
+    expect((await request(app()).get(logsPath)).status).toBe(403);
     expect(mocks.latest).not.toHaveBeenCalled();
+  });
+});
+
+describe("usage summary route", () => {
+  it("returns the DB-aggregated summary for board readers with the cost-scope read decision", async () => {
+    const response = await request(app()).get(summaryPath);
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(summaryFixture);
+    expect(mocks.summary).toHaveBeenCalledExactlyOnceWith(companyId, undefined);
+    expect(mocks.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "company_scope:read",
+      resource: { type: "company", companyId },
+    }));
+  });
+
+  it("parses optional from/to bounds into dates and rejects invalid ones before reading", async () => {
+    const from = "2026-01-01T00:00:00.000Z";
+    const to = "2026-01-02";
+    const response = await request(app()).get(`${summaryPath}?from=${from}&to=${to}`);
+    expect(response.status).toBe(200);
+    expect(mocks.summary).toHaveBeenCalledExactlyOnceWith(companyId, { from: new Date(from), to: new Date(to) });
+    for (const query of ["from=nope", "to=nope", "from=2026-02-02T00:00:00.000Z&to=2026-01-01T00:00:00.000Z"]) {
+      expect((await request(app()).get(`${summaryPath}?${query}`)).status).toBe(400);
+    }
+    expect(mocks.summary).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects agents, foreign companies and denied cost-scope readers without aggregating", async () => {
+    expect((await request(app("agent")).get(summaryPath)).status).toBe(403);
+    expect((await request(app()).get("/api/companies/other/usage/summary")).status).toBe(403);
+    mocks.decide.mockResolvedValue({ allowed: false });
+    expect((await request(app()).get(summaryPath)).status).toBe(403);
+    expect(mocks.summary).not.toHaveBeenCalled();
   });
 });

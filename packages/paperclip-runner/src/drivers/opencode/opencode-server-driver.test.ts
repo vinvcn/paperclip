@@ -743,7 +743,10 @@ describe("OpenCodeServerDriver", () => {
       const result = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
       expect(result.headers.get("x-provider-private-header")).toBeNull();
       expect(await result.text()).toBe('data: {"choices":[]}\n\ndata: [DONE]\n\n');
-      expect(received).toEqual([{ path: "/custom/v1/chat/completions", authorization: key ? `Bearer ${key}` : undefined, body: payload }]);
+      // The proxy injects stream_options.include_usage into streamed requests
+      // so usage stays observable (docs/specs/usage-request-logs.md, Capture);
+      // everything else forwards exactly as the client sent it.
+      expect(received).toEqual([{ path: "/custom/v1/chat/completions", authorization: key ? `Bearer ${key}` : undefined, body: { ...payload, stream_options: { include_usage: true } } }]);
       const pending = await fetch(url, { method: "POST", headers, body: JSON.stringify({ ...payload, messages: [{ role: "user", content: "hold" }] }) });
       const pendingText = pending.text().then(() => "unexpected completion", () => "aborted");
       await session.close({ reason: "test" });
