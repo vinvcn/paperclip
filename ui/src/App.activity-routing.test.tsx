@@ -107,6 +107,13 @@ vi.mock("./pages/Costs", () => ({
   },
 }));
 
+vi.mock("./pages/Usage", () => ({
+  Usage: () => {
+    const location = useLocation();
+    return <div>{`USAGE_PAGE@${location.pathname}${location.search}`}</div>;
+  },
+}));
+
 vi.mock("./pages/NotFound", () => ({
   NotFoundPage: ({ scope }: { scope: string }) => <div>{`NOT_FOUND:${scope}`}</div>,
 }));
@@ -214,6 +221,12 @@ describe("App Activity routing (PAP-16302)", () => {
   it("serves each canonical Audit section under Activity", async () => {
     const root = renderAppAt(container, "/PAP/activity/runs?agentId=agent-1");
     await waitForRoute(container, "AUDIT_RUNS@/PAP/activity/runs?agentId=agent-1");
+    flushSync(() => root.unmount());
+  });
+
+  it("serves the Usage request-log page at /:company/usage", async () => {
+    const root = renderAppAt(container, "/PAP/usage");
+    await waitForRoute(container, "USAGE_PAGE@/PAP/usage");
     flushSync(() => root.unmount());
   });
 

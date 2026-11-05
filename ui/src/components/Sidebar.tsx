@@ -24,6 +24,7 @@ import {
   GanttChartSquare,
   LayoutGrid,
   Users,
+  ScrollText,
 } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -281,6 +282,7 @@ function ClassicSidebar({ children }: { children?: ReactNode }) {
             <SidebarNavItem to="/agents" label="Agents" icon={Users} />
             <SidebarNavItem to="/skills" label="Skills" icon={Boxes} />
             <SidebarNavItem to="/apps" label="Connectors" icon={Unplug} />
+            <SidebarNavItem to="/usage" label="Usage" icon={ScrollText} />
             <SidebarNavItem to="/activity" label="Audit" icon={History} />
           </SidebarSection>
         ) : null}
@@ -301,6 +303,7 @@ function ClassicSidebar({ children }: { children?: ReactNode }) {
               <SidebarNavItem to="/apps" label="Connectors" icon={Unplug} />
               <SidebarNavItem to="/timeline" label="Timeline" icon={GanttChartSquare} />
               <SidebarNavItem to="/costs" label="Costs" icon={DollarSign} />
+              <SidebarNavItem to="/usage" label="Usage" icon={ScrollText} />
               <SidebarNavItem to="/activity" label="Activity" icon={History} />
               <SidebarNavItem to="/activity/commentary" label="Commentary" icon={History} />
               <SidebarNavItem to="/company/settings" label="Settings" icon={Settings} />

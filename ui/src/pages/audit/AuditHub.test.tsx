@@ -25,6 +25,7 @@ vi.mock("@/context/SidebarContext", () => ({
 vi.mock("@/lib/router", () => ({
   useNavigate: () => navigateMock,
   useSearchParams: () => [new URLSearchParams(currentSearch), setSearchParamsMock],
+  Navigate: ({ to }: { to: string }) => <div data-testid="audit-navigate" data-to={to} />,
 }));
 
 vi.mock("./AuditFeed", () => ({
@@ -95,7 +96,9 @@ describe("AuditHub", () => {
     vi.clearAllMocks();
   });
 
-  function render(section: "activity" | "runs" | "costs" | "budgets" | "timeline" | "commentary") {
+  function render(
+    section: "activity" | "runs" | "costs" | "usage" | "budgets" | "timeline" | "commentary",
+  ) {
     root = createRoot(container);
     flushSync(() => root.render(<AuditHub section={section} />));
   }
@@ -104,7 +107,7 @@ describe("AuditHub", () => {
     currentSearch = "mode=agents&agentId=agent-1&runId=run-1&action=tool_";
     render("activity");
 
-    expect(container.querySelectorAll('[role="tab"]')).toHaveLength(6);
+    expect(container.querySelectorAll('[role="tab"]')).toHaveLength(7);
     expect(container.textContent).toContain("Activity");
     expect(container.textContent).toContain("Runs");
     expect(container.textContent).toContain("Commentary");
@@ -189,9 +192,22 @@ describe("AuditHub", () => {
 
     const labels = Array.from(container.querySelectorAll<HTMLElement>('[role="tab"]'))
       .map((tab) => tab.textContent?.trim());
-    expect(labels).toEqual(["Activity", "Runs", "Commentary", "Costs", "Budgets", "Timeline"]);
+    expect(labels).toEqual(["Activity", "Runs", "Commentary", "Costs", "Usage", "Budgets", "Timeline"]);
     expect(container.querySelector<HTMLElement>('[data-testid="audit-timeline"]')?.dataset.embedded)
       .toBe("true");
+  });
+
+  it("redirects the Usage tab to the standalone usage page", () => {
+    render("usage");
+
+    // Usage is a first-class page, not embedded hub content: selecting the tab
+    // navigates to /usage (the tab's auditSectionHref), and a hub mount with
+    // the usage section hands off to the same destination.
+    expect(navigateMock).not.toHaveBeenCalled();
+    const redirect = container.querySelector<HTMLElement>('[data-testid="audit-navigate"]');
+    expect(redirect?.dataset.to).toBe("/usage");
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.trim())
+      .toBe("Usage");
   });
 
   it("renders Costs and Budgets as intentional peer sections", () => {
