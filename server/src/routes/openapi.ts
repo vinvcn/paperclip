@@ -5876,6 +5876,19 @@ registry.registerPath({
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/usage/summary",
+  tags: ["usage"],
+  summary: "Usage summary: aggregated request and token totals",
+  description: "Card totals for the usage page, aggregated in SQL over the request logs the runner proxy observed. Requires the same access as cost reads. Optional from/to bounds; the cache hit rate is null when no prompt input was observed.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({ from: z.string().optional(), to: z.string().optional() }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
 registry.registerPath({ method: "post", path: "/api/companies/{companyId}/costs/retry-accounting", tags: ["costs"],
   summary: "Retry recording a run's saved cost data",
   description: "Requires company cost-read and board write access. Viewers and agents cannot retry. Replays accounting evidence only; never starts provider work or invents missing usage.",

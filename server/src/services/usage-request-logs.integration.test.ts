@@ -298,4 +298,146 @@ describeEmbeddedPostgres("usage request log persistence", () => {
       expect(rows).toHaveLength(1);
     });
   });
+
+  describe("summary metrics", () => {
+    let summaryCompanyId: string, summaryOtherCompanyId: string, summaryAgentId: string, summaryOtherAgentId: string, summaryRunId: string;
+
+    beforeAll(async () => {
+      summaryCompanyId = randomUUID();
+      summaryOtherCompanyId = randomUUID();
+      summaryAgentId = randomUUID();
+      summaryOtherAgentId = randomUUID();
+      summaryRunId = randomUUID();
+      await db.insert(companies).values([
+        { id: summaryCompanyId, name: "Usage Summary", issuePrefix: "USGS", requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user" },
+        { id: summaryOtherCompanyId, name: "Usage Summary Two", issuePrefix: "USGT", requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user" },
+      ]);
+      await db.insert(agents).values([
+        { id: summaryAgentId, companyId: summaryCompanyId, name: "UsageSummary", role: "engineer", status: "active", adapterType: "paperclip_runner", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+        { id: summaryOtherAgentId, companyId: summaryOtherCompanyId, name: "UsageSummaryTwo", role: "engineer", status: "active", adapterType: "paperclip_runner", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+      ]);
+      await db.insert(heartbeatRuns).values([
+        { id: summaryRunId, companyId: summaryCompanyId, agentId: summaryAgentId, invocationSource: "on_demand", status: "running", contextSnapshot: {} },
+        { id: randomUUID(), companyId: summaryOtherCompanyId, agentId: summaryOtherAgentId, invocationSource: "on_demand", status: "running", contextSnapshot: {} },
+      ]);
+    });
+
+    afterAll(async () => {
+      await db.delete(usageRequestLogs).where(eq(usageRequestLogs.companyId, summaryCompanyId));
+      await db.delete(usageRequestLogs).where(eq(usageRequestLogs.companyId, summaryOtherCompanyId));
+      await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, summaryCompanyId));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, summaryCompanyId));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, summaryOtherCompanyId));
+      await db.delete(agents).where(eq(agents.id, summaryAgentId));
+      await db.delete(agents).where(eq(agents.id, summaryOtherAgentId));
+      await db.delete(companies).where(eq(companies.id, summaryCompanyId));
+      await db.delete(companies).where(eq(companies.id, summaryOtherCompanyId));
+    });
+
+    async function summaryRow(requestId: string, overrides: Record<string, unknown>, company = summaryCompanyId) {
+      const startedAtMs = Date.now() - 60_000;
+      const inserted = await usageRequestLogService(db).recordForRun(
+        { companyId: company, runId: summaryRunId, agentId: null, issueId: null },
+        usageEvent(requestId, { startedAtMs, endedAtMs: startedAtMs + 100, ttftMs: 10, ...overrides }),
+      );
+      if (!inserted) throw new Error(`fixture row ${requestId} was not inserted`);
+    }
+
+    it("aggregates the spec metrics in SQL and excludes unobserved requests from token sums", async () => {
+      const service = usageRequestLogService(db);
+      // fresh input = 1200 - 300 = 900.
+      await summaryRow(randomUUID(), { usage: { inputTokens: 1200, cachedInputTokens: 300, cacheWriteTokens: 100, outputTokens: 450 } });
+      // A null cached counter (NIM omits cache creation) counts as zero, not as an unobserved row.
+      await summaryRow(randomUUID(), { usage: { inputTokens: 500, cachedInputTokens: null, cacheWriteTokens: null, outputTokens: null } });
+      // Usage never observed: counts toward requests, adds nothing to token sums.
+      await summaryRow(randomUUID(), { usage: null, httpStatus: 429 });
+      // Outside the window for the from-filtered read below.
+      const staleStartedAtMs = Date.now() - 3 * 60 * 60 * 1000;
+      await db.insert(usageRequestLogs).values({
+        companyId: summaryCompanyId,
+        runId: summaryRunId,
+        app: "opencode",
+        provider: "paperclip",
+        biller: "paperclip",
+        model: "openai/gpt-5.2",
+        inputTokens: 10,
+        cachedInputTokens: 0,
+        cacheWriteTokens: 0,
+        outputTokens: 10,
+        requestId: randomUUID(),
+        occurredAt: new Date(staleStartedAtMs),
+      });
+
+      expect(await service.summary(summaryCompanyId)).toEqual({
+        companyId: summaryCompanyId,
+        totalRequests: 4,
+        freshInputTokens: 1410,
+        cachedInputTokens: 300,
+        cacheWriteTokens: 100,
+        outputTokens: 460,
+        tokensProcessed: 2270,
+        cacheHitRate: 300 / 1710,
+        unpricedCount: 4,
+      });
+
+      const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+      expect(await service.summary(summaryCompanyId, { from: hourAgo })).toEqual({
+        companyId: summaryCompanyId,
+        totalRequests: 3,
+        freshInputTokens: 1400,
+        cachedInputTokens: 300,
+        cacheWriteTokens: 100,
+        outputTokens: 450,
+        tokensProcessed: 2250,
+        cacheHitRate: 300 / 1700,
+        unpricedCount: 3,
+      });
+      // A company with no rows aggregates to the zero state with a null rate.
+      expect(await service.summary(randomUUID())).toEqual({
+        companyId: expect.any(String),
+        totalRequests: 0,
+        freshInputTokens: 0,
+        cachedInputTokens: 0,
+        cacheWriteTokens: 0,
+        outputTokens: 0,
+        tokensProcessed: 0,
+        cacheHitRate: null,
+        unpricedCount: 0,
+      });
+    });
+
+    it("returns a null cache hit rate when no observed request carries prompt input", async () => {
+      const otherRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: otherRunId,
+        companyId: summaryOtherCompanyId,
+        agentId: summaryOtherAgentId,
+        invocationSource: "on_demand",
+        status: "running",
+        contextSnapshot: {},
+      });
+      const requestId = randomUUID();
+      const startedAtMs = Date.now() - 60_000;
+      await usageRequestLogService(db).recordForRun(
+        { companyId: summaryOtherCompanyId, runId: otherRunId, agentId: null, issueId: null },
+        usageEvent(requestId, { startedAtMs, endedAtMs: startedAtMs + 100, ttftMs: 10, usage: null }),
+      );
+      const summary = await usageRequestLogService(db).summary(summaryOtherCompanyId);
+      expect(summary.totalRequests).toBe(1);
+      expect(summary.cacheHitRate).toBeNull();
+      expect(summary.tokensProcessed).toBe(0);
+    });
+  });
+
+  it("persists the usage_missing flag of include_usage fallbacks in metadata", async () => {
+    const service = usageRequestLogService(db);
+    const requestId = randomUUID();
+    expect(await service.recordForRun(
+      { companyId, runId, agentId, issueId },
+      usageEvent(requestId, { usageMissing: true, usage: null }),
+    )).toBe(true);
+    const [row] = await db.select().from(usageRequestLogs)
+      .where(and(eq(usageRequestLogs.companyId, companyId), eq(usageRequestLogs.requestId, requestId)));
+    expect(row.metadata).toEqual({ usageMissing: true });
+  });
 });

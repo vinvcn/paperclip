@@ -39,6 +39,7 @@ API: `present` — representative operation IDs:
 - `GET /api/companies/{companyId}/costs/summary`.
 - `GET /api/companies/{companyId}/costs/by-agent`.
 - `GET /api/companies/{companyId}/usage/logs`.
+- `GET /api/companies/{companyId}/usage/summary`.
 
 Agent access: `available` — REST / native call_api / CLI cost.
 

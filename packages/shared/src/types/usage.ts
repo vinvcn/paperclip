@@ -37,3 +37,25 @@ export interface UsageRequestLogRow {
   metadata: Record<string, unknown> | null;
   createdAt: string;
 }
+
+/**
+ * Aggregated Usage card totals from `GET /api/companies/{companyId}/usage/summary`
+ * (docs/specs/usage-request-logs.md, Metrics). Token sums are computed in SQL;
+ * requests whose usage block was never observed keep null token columns and add
+ * nothing to the sums. `freshInputTokens = input − cached input` and
+ * `tokensProcessed = fresh + output + cached input` follow the spec formulas.
+ * `cacheHitRate` is null when no observed request carries prompt input; the UI
+ * renders it as an em dash. `unpricedCount` is a placeholder for the pricing
+ * ticket, which introduces per-row cost attribution.
+ */
+export interface UsageSummary {
+  companyId: string;
+  totalRequests: number;
+  freshInputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteTokens: number;
+  outputTokens: number;
+  tokensProcessed: number;
+  cacheHitRate: number | null;
+  unpricedCount: number;
+}

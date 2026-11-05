@@ -1,5 +1,6 @@
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, gte, lte, sql } from "drizzle-orm";
 import { heartbeatRunEvents, issues, usageRequestLogs, type Db } from "@paperclipai/db";
+import type { UsageSummary } from "@paperclipai/shared";
 import { parseProviderRequestUsageRecord } from "../vendor/paperclip-runner/index.js";
 
 export type UsageRequestLogRow = typeof usageRequestLogs.$inferSelect;
@@ -70,6 +71,7 @@ export function usageRequestLogService(db: Db) {
         providerRequestId: parsed.providerRequestId,
         requestId: parsed.requestId,
         occurredAt: new Date(parsed.startedAtMs),
+        ...(parsed.usageMissing ? { metadata: { usageMissing: true } } : {}),
       }).onConflictDoNothing().returning({ id: usageRequestLogs.id });
       return inserted.length > 0;
     },
@@ -80,6 +82,50 @@ export function usageRequestLogService(db: Db) {
         .where(eq(usageRequestLogs.companyId, companyId))
         .orderBy(desc(usageRequestLogs.occurredAt), desc(usageRequestLogs.id))
         .limit(limit);
+    },
+
+    /**
+     * Card totals for the Usage page (docs/specs/usage-request-logs.md,
+     * Metrics), aggregated in SQL — rows are never pulled into memory.
+     * Requests whose usage block was never observed keep null token columns
+     * and coalesce to zero inside the sums, so they count toward the request
+     * total but add nothing to the token figures. The spec formulas are
+     * applied to the aggregates: fresh input = input − cached input, tokens
+     * processed = fresh + output + cached input, and the cache hit rate is
+     * null when its denominator is zero.
+     */
+    async summary(companyId: string, range?: { from?: Date; to?: Date }): Promise<UsageSummary> {
+      const conditions = [eq(usageRequestLogs.companyId, companyId)];
+      if (range?.from) conditions.push(gte(usageRequestLogs.occurredAt, range.from));
+      if (range?.to) conditions.push(lte(usageRequestLogs.occurredAt, range.to));
+      const [row] = await db
+        .select({
+          totalRequests: sql<number>`count(*)::int`,
+          inputTokens: sql<number>`coalesce(sum(coalesce(${usageRequestLogs.inputTokens}, 0)), 0)::double precision`,
+          cachedInputTokens: sql<number>`coalesce(sum(coalesce(${usageRequestLogs.cachedInputTokens}, 0)), 0)::double precision`,
+          cacheWriteTokens: sql<number>`coalesce(sum(coalesce(${usageRequestLogs.cacheWriteTokens}, 0)), 0)::double precision`,
+          outputTokens: sql<number>`coalesce(sum(coalesce(${usageRequestLogs.outputTokens}, 0)), 0)::double precision`,
+          unpricedCount: sql<number>`count(*) filter (where ${usageRequestLogs.costStatus} = 'unpriced')::int`,
+        })
+        .from(usageRequestLogs)
+        .where(and(...conditions));
+      const input = row?.inputTokens ?? 0;
+      const cached = row?.cachedInputTokens ?? 0;
+      const freshInput = input - cached;
+      const cacheWrite = row?.cacheWriteTokens ?? 0;
+      const output = row?.outputTokens ?? 0;
+      const hitDenominator = freshInput + cached;
+      return {
+        companyId,
+        totalRequests: row?.totalRequests ?? 0,
+        freshInputTokens: freshInput,
+        cachedInputTokens: cached,
+        cacheWriteTokens: cacheWrite,
+        outputTokens: output,
+        tokensProcessed: freshInput + cached + cacheWrite + output,
+        cacheHitRate: hitDenominator > 0 ? cached / hitDenominator : null,
+        unpricedCount: row?.unpricedCount ?? 0,
+      };
     },
   };
 }
