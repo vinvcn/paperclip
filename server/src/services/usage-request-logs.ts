@@ -20,9 +20,26 @@ export interface UsageRequestFilters {
   status?: UsageStatusFilter;
 }
 
-/** The logs read's filters: the same dimensions plus the summary's from/to window. */
+/**
+ * The logs read's filters: the same dimensions plus the summary's from/to
+ * window and the keyset cursor (docs/specs/usage-request-logs.md, API).
+ * `after` anchors the read strictly after the given `(occurredAt, id)` pair —
+ * the decoded form of the previous page's `nextCursor`.
+ */
 export interface UsageRequestLogQuery extends UsageRequestFilters {
   range?: { from?: Date; to?: Date };
+  after?: { occurredAt: Date; id: string };
+}
+
+/**
+ * The page `latest` returns, over DB rows (Date instants). The route's JSON
+ * layer serializes the timestamps into the shared `UsageRequestLogPage`
+ * contract, whose `rows` carry ISO strings.
+ */
+export interface UsageRequestLogDbPage {
+  rows: UsageRequestLogRow[];
+  total: number;
+  nextCursor: string | null;
 }
 
 export type UsageRequestRunBinding = {
@@ -34,6 +51,9 @@ export type UsageRequestRunBinding = {
 
 /** Spec: hour buckets for windows up to 48 hours, day buckets beyond. */
 const HOUR_BUCKET_WINDOW_MS = 48 * 60 * 60 * 1000;
+
+/** Cap on the summary's model facet list (docs/specs/usage-request-logs.md, API). */
+const MODEL_FACET_LIMIT = 50;
 
 /**
  * SQL predicate for one status filter class (docs/specs/
@@ -257,19 +277,49 @@ export function usageRequestLogService(db: Db) {
     },
 
     /**
-     * Newest rows for the log list, narrowed by the shared filters and an
-     * optional from/to window. Absent filters change nothing.
+     * One keyset-paginated page of newest rows for the log list (docs/specs/
+     * usage-request-logs.md, API), narrowed by the shared filters, an optional
+     * from/to window and the `after` cursor. Absent filters change nothing.
+     *
+     * The cursor is a PostgreSQL row comparison over `(occurred_at, id) < (ts,
+     * id)` — the exact complement of the `occurredAt DESC, id DESC` ordering
+     * the index `(company_id, occurred_at desc, id)` serves — so a page
+     * fetched with a cursor stays stable while newer rows arrive, which an
+     * offset pagination cannot promise. The list query probes `limit + 1` rows
+     * so `nextCursor` is non-null only when a further page actually exists,
+     * and `total` is one `count(*)` over the same matching rows (cursor
+     * excluded) so every page of one read reports the same figure.
      */
-    async latest(companyId: string, limit: number, query: UsageRequestLogQuery = {}): Promise<UsageRequestLogRow[]> {
-      const conditions: SQL[] = [eq(usageRequestLogs.companyId, companyId)];
-      if (query.range?.from) conditions.push(gte(usageRequestLogs.occurredAt, query.range.from));
-      if (query.range?.to) conditions.push(lte(usageRequestLogs.occurredAt, query.range.to));
-      conditions.push(...usageFilterConditions(query));
-      return db.select()
+    async latest(companyId: string, limit: number, query: UsageRequestLogQuery = {}): Promise<UsageRequestLogDbPage> {
+      const scopeConditions: SQL[] = [eq(usageRequestLogs.companyId, companyId)];
+      if (query.range?.from) scopeConditions.push(gte(usageRequestLogs.occurredAt, query.range.from));
+      if (query.range?.to) scopeConditions.push(lte(usageRequestLogs.occurredAt, query.range.to));
+      scopeConditions.push(...usageFilterConditions(query));
+      const conditions = [...scopeConditions];
+      if (query.after) {
+        // Bound parameters, never SQL text: the timestamp as ISO and the row
+        // id cast to uuid keep the row comparison type-correct.
+        conditions.push(sql`(${usageRequestLogs.occurredAt}, ${usageRequestLogs.id}) < (${query.after.occurredAt.toISOString()}::timestamptz, ${query.after.id}::uuid)`);
+      }
+      const where = and(...conditions);
+      const candidates = await db.select()
         .from(usageRequestLogs)
-        .where(and(...conditions))
+        .where(where)
         .orderBy(desc(usageRequestLogs.occurredAt), desc(usageRequestLogs.id))
-        .limit(limit);
+        .limit(limit + 1);
+      const [counted] = await db
+        .select({ total: sql<number>`count(*)::int` })
+        .from(usageRequestLogs)
+        .where(and(...scopeConditions));
+      const rows = candidates.slice(0, limit);
+      const last = rows[rows.length - 1];
+      return {
+        rows,
+        total: counted?.total ?? 0,
+        nextCursor: candidates.length > limit && last
+          ? `${last.occurredAt.toISOString()},${last.id}`
+          : null,
+      };
     },
 
     /**
@@ -342,7 +392,10 @@ export function usageRequestLogService(db: Db) {
      * dimensions; the scope is deliberately the *unfiltered* window, so a
      * selected app never removes its own chip (or another chip a user could
      * still switch to). Since the columns are NOT NULL, a NULL marks the
-     * grouping sets the row does not belong to.
+     * grouping sets the row does not belong to. The models list is capped at
+     * 50 sorted-by-volume values — a company's model namespace can be
+     * high-cardinality — and `modelsTruncated` reports whether the cap cut
+     * anything, so the response stays bounded without silently lying.
      */
     async facets(scopeConditions: SQL[]): Promise<UsageSummaryFacets> {
       const rows = await db.execute(sql`
@@ -364,7 +417,8 @@ export function usageRequestLogService(db: Db) {
       return {
         apps: apps.sort(byVolume),
         providers: providers.sort(byVolume),
-        models: models.sort(byVolume),
+        models: models.sort(byVolume).slice(0, MODEL_FACET_LIMIT),
+        modelsTruncated: models.length > MODEL_FACET_LIMIT,
       };
     },
 

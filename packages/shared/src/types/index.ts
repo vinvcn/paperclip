@@ -925,6 +925,7 @@ export type {
 export type { CostEvent, CostSummary, CostDataQualityItem, CostDataQualityReport, CostDataQualityReason, IssueCostSummary, CostByUser, CostByUserReport, CostByAgent, CostByProviderModel, CostByBiller, CostByAgentModel, CostWindowSpendRow, CostByProject } from "./cost.js";
 export type {
   UsageRequestLogRow,
+  UsageRequestLogPage,
   UsageStatusFilter,
   UsageSummary,
   UsageSummaryFacet,

@@ -211,9 +211,9 @@ describeEmbeddedPostgres("usage request log persistence", () => {
       );
     }
     const latest = await service.latest(companyId, 2);
-    expect(latest).toHaveLength(2);
-    expect(latest[0]!.occurredAt.getTime()).toBeGreaterThan(latest[1]!.occurredAt.getTime());
-    expect(await service.latest(otherCompanyId, 20)).toHaveLength(1);
+    expect(latest.rows).toHaveLength(2);
+    expect(latest.rows[0]!.occurredAt.getTime()).toBeGreaterThan(latest.rows[1]!.occurredAt.getTime());
+    expect(await service.latest(otherCompanyId, 20).then((page) => page.rows)).toHaveLength(1);
   });
 
   describe("sweepRunUsageRequestLogEvents", () => {
@@ -422,7 +422,7 @@ describeEmbeddedPostgres("usage request log persistence", () => {
         cacheHitRate: null,
         unpricedCount: 0,
         series: [],
-        facets: { apps: [], providers: [], models: [] },
+        facets: { apps: [], providers: [], models: [], modelsTruncated: false },
       });
     });
 
@@ -706,6 +706,7 @@ describeEmbeddedPostgres("usage request log persistence", () => {
         { value: "anthropic/claude-sonnet-4-5", requests: 2 },
         { value: "anthropic/claude-haiku-4-5", requests: 1 },
       ]);
+      expect(summary.facets.modelsTruncated).toBe(false);
     });
 
     it("excludes values without rows in the window from the facets", async () => {
@@ -747,7 +748,7 @@ describeEmbeddedPostgres("usage request log persistence", () => {
       // The series answers to the same WHERE as the cards.
       expect(summary.series.reduce((n, point) => n + point.requests, 0)).toBe(expected);
       // And so does the log list.
-      const rows = await service.latest(filterCompanyId, 20, filters);
+      const rows = (await service.latest(filterCompanyId, 20, filters)).rows;
       expect(rows).toHaveLength(expected);
       if (filters.app) expect(rows.every((row) => row.app === filters.app)).toBe(true);
       if (filters.provider) expect(rows.every((row) => row.provider === filters.provider)).toBe(true);
@@ -764,7 +765,7 @@ describeEmbeddedPostgres("usage request log persistence", () => {
     it("sorts null, redirect and transport-error statuses into other, never success", async () => {
       const other = await usageRequestLogService(db).summary(filterCompanyId, undefined, "UTC", { status: "other" });
       expect(other.totalRequests).toBe(3);
-      const rows = await usageRequestLogService(db).latest(filterCompanyId, 20, { status: "other" });
+      const rows = (await usageRequestLogService(db).latest(filterCompanyId, 20, { status: "other" })).rows;
       // The proxy also records redirects (302) and transport errors (600);
       // with the null-status row they form "other", never success/4xx/5xx.
       expect([...rows.map((row) => row.httpStatus)].sort((a, b) => (a ?? -1) - (b ?? -1))).toEqual([null, 302, 600]);
@@ -772,7 +773,227 @@ describeEmbeddedPostgres("usage request log persistence", () => {
 
     it("accepts a from/to window on the log list", async () => {
       const windowed = await usageRequestLogService(db).latest(filterCompanyId, 20, { range: { from: new Date(Date.now() - 60 * 60_000) } });
-      expect(windowed).toHaveLength(6); // the 3h-old legacy row is out
+      expect(windowed.rows).toHaveLength(6); // the 3h-old legacy row is out
+    });
+  });
+
+  describe("keyset pagination", () => {
+    const createdCompanyIds: string[] = [];
+
+    /** One isolated company + run per test: page walks must never see another case's rows. */
+    async function freshPageCompany() {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Usage Paging",
+        issuePrefix: companyId.replaceAll("-", "").slice(0, 4).toUpperCase(),
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "UsagePaging",
+        role: "engineer",
+        status: "active",
+        adapterType: "paperclip_runner",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "on_demand",
+        status: "running",
+        contextSnapshot: {},
+      });
+      createdCompanyIds.push(companyId);
+      return { companyId, runId };
+    }
+
+    afterAll(async () => {
+      for (const companyId of createdCompanyIds) {
+        await db.delete(usageRequestLogs).where(eq(usageRequestLogs.companyId, companyId));
+        await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+        await db.delete(agents).where(eq(agents.companyId, companyId));
+        await db.delete(companies).where(eq(companies.id, companyId));
+      }
+    });
+
+    /** One request row at an exact instant, keyed by the minute offset so tests can name them. */
+    async function row(ids: { companyId: string; runId: string }, minuteOffset: number, overrides: Record<string, unknown> = {}) {
+      const requestId = randomUUID();
+      await db.insert(usageRequestLogs).values({
+        companyId: ids.companyId,
+        runId: ids.runId,
+        app: "opencode",
+        provider: "openrouter",
+        biller: "openrouter",
+        model: "openai/gpt-5.2",
+        requestId,
+        occurredAt: new Date(Date.parse("2026-11-04T12:00:00Z") + minuteOffset * 60_000),
+        ...overrides,
+      });
+      return requestId;
+    }
+
+    it("walks every row exactly once across pages: no duplicates, no gaps", async () => {
+      const ids = await freshPageCompany();
+      await row(ids, 10);
+      await row(ids, 20);
+      await row(ids, 30);
+      await row(ids, 30); // same occurred_at: the id tiebreak must not skip or repeat it
+      await row(ids, 40);
+      await row(ids, 50);
+
+      const service = usageRequestLogService(db);
+      const seen: string[] = [];
+      let after: { occurredAt: Date; id: string } | undefined;
+      let pages = 0;
+      while (pages < 10) {
+        const page = await service.latest(ids.companyId, 2, after ? { after } : {});
+        seen.push(...page.rows.map((row) => row.requestId));
+        if (!page.nextCursor) break;
+        const separator = page.nextCursor.indexOf(",");
+        after = { occurredAt: new Date(page.nextCursor.slice(0, separator)), id: page.nextCursor.slice(separator + 1) };
+        pages += 1;
+      }
+      expect(seen).toHaveLength(6);
+      expect(new Set(seen).size).toBe(6); // no duplicates across pages
+      // Newest first throughout: ties share a timestamp and stay ordered by id.
+      const rows = await db.select().from(usageRequestLogs).where(eq(usageRequestLogs.companyId, ids.companyId));
+      const expectedOrder = rows
+        .sort((a, b) => b.occurredAt.getTime() - a.occurredAt.getTime() || (a.id < b.id ? 1 : -1))
+        .map((row) => row.requestId);
+      expect(seen).toEqual(expectedOrder);
+    });
+
+    it("keeps a cursor-anchored page stable when newer rows arrive mid-read", async () => {
+      const ids = await freshPageCompany();
+      await row(ids, 1);
+      await row(ids, 2);
+      await row(ids, 3);
+      const service = usageRequestLogService(db);
+      const firstPage = await service.latest(ids.companyId, 2);
+      expect(firstPage.rows.map((row) => row.occurredAt.getUTCMinutes())).toEqual([3, 2]);
+      expect(firstPage.nextCursor).toBe(`${firstPage.rows[1]!.occurredAt.toISOString()},${firstPage.rows[1]!.id}`);
+
+      // Five new requests land while the reader is still on page one.
+      await row(ids, 61);
+      await row(ids, 62);
+      await row(ids, 63);
+      await row(ids, 64);
+      await row(ids, 65);
+
+      const secondPage = await service.latest(ids.companyId, 2, { after: { occurredAt: firstPage.rows[1]!.occurredAt, id: firstPage.rows[1]!.id } });
+      // The cursor anchors the page: the new rows never push into it.
+      expect(secondPage.rows.map((row) => row.occurredAt.getUTCMinutes())).toEqual([1]);
+      expect(secondPage.nextCursor).toBeNull();
+      // And the total reflects the matching set, not the page.
+      expect(secondPage.total).toBe(8);
+    });
+
+    it("returns the total matching count independent of the cursor position", async () => {
+      const ids = await freshPageCompany();
+      for (const minute of [1, 2, 3]) await row(ids, minute);
+      const service = usageRequestLogService(db);
+      const firstPage = await service.latest(ids.companyId, 2);
+      expect(firstPage.total).toBe(3);
+      const lastPage = await service.latest(ids.companyId, 2, {
+        after: { occurredAt: firstPage.rows[1]!.occurredAt, id: firstPage.rows[1]!.id },
+      });
+      expect(lastPage.rows.length).toBeLessThanOrEqual(2);
+      expect(lastPage.total).toBe(3);
+    });
+
+    it("combines the keyset cursor with the request filters", async () => {
+      const ids = await freshPageCompany();
+      await row(ids, 100, { httpStatus: 500 });
+      await row(ids, 101, { httpStatus: 500 });
+      await row(ids, 102, { httpStatus: 500 });
+      const service = usageRequestLogService(db);
+      const page = await service.latest(ids.companyId, 2, { status: "server_error" });
+      expect(page.rows).toHaveLength(2);
+      expect(page.total).toBe(3);
+      expect(page.nextCursor).toBe(`${page.rows[1]!.occurredAt.toISOString()},${page.rows[1]!.id}`);
+      const next = await service.latest(ids.companyId, 2, {
+        status: "server_error",
+        after: { occurredAt: page.rows[1]!.occurredAt, id: page.rows[1]!.id },
+      });
+      expect(next.rows).toHaveLength(1);
+      expect(next.total).toBe(3);
+      expect(next.nextCursor).toBeNull();
+    });
+  });
+
+  describe("model facet truncation", () => {
+    let facetsCompanyId: string, facetsAgentId: string, facetsRunId: string;
+    const createdCompanyIds: string[] = [];
+
+    beforeAll(async () => {
+      facetsCompanyId = randomUUID();
+      facetsAgentId = randomUUID();
+      facetsRunId = randomUUID();
+      await db.insert(companies).values({
+        id: facetsCompanyId,
+        name: "Usage Facets",
+        issuePrefix: facetsCompanyId.replaceAll("-", "").slice(0, 4).toUpperCase(),
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: facetsAgentId,
+        companyId: facetsCompanyId,
+        name: "UsageFacets",
+        role: "engineer",
+        status: "active",
+        adapterType: "paperclip_runner",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(heartbeatRuns).values({
+        id: facetsRunId,
+        companyId: facetsCompanyId,
+        agentId: facetsAgentId,
+        invocationSource: "on_demand",
+        status: "running",
+        contextSnapshot: {},
+      });
+      createdCompanyIds.push(facetsCompanyId);
+      // One more distinct model than the facet cap: the response must bound
+      // the list instead of streaming a high-cardinality model namespace.
+      for (let i = 0; i < 55; i += 1) {
+        await db.insert(usageRequestLogs).values({
+          companyId: facetsCompanyId,
+          runId: facetsRunId,
+          app: "opencode",
+          provider: "openrouter",
+          biller: "openrouter",
+          model: `vendor/model-${i}`,
+          requestId: randomUUID(),
+          occurredAt: new Date(Date.parse("2026-11-04T12:00:00Z") + i * 1000),
+        });
+      }
+    });
+
+    afterAll(async () => {
+      for (const companyId of createdCompanyIds) {
+        await db.delete(usageRequestLogs).where(eq(usageRequestLogs.companyId, companyId));
+        await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+        await db.delete(agents).where(eq(agents.companyId, companyId));
+        await db.delete(companies).where(eq(companies.id, companyId));
+      }
+    });
+
+    it("caps the model facet list at 50 and flags the truncation", async () => {
+      const summary = await usageRequestLogService(db).summary(facetsCompanyId);
+      expect(summary.facets.models).toHaveLength(50);
+      expect(summary.facets.modelsTruncated).toBe(true);
     });
   });
 

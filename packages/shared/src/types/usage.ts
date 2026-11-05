@@ -67,6 +67,21 @@ export interface UsageSummary {
 }
 
 /**
+ * One page of `GET /api/companies/{companyId}/usage/logs`
+ * (docs/specs/usage-request-logs.md, API). Pagination is a keyset cursor over
+ * `(occurred_at, id)` descending: a deep page stays stable while new rows
+ * arrive, because the cursor anchors the read instead of an offset. `total`
+ * counts every row matching the filters (regardless of the cursor), and
+ * `nextCursor` is null once no further page exists. The cursor string is
+ * `<occurred-at ISO>,<row id>`; clients echo it back as the `after` param.
+ */
+export interface UsageRequestLogPage {
+  rows: UsageRequestLogRow[];
+  total: number;
+  nextCursor: string | null;
+}
+
+/**
  * URL-friendly status classes for the usage `status` filter param
  * (docs/specs/usage-request-logs.md, API). Classes keep the URL readable and
  * match the log table's Status column; anything outside 2xx/4xx/5xx — a null
@@ -92,12 +107,15 @@ export interface UsageSummaryFacet {
 /**
  * The filter dimensions of the summary's window. Facets always describe the
  * *unfiltered* window — they answer "what could I filter by here" — so a
- * selected value never removes its own chip or option.
+ * selected value never removes its own chip or option. The models list is
+ * capped so a high-cardinality model namespace cannot flood the response;
+ * `modelsTruncated` says whether the cap hid values.
  */
 export interface UsageSummaryFacets {
   apps: UsageSummaryFacet[];
   providers: UsageSummaryFacet[];
   models: UsageSummaryFacet[];
+  modelsTruncated: boolean;
 }
 
 /**
