@@ -41,6 +41,8 @@ export interface ProviderRequestUsageRecord {
   httpStatus: number | null;
   providerRequestId: string | null;
   usage: ProviderRequestUsageTokens | null;
+  /** True when the proxy had to retry without an injected stream_options.include_usage after the upstream refused it, so usage could not be observed. */
+  usageMissing: boolean;
 }
 
 /** What the proxy hands to the sink: timing and status only. */
@@ -52,6 +54,7 @@ export interface ProviderRequestUsageObservation {
   httpStatus: number | null;
   providerRequestId: string | null;
   usage: ProviderRequestUsageTokens | null;
+  usageMissing: boolean;
 }
 
 /** The proxy's view of the capture sink; app/provider/biller/model are the sink's identity. */
@@ -148,9 +151,14 @@ export function parseProviderRequestUsageRecord(
   if (value.httpStatus !== null && (httpStatus === null || httpStatus < 100 || httpStatus > 599)) return null;
   const providerRequestId = value.providerRequestId === null ? null : boundedText(value.providerRequestId, 400);
   if (value.providerRequestId !== null && providerRequestId === null) return null;
+  // The flag is optional (runner builds older than the include_usage retry do
+  // not send it) but must be boolean when present.
+  const usageMissing = value.usageMissing === undefined ? false : value.usageMissing;
+  if (typeof usageMissing !== "boolean") return null;
   return {
     requestId, app, provider, biller, model, startedAtMs, endedAtMs,
     ttftMs, httpStatus, providerRequestId,
     usage: value.usage === null ? null : parseUsageTokens(value.usage),
+    usageMissing,
   };
 }

@@ -22,6 +22,7 @@ function validRecord(overrides: Partial<ProviderRequestUsageRecord> = {}): Provi
     httpStatus: 200,
     providerRequestId: "upstream-1",
     usage: { inputTokens: 100, cachedInputTokens: 40, cacheWriteTokens: null, outputTokens: 20 },
+    usageMissing: false,
     ...overrides,
   };
 }
@@ -117,5 +118,25 @@ describe("usage capture contract", () => {
       endedAtMs: now - 25,
     });
     expect(parseProviderRequestUsageRecord({ kind: PROVIDER_REQUEST_USAGE_KIND, request: record }, now)).toEqual(record);
+  });
+
+  it("carries the usage_missing flag through the durable parse boundary", () => {
+    const now = Date.now();
+    // Older runner builds do not send the flag; it parses as false.
+    const legacy = validRecord() as Partial<ProviderRequestUsageRecord>;
+    delete legacy.usageMissing;
+    expect(parseProviderRequestUsageRecord(
+      { kind: PROVIDER_REQUEST_USAGE_KIND, request: legacy as ProviderRequestUsageRecord },
+      now,
+    )).toMatchObject({ usageMissing: false });
+    expect(parseProviderRequestUsageRecord(
+      { kind: PROVIDER_REQUEST_USAGE_KIND, request: validRecord({ usageMissing: true }) },
+      now,
+    )).toMatchObject({ usageMissing: true });
+    // A non-boolean flag is malformed and drops the whole record.
+    expect(parseProviderRequestUsageRecord(
+      { kind: PROVIDER_REQUEST_USAGE_KIND, request: validRecord({ usageMissing: "yes" as unknown as boolean }) },
+      now,
+    )).toBeNull();
   });
 });

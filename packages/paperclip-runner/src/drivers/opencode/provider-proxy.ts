@@ -81,11 +81,36 @@ export async function startOpenCodeProviderProxy(
       // and is never persisted or logged.
       const requestId = capture ? randomUUID() : "";
       const startedAtMs = capture ? Date.now() : 0;
+      // A streamed response reports its usage only in a final SSE frame the
+      // client never asks for. With capture on, the proxy injects
+      // stream_options.include_usage when the client did not set it; if the
+      // upstream refuses the injected field with a 4xx, the proxy retries
+      // once with the client's original body and marks the record
+      // usage_missing instead of failing (docs/specs/usage-request-logs.md,
+      // Capture). With capture off the request bytes stay untouched.
+      const clientStreamOptions: unknown = payload.stream_options;
+      const clientStreamOptionsIsObject = clientStreamOptions !== null
+        && typeof clientStreamOptions === "object"
+        && !Array.isArray(clientStreamOptions);
+      const clientSetIncludeUsage = clientStreamOptionsIsObject
+        && Object.hasOwn(clientStreamOptions as object, "include_usage");
+      const injectIncludeUsage = capture !== null && payload.stream === true && !clientSetIncludeUsage;
+      let attemptBody = body;
+      if (injectIncludeUsage) {
+        attemptBody = Buffer.from(JSON.stringify({
+          ...payload,
+          stream_options: {
+            ...(clientStreamOptionsIsObject ? clientStreamOptions as Record<string, unknown> : {}),
+            include_usage: true,
+          },
+        }), "utf8");
+      }
       let firstByteAt: number | null = null;
       let providerRequestId: string | null = null;
       let upstream: IncomingMessage | null = null;
       const tailChunks: Buffer[] = [];
       let tailBytes = 0;
+      let usageMissing = false;
       let recorded = false;
       const record = (httpStatus: number | null) => {
         if (!capture || recorded) return;
@@ -99,6 +124,7 @@ export async function startOpenCodeProviderProxy(
           httpStatus,
           providerRequestId,
           usage: usageTokensFromBlock(extractProviderUsageBlock(Buffer.concat(tailChunks).toString("utf8"))),
+          usageMissing,
         });
       };
       const tapUpstream = (chunk: Buffer) => {
@@ -111,34 +137,50 @@ export async function startOpenCodeProviderProxy(
         }
       };
       try {
-        upstream = await new Promise<IncomingMessage>((resolve, reject) => {
-          const outgoing = (upstreamUrl.protocol === "https:" ? requestHttps : requestHttp)(upstreamUrl, {
-            method: "POST",
-            agent,
-            headers: { ...(isOpenRouterUrl(baseUrl) ? OPENROUTER_ATTRIBUTION_HEADERS : {}), "Content-Type": "application/json", "Content-Length": body.length, ...(key ? { Authorization: `Bearer ${key}` } : {}) },
-            signal: AbortSignal.any([controller.signal, AbortSignal.timeout(600_000)]),
-          }, resolve);
-          outgoing.once("error", reject);
-          outgoing.end(body);
-        });
-        // Never forward authentication to a redirect destination.
-        const status = upstream.statusCode ?? 502;
-        const upstreamId = upstream.headers["x-request-id"];
-        providerRequestId = typeof upstreamId === "string" && upstreamId.length <= 400 ? upstreamId : null;
-        if (status >= 300 && status < 400) {
-          upstream.destroy();
+        for (let attempt = 0; ; attempt += 1) {
+          // Every attempt measures its own timing and response tail; only the
+          // final attempt is forwarded to the client and recorded.
+          firstByteAt = null;
+          providerRequestId = null;
+          tailChunks.length = 0;
+          tailBytes = 0;
+          upstream = await new Promise<IncomingMessage>((resolve, reject) => {
+            const outgoing = (upstreamUrl.protocol === "https:" ? requestHttps : requestHttp)(upstreamUrl, {
+              method: "POST",
+              agent,
+              headers: { ...(isOpenRouterUrl(baseUrl) ? OPENROUTER_ATTRIBUTION_HEADERS : {}), "Content-Type": "application/json", "Content-Length": attemptBody.length, ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+              signal: AbortSignal.any([controller.signal, AbortSignal.timeout(600_000)]),
+            }, resolve);
+            outgoing.once("error", reject);
+            outgoing.end(attemptBody);
+          });
+          // Never forward authentication to a redirect destination.
+          const status = upstream.statusCode ?? 502;
+          const upstreamId = upstream.headers["x-request-id"];
+          providerRequestId = typeof upstreamId === "string" && upstreamId.length <= 400 ? upstreamId : null;
+          if (injectIncludeUsage && attempt === 0 && status >= 400 && status < 500) {
+            // The upstream refused the injected field: retry once without it.
+            usageMissing = true;
+            attemptBody = body;
+            upstream.destroy();
+            continue;
+          }
+          if (status >= 300 && status < 400) {
+            upstream.destroy();
+            record(status);
+            throw new Error("Provider redirects are not supported");
+          }
+          const headers: Record<string, string> = {};
+          for (const name of ["content-type", "content-encoding", "cache-control", "retry-after"]) {
+            const value = upstream.headers[name];
+            if (typeof value === "string") headers[name] = value;
+          }
+          response.writeHead(status, headers);
+          if (capture) upstream.on("data", tapUpstream);
+          await pipeline(upstream, response);
           record(status);
-          throw new Error("Provider redirects are not supported");
+          break;
         }
-        const headers: Record<string, string> = {};
-        for (const name of ["content-type", "content-encoding", "cache-control", "retry-after"]) {
-          const value = upstream.headers[name];
-          if (typeof value === "string") headers[name] = value;
-        }
-        response.writeHead(status, headers);
-        if (capture) upstream.on("data", tapUpstream);
-        await pipeline(upstream, response);
-        record(status);
       } catch (error) {
         record(upstream?.statusCode ?? null);
         throw error;
