@@ -1,5 +1,6 @@
 import { and, desc, eq, gte, lte, sql, type SQL } from "drizzle-orm";
-import { heartbeatRunEvents, issues, usageRequestLogs, type Db } from "@paperclipai/db";
+import { centsToUnits, unitsToCents } from "@paperclipai/shared";
+import { costEvents, heartbeatRunEvents, issues, usageRequestLogs, type Db } from "@paperclipai/db";
 import type { UsageSummary, UsageSummarySeriesPoint } from "@paperclipai/shared";
 import { parseProviderRequestUsageRecord } from "../vendor/paperclip-runner/index.js";
 
@@ -14,6 +15,33 @@ export type UsageRequestRunBinding = {
 
 /** Spec: hour buckets for windows up to 48 hours, day buckets beyond. */
 const HOUR_BUCKET_WINDOW_MS = 48 * 60 * 60 * 1000;
+
+/**
+ * Split a run's receipt across its request rows in the numeric(24,7)
+ * minimum unit (1e-7 cents) so the parts sum exactly to the receipt with no
+ * rounding drift (docs/specs/usage-request-logs.md, Cost attribution). Every
+ * row first receives its floored pro-rata share; the remainder is always
+ * smaller than one unit per row and is handed out one unit at a time to the
+ * largest weights (ties keep the input order), which keeps the sum exact
+ * while biasing residue toward the rows the money belongs on.
+ */
+export function allocateUnitsByWeight(totalUnits: bigint, weights: number[]): bigint[] {
+  const rows = weights.map((weight, index) => ({ index, weight }));
+  const shares = rows.map(() => 0n);
+  const totalWeight = rows.reduce((sum, row) => sum + row.weight, 0);
+  if (totalWeight <= 0 || totalUnits <= 0n) return shares;
+  let allocated = 0n;
+  for (const row of rows) {
+    const share = (totalUnits * BigInt(row.weight)) / BigInt(totalWeight);
+    shares[row.index] = share;
+    allocated += share;
+  }
+  const remainderOrder = [...rows].sort((a, b) => b.weight - a.weight || a.index - b.index);
+  for (const row of remainderOrder.slice(0, Number(totalUnits - allocated))) {
+    shares[row.index] += 1n;
+  }
+  return shares;
+}
 
 function recordObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
