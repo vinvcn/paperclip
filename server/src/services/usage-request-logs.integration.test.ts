@@ -368,6 +368,8 @@ describeEmbeddedPostgres("usage request log persistence", () => {
         occurredAt: new Date(staleStartedAtMs),
       });
 
+      // tokensProcessed = fresh + output + cached input; cache write is a
+      // billed-token input for cost allocation, not part of processed tokens.
       expect(await service.summary(summaryCompanyId)).toEqual({
         companyId: summaryCompanyId,
         totalRequests: 4,
@@ -375,7 +377,7 @@ describeEmbeddedPostgres("usage request log persistence", () => {
         cachedInputTokens: 300,
         cacheWriteTokens: 100,
         outputTokens: 460,
-        tokensProcessed: 2270,
+        tokensProcessed: 2170,
         cacheHitRate: 300 / 1710,
         unpricedCount: 4,
       });
@@ -388,7 +390,7 @@ describeEmbeddedPostgres("usage request log persistence", () => {
         cachedInputTokens: 300,
         cacheWriteTokens: 100,
         outputTokens: 450,
-        tokensProcessed: 2250,
+        tokensProcessed: 2150,
         cacheHitRate: 300 / 1700,
         unpricedCount: 3,
       });

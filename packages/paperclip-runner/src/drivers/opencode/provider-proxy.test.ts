@@ -384,6 +384,13 @@ describe("OpenCode provider proxy usage observation", () => {
       const response = await post(proxy, chatBody);
       expect(response.status).toBe(200);
       expect(await response.text()).toBe(payload);
+      // A stream:true body is forwarded untouched too: with the kill switch
+      // off no stream_options are injected, so the upstream sees the exact
+      // request bytes the client sent.
+      const streamResponse = await post(proxy, streamChatBody);
+      expect(streamResponse.status).toBe(200);
+      expect(await streamResponse.text()).toBe(payload);
+      expect(upstreamRequests.map(({ body }) => body)).toEqual([chatBody, streamChatBody]);
     } finally {
       await completeProxy(proxy);
     }

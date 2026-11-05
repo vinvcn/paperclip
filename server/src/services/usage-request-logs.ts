@@ -122,7 +122,7 @@ export function usageRequestLogService(db: Db) {
         cachedInputTokens: cached,
         cacheWriteTokens: cacheWrite,
         outputTokens: output,
-        tokensProcessed: freshInput + cached + cacheWrite + output,
+        tokensProcessed: freshInput + cached + output,
         cacheHitRate: hitDenominator > 0 ? cached / hitDenominator : null,
         unpricedCount: row?.unpricedCount ?? 0,
       };

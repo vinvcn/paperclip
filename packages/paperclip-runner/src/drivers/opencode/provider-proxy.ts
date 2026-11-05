@@ -160,6 +160,9 @@ export async function startOpenCodeProviderProxy(
           providerRequestId = typeof upstreamId === "string" && upstreamId.length <= 400 ? upstreamId : null;
           if (injectIncludeUsage && attempt === 0 && status >= 400 && status < 500) {
             // The upstream refused the injected field: retry once without it.
+            // startedAtMs still comes from the first attempt, so the recorded
+            // duration and TTFT deliberately include the failed attempt's
+            // round trip — the client-perceived wall clock, not the retry's.
             usageMissing = true;
             attemptBody = body;
             upstream.destroy();
