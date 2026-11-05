@@ -923,7 +923,15 @@ export type {
   RoutineListItem,
 } from "./routine.js";
 export type { CostEvent, CostSummary, CostDataQualityItem, CostDataQualityReport, CostDataQualityReason, IssueCostSummary, CostByUser, CostByUserReport, CostByAgent, CostByProviderModel, CostByBiller, CostByAgentModel, CostWindowSpendRow, CostByProject } from "./cost.js";
-export type { UsageRequestLogRow, UsageSummary, UsageSummarySeriesPoint } from "./usage.js";
+export type {
+  UsageRequestLogRow,
+  UsageStatusFilter,
+  UsageSummary,
+  UsageSummaryFacet,
+  UsageSummaryFacets,
+  UsageSummarySeriesPoint,
+} from "./usage.js";
+export { USAGE_STATUS_FILTERS } from "./usage.js";
 export type { FinanceEvent, FinanceSummary, FinanceByBiller, FinanceByKind } from "./finance.js";
 export type {
   AgentWakeupResponse,
