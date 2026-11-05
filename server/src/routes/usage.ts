@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
+import { USAGE_STATUS_FILTERS, type UsageRequestFilters, type UsageStatusFilter } from "@paperclipai/shared";
 import { accessService } from "../services/index.js";
 import { usageRequestLogService } from "../services/usage-request-logs.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
@@ -38,10 +39,36 @@ export function parseUsageTimezone(query: Record<string, unknown>): string {
 }
 
 /**
+ * The usage filter dimensions shared by the summary and logs reads
+ * (docs/specs/usage-request-logs.md, API). An absent or empty value means
+ * "no filter" — the same rule as `limit` and `tz` — while anything else that
+ * is not a single string (a repeated parameter arrives as an array) or not a
+ * known status class is a 400, never a silently ignored filter.
+ */
+export function parseUsageFilters(query: Record<string, unknown>): UsageRequestFilters {
+  const filters: UsageRequestFilters = {};
+  for (const key of ["app", "provider", "model"] as const) {
+    const raw = query[key];
+    if (raw == null || raw === "") continue;
+    if (typeof raw !== "string") throw badRequest(`invalid '${key}' value`);
+    filters[key] = raw;
+  }
+  const rawStatus = query.status;
+  if (rawStatus != null && rawStatus !== "") {
+    if (typeof rawStatus !== "string" || !USAGE_STATUS_FILTERS.includes(rawStatus as UsageStatusFilter)) {
+      throw badRequest("invalid 'status' value");
+    }
+    filters.status = rawStatus as UsageStatusFilter;
+  }
+  return filters;
+}
+
+/**
  * Usage request log reads (docs/specs/usage-request-logs.md). P1 exposes the
- * newest rows plus the aggregated summary; filters and keyset pagination
- * follow with the UI ticket. Authorization mirrors the costs read endpoints:
- * board actors with the company cost-scope read decision.
+ * filtered newest rows plus the aggregated summary with facets; keyset
+ * pagination follows with the persistence ticket. Authorization mirrors the
+ * costs read endpoints: board actors with the company cost-scope read
+ * decision.
  */
 export function usageRoutes(db: Db) {
   const router = Router();
@@ -68,7 +95,9 @@ export function usageRoutes(db: Db) {
     const companyId = req.params.companyId as string;
     if (!(await requireUsageRead(req, res, companyId))) return;
     const limit = parseUsageLimit(req.query);
-    res.json(await logs.latest(companyId, limit));
+    const range = parseCostDateRange(req.query);
+    const filters = parseUsageFilters(req.query);
+    res.json(await logs.latest(companyId, limit, { ...filters, range }));
   });
 
   router.get("/companies/:companyId/usage/summary", async (req, res) => {
@@ -76,7 +105,8 @@ export function usageRoutes(db: Db) {
     if (!(await requireUsageRead(req, res, companyId))) return;
     const range = parseCostDateRange(req.query);
     const timeZone = parseUsageTimezone(req.query);
-    res.json(await logs.summary(companyId, range, timeZone));
+    const filters = parseUsageFilters(req.query);
+    res.json(await logs.summary(companyId, range, timeZone, filters));
   });
 
   return router;
