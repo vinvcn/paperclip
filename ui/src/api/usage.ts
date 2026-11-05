@@ -12,6 +12,13 @@ export const usageApi = {
     api.get<UsageRequestLogRow[]>(
       `/companies/${companyId}/usage/logs?limit=${limit}`,
     ),
-  summary: (companyId: string) =>
-    api.get<UsageSummary>(`/companies/${companyId}/usage/summary`),
+  /**
+   * `timeZone` is the viewer's IANA timezone (the browser reports it via
+   * `Intl.DateTimeFormat().resolvedOptions().timeZone`); the server buckets
+   * the summary's series into local hours or days with it.
+   */
+  summary: (companyId: string, timeZone?: string) =>
+    api.get<UsageSummary>(
+      `/companies/${companyId}/usage/summary${timeZone ? `?tz=${encodeURIComponent(timeZone)}` : ""}`,
+    ),
 };

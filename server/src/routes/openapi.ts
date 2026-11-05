@@ -5881,10 +5881,10 @@ registry.registerPath({
   path: "/api/companies/{companyId}/usage/summary",
   tags: ["usage"],
   summary: "Usage summary: aggregated request and token totals",
-  description: "Card totals for the usage page, aggregated in SQL over the request logs the runner proxy observed. Requires the same access as cost reads. Optional from/to bounds; the cache hit rate is null when no prompt input was observed.",
+  description: "Card totals for the usage page, aggregated in SQL over the request logs the runner proxy observed. Requires the same access as cost reads. Optional from/to bounds and tz (IANA timezone used to bucket the returned hourly/daily token series; defaults to UTC); the cache hit rate is null when no prompt input was observed.",
   request: {
     params: z.object({ companyId: z.string() }),
-    query: z.object({ from: z.string().optional(), to: z.string().optional() }),
+    query: z.object({ from: z.string().optional(), to: z.string().optional(), tz: z.string().optional() }),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });

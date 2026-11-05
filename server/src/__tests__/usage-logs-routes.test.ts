@@ -23,6 +23,7 @@ const summaryFixture = {
   tokensProcessed: 3000,
   cacheHitRate: 0.25,
   unpricedCount: 12,
+  series: [],
 };
 
 function app(type: "board" | "agent" = "board", role = "member") {
@@ -83,7 +84,7 @@ describe("usage summary route", () => {
     const response = await request(app()).get(summaryPath);
     expect(response.status).toBe(200);
     expect(response.body).toEqual(summaryFixture);
-    expect(mocks.summary).toHaveBeenCalledExactlyOnceWith(companyId, undefined);
+    expect(mocks.summary).toHaveBeenCalledExactlyOnceWith(companyId, undefined, "UTC");
     expect(mocks.decide).toHaveBeenCalledWith(expect.objectContaining({
       action: "company_scope:read",
       resource: { type: "company", companyId },
@@ -95,11 +96,25 @@ describe("usage summary route", () => {
     const to = "2026-01-02";
     const response = await request(app()).get(`${summaryPath}?from=${from}&to=${to}`);
     expect(response.status).toBe(200);
-    expect(mocks.summary).toHaveBeenCalledExactlyOnceWith(companyId, { from: new Date(from), to: new Date(to) });
+    expect(mocks.summary).toHaveBeenCalledExactlyOnceWith(companyId, { from: new Date(from), to: new Date(to) }, "UTC");
     for (const query of ["from=nope", "to=nope", "from=2026-02-02T00:00:00.000Z&to=2026-01-01T00:00:00.000Z"]) {
       expect((await request(app()).get(`${summaryPath}?${query}`)).status).toBe(400);
     }
     expect(mocks.summary).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards the viewer timezone and canonicalizes it for the SQL bucketing", async () => {
+    const response = await request(app()).get(`${summaryPath}?tz=asia%2Fshanghai`);
+    expect(response.status).toBe(200);
+    expect(mocks.summary).toHaveBeenCalledExactlyOnceWith(companyId, undefined, "Asia/Shanghai");
+  });
+
+  it("rejects invalid timezones with 400 before touching the service", async () => {
+    for (const tz of ["Not/AZone", "../../etc/passwd", "UTC; drop table x"]) {
+      const response = await request(app()).get(`${summaryPath}?tz=${encodeURIComponent(tz)}`);
+      expect(response.status).toBe(400);
+    }
+    expect(mocks.summary).not.toHaveBeenCalled();
   });
 
   it("rejects agents, foreign companies and denied cost-scope readers without aggregating", async () => {

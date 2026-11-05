@@ -370,7 +370,8 @@ describeEmbeddedPostgres("usage request log persistence", () => {
 
       // tokensProcessed = fresh + output + cached input; cache write is a
       // billed-token input for cost allocation, not part of processed tokens.
-      expect(await service.summary(summaryCompanyId)).toEqual({
+      const summary = await service.summary(summaryCompanyId);
+      expect(summary).toMatchObject({
         companyId: summaryCompanyId,
         totalRequests: 4,
         freshInputTokens: 1410,
@@ -381,9 +382,14 @@ describeEmbeddedPostgres("usage request log persistence", () => {
         cacheHitRate: 300 / 1710,
         unpricedCount: 4,
       });
+      // The series follows the summary's window (no from/to -> the extent of
+      // the matching rows), so its bucket sums equal the card totals.
+      expect(summary.series.reduce((n, point) => n + point.requests, 0)).toBe(4);
+      expect(summary.series.reduce((n, point) => n + point.tokens, 0)).toBe(2170);
 
       const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
-      expect(await service.summary(summaryCompanyId, { from: hourAgo })).toEqual({
+      const windowed = await service.summary(summaryCompanyId, { from: hourAgo });
+      expect(windowed).toMatchObject({
         companyId: summaryCompanyId,
         totalRequests: 3,
         freshInputTokens: 1400,
@@ -394,6 +400,8 @@ describeEmbeddedPostgres("usage request log persistence", () => {
         cacheHitRate: 300 / 1700,
         unpricedCount: 3,
       });
+      expect(windowed.series.reduce((n, point) => n + point.requests, 0)).toBe(3);
+      expect(windowed.series.reduce((n, point) => n + point.tokens, 0)).toBe(2150);
       // A company with no rows aggregates to the zero state with a null rate.
       expect(await service.summary(randomUUID())).toEqual({
         companyId: expect.any(String),
@@ -405,6 +413,7 @@ describeEmbeddedPostgres("usage request log persistence", () => {
         tokensProcessed: 0,
         cacheHitRate: null,
         unpricedCount: 0,
+        series: [],
       });
     });
 
@@ -428,6 +437,169 @@ describeEmbeddedPostgres("usage request log persistence", () => {
       expect(summary.totalRequests).toBe(1);
       expect(summary.cacheHitRate).toBeNull();
       expect(summary.tokensProcessed).toBe(0);
+    });
+  });
+
+  describe("summary series bucketing", () => {
+    // Spec Metrics: fresh input + output + cached input = (1200 - 300) + 450 + 300.
+    const PROCESSED_TOKENS = 1650;
+    const processedUsage = { inputTokens: 1200, cachedInputTokens: 300, cacheWriteTokens: 100, outputTokens: 450 };
+    const createdCompanyIds: string[] = [];
+
+    /**
+     * One isolated company per test: bucketing windows overlap between the
+     * DST cases, so rows from one test must never be visible to another's
+     * series.
+     */
+    async function freshSeriesCompany() {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Usage Series",
+        // Unique per company: issue_prefix has a unique index and these
+        // companies are created per test.
+        issuePrefix: companyId.replaceAll("-", "").slice(0, 4).toUpperCase(),
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "UsageSeries",
+        role: "engineer",
+        status: "active",
+        adapterType: "paperclip_runner",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "on_demand",
+        status: "running",
+        contextSnapshot: {},
+      });
+      createdCompanyIds.push(companyId);
+      return { companyId, runId };
+    }
+
+    afterAll(async () => {
+      for (const companyId of createdCompanyIds) {
+        await db.delete(usageRequestLogs).where(eq(usageRequestLogs.companyId, companyId));
+        await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+        await db.delete(agents).where(eq(agents.companyId, companyId));
+        await db.delete(companies).where(eq(companies.id, companyId));
+      }
+    });
+
+    async function seriesRow(
+      ids: { companyId: string; runId: string },
+      occurredAt: Date,
+      usage: Record<string, number> = processedUsage,
+    ) {
+      await db.insert(usageRequestLogs).values({
+        companyId: ids.companyId,
+        runId: ids.runId,
+        app: "opencode",
+        provider: "paperclip",
+        biller: "paperclip",
+        model: "openai/gpt-5.2",
+        inputTokens: usage.inputTokens ?? null,
+        cachedInputTokens: usage.cachedInputTokens ?? null,
+        cacheWriteTokens: usage.cacheWriteTokens ?? null,
+        outputTokens: usage.outputTokens ?? null,
+        requestId: randomUUID(),
+        occurredAt,
+      });
+    }
+
+    function bucketTokens(summary: { series: { tokens: number; requests: number }[] }) {
+      return {
+        tokens: summary.series.reduce((n, point) => n + point.tokens, 0),
+        requests: summary.series.reduce((n, point) => n + point.requests, 0),
+      };
+    }
+
+    it("buckets an hourly series across a DST spring-forward in the viewer timezone", async () => {
+      // America/New_York jumps 02:00 EST -> 03:00 EDT on 2026-03-08, so the
+      // wall-clock 02:00 hour does not exist. The window is local 00:00-12:00.
+      const ids = await freshSeriesCompany();
+      await seriesRow(ids, new Date("2026-03-08T06:30:00Z")); // 01:30 EST
+      await seriesRow(ids, new Date("2026-03-08T07:30:00Z")); // 03:30 EDT
+      const summary = await usageRequestLogService(db).summary(ids.companyId, {
+        from: new Date("2026-03-08T05:00:00Z"), // 00:00 EST
+        to: new Date("2026-03-08T16:00:00Z"), // 12:00 EDT
+      }, "America/New_York");
+      expect(summary.series).toHaveLength(12);
+      expect(summary.series[0]).toEqual({ bucketStart: "2026-03-08T05:00:00.000Z", tokens: 0, requests: 0 });
+      // Wall 01:00 EST is 06:00Z and wall 03:00 EDT is 07:00Z: the skipped
+      // wall 02:00 hour is not a bucket, yet the bucket starts stay unique.
+      expect(summary.series[1]).toEqual({ bucketStart: "2026-03-08T06:00:00.000Z", tokens: PROCESSED_TOKENS, requests: 1 });
+      expect(summary.series[2]).toEqual({ bucketStart: "2026-03-08T07:00:00.000Z", tokens: PROCESSED_TOKENS, requests: 1 });
+      expect(summary.series.slice(3).every((point) => point.tokens === 0 && point.requests === 0)).toBe(true);
+      expect(bucketTokens(summary)).toEqual({ tokens: summary.tokensProcessed, requests: summary.totalRequests });
+    });
+
+    it("merges the repeated wall hour of a DST fall-back into one bucket", async () => {
+      // America/New_York repeats wall 01:00 on 2026-11-01 (01:00 EDT then
+      // 01:00 EST). Both rows truncate to the same wall hour, so a single
+      // bucket holds them while the bucket sums still match the cards.
+      const ids = await freshSeriesCompany();
+      await seriesRow(ids, new Date("2026-11-01T05:30:00Z")); // 01:30 EDT
+      await seriesRow(ids, new Date("2026-11-01T06:30:00Z")); // 01:30 EST
+      const summary = await usageRequestLogService(db).summary(ids.companyId, {
+        from: new Date("2026-11-01T04:00:00Z"), // 00:00 EDT
+        to: new Date("2026-11-02T04:00:00Z"), // 23:00 EST
+      }, "America/New_York");
+      const withRequests = summary.series.filter((point) => point.requests > 0);
+      expect(withRequests).toHaveLength(1);
+      expect(withRequests[0]).toEqual({ bucketStart: "2026-11-01T06:00:00.000Z", tokens: 2 * PROCESSED_TOKENS, requests: 2 });
+      expect(bucketTokens(summary)).toEqual({ tokens: summary.tokensProcessed, requests: summary.totalRequests });
+    });
+
+    it("switches to local-midnight day buckets with zero fill for multi-day windows", async () => {
+      // Asia/Shanghai (UTC+8, no DST): a row at 16:30Z is already the next
+      // local day, so it belongs to that day's local-midnight bucket rather
+      // than the UTC day bucket it would land in without the timezone.
+      const ids = await freshSeriesCompany();
+      await seriesRow(ids, new Date("2026-11-02T16:30:00Z")); // Nov 3, 00:30 +08
+      await seriesRow(ids, new Date("2026-11-04T08:00:00Z")); // Nov 4, 16:00 +08
+      const summary = await usageRequestLogService(db).summary(ids.companyId, {
+        from: new Date("2026-10-31T16:00:00Z"), // Nov 1, 00:00 +08
+        to: new Date("2026-11-04T16:00:00Z"), // Nov 5, 00:00 +08
+      }, "Asia/Shanghai");
+      expect(summary.series).toHaveLength(5); // local Nov 1 .. Nov 5
+      expect(summary.series[0]).toEqual({ bucketStart: "2026-10-31T16:00:00.000Z", tokens: 0, requests: 0 });
+      expect(summary.series[2]).toEqual({ bucketStart: "2026-11-02T16:00:00.000Z", tokens: PROCESSED_TOKENS, requests: 1 }); // local Nov 3
+      expect(summary.series[3]).toEqual({ bucketStart: "2026-11-03T16:00:00.000Z", tokens: PROCESSED_TOKENS, requests: 1 }); // local Nov 4
+      expect(summary.series[4]).toEqual({ bucketStart: "2026-11-04T16:00:00.000Z", tokens: 0, requests: 0 }); // zero-filled day
+      expect(bucketTokens(summary)).toEqual({ tokens: summary.tokensProcessed, requests: summary.totalRequests });
+    });
+
+    it("uses hour buckets up to a 48h window and day buckets beyond it", async () => {
+      const ids = await freshSeriesCompany();
+      const exactly48h = await usageRequestLogService(db).summary(ids.companyId, {
+        from: new Date("2026-03-08T00:00:00Z"),
+        to: new Date("2026-03-10T00:00:00Z"),
+      }, "UTC");
+      expect(exactly48h.series).toHaveLength(49);
+      expect(new Date(exactly48h.series[1]!.bucketStart).getTime() - new Date(exactly48h.series[0]!.bucketStart).getTime()).toBe(3_600_000);
+
+      const justOver48h = await usageRequestLogService(db).summary(ids.companyId, {
+        from: new Date("2026-03-08T00:00:00Z"),
+        to: new Date("2026-03-10T00:00:00.001Z"),
+      }, "UTC");
+      expect(justOver48h.series).toHaveLength(3); // day-aligned, zero-filled
+      expect(new Date(justOver48h.series[1]!.bucketStart).getTime() - new Date(justOver48h.series[0]!.bucketStart).getTime()).toBe(24 * 3_600_000);
+    });
+
+    it("returns an empty series when there is neither a window nor rows", async () => {
+      const summary = await usageRequestLogService(db).summary(randomUUID());
+      expect(summary.series).toEqual([]);
     });
   });
 

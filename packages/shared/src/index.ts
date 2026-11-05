@@ -1257,6 +1257,7 @@ export type {
   CostByProject,
   UsageRequestLogRow,
   UsageSummary,
+  UsageSummarySeriesPoint,
   FinanceEvent,
   FinanceSummary,
   FinanceByBiller,
