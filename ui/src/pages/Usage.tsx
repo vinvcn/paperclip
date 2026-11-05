@@ -10,6 +10,7 @@ import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
 import { formatDateTime, formatDurationMs, formatTokens, providerDisplayName } from "../lib/utils";
+import { UsageTokensChart } from "./usage/UsageTokensChart";
 import type { UsageSummary } from "@paperclipai/shared";
 
 const NO_COMPANY = "__none__";
@@ -94,7 +95,8 @@ export function Usage() {
   });
   const summaryQuery = useQuery({
     queryKey: queryKeys.usageSummary(companyId),
-    queryFn: () => usageApi.summary(companyId),
+    // The browser's IANA timezone drives the server-side series bucketing.
+    queryFn: () => usageApi.summary(companyId, Intl.DateTimeFormat().resolvedOptions().timeZone),
     enabled: !!selectedCompanyId,
   });
 
@@ -123,6 +125,7 @@ export function Usage() {
       ) : (
         <>
           <SummaryCards summary={summaryQuery.data} />
+          <UsageTokensChart series={summaryQuery.data?.series} />
           <Card className="gap-3 py-4">
             <CardHeader className="gap-0 px-5">
               <CardTitle className="text-base">Request logs</CardTitle>

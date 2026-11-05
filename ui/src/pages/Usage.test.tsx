@@ -68,6 +68,7 @@ function summary(overrides: Partial<UsageSummary> = {}): UsageSummary {
     tokensProcessed: 3000,
     cacheHitRate: 0.25,
     unpricedCount: 12,
+    series: [],
     ...overrides,
   };
 }
@@ -156,11 +157,30 @@ describe("Usage page", () => {
     expect(second.textContent).toContain("12.4s");
   });
 
-  it("fetches the usage summary endpoint for the selected company", async () => {
+  it("fetches the usage summary endpoint with the browser's timezone for the selected company", async () => {
     renderPage();
     await act(async () => {
-      await vi.waitFor(() => expect(usageSummaryMock).toHaveBeenCalledExactlyOnceWith("company-1"));
+      await vi.waitFor(() => expect(usageSummaryMock).toHaveBeenCalledExactlyOnceWith(
+        "company-1",
+        Intl.DateTimeFormat().resolvedOptions().timeZone,
+      ));
     });
+  });
+
+  it("renders the summary's token series as chart columns, zero buckets included", async () => {
+    usageSummaryMock.mockResolvedValue(summary({
+      series: [
+        { bucketStart: "2026-11-04T13:00:00Z", tokens: 2000, requests: 4 },
+        { bucketStart: "2026-11-04T14:00:00Z", tokens: 0, requests: 0 },
+        { bucketStart: "2026-11-04T15:00:00Z", tokens: 1000, requests: 2 },
+      ],
+    }));
+    renderPage();
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelectorAll('[data-testid="usage-chart-bar"]')).toHaveLength(3));
+    });
+    expect(container.querySelectorAll('[data-testid="usage-chart-bar"][data-zero]')).toHaveLength(1);
+    expect(container.textContent).toContain("Tokens");
   });
 
   it("renders the summary cards with formatted totals inside one bordered block", async () => {
