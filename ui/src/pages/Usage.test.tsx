@@ -583,6 +583,110 @@ function expectLocationParams(pairs: Record<string, string>) {
     });
   });
 
+  describe("table tabs", () => {
+    /** The tab triggers as the table card's header renders them. */
+    function tabTriggers(): HTMLElement[] {
+      return [...container.querySelectorAll<HTMLElement>('[role="tab"]')];
+    }
+    function tabByLabel(label: string): HTMLElement {
+      return tabTriggers().find((el) => el.textContent!.includes(label))!;
+    }
+    /** Radix tab triggers activate on mousedown, not click. */
+    async function clickTab(label: string) {
+      await act(async () => {
+        tabByLabel(label).dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        await Promise.resolve();
+      });
+    }
+
+    it("shows Request logs, Providers and Models tabs with a visible P2 marker on the placeholders", async () => {
+      usageLogsMock.mockResolvedValue(pageOf([row()]));
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(container.querySelector("tbody tr")).not.toBeNull());
+      });
+      expect(tabTriggers()).toHaveLength(3);
+      expect(tabByLabel("Request logs").getAttribute("aria-selected")).toBe("true");
+      // The placeholder tabs are real, clickable controls, visibly marked P2.
+      for (const label of ["Providers", "Models"]) {
+        const tab = tabByLabel(label);
+        expect(tab.tagName).toBe("BUTTON");
+        expect(tab.hasAttribute("disabled")).toBe(false);
+        expect(tab.textContent).toContain(label);
+        expect(tab.textContent).toContain("P2");
+      }
+      expect(tabByLabel("Request logs").textContent).not.toContain("P2");
+    });
+
+    it("renders a short coming-in-P2 panel instead of an empty table on the placeholder tabs", async () => {
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith("company-1", { from: DEFAULT_FROM }, 20, null));
+      });
+      // The tab strip lives in the settled card, past the initial skeleton.
+      await act(async () => {
+        await vi.waitFor(() => expect(tabTriggers()).toHaveLength(3));
+      });
+      await clickTab("Providers");
+      expect(container.querySelector("table")).toBeNull();
+      expect(container.textContent).toContain("per-provider breakdown");
+      // The logs empty state must not bleed into the placeholder view.
+      expect(container.textContent).not.toContain("No requests observed yet");
+      await clickTab("Models");
+      expect(container.querySelector("table")).toBeNull();
+      expect(container.textContent).toContain("per-model breakdown");
+      expect(container.textContent).not.toContain("No requests observed yet");
+    });
+
+    it("switching tabs sends no requests and restores the logs view with filters, page and cursor intact", async () => {
+      usageLogsMock.mockImplementation((_companyId: string, _filters: unknown, _limit: number, after: string | null) => {
+        if (after == null) return Promise.resolve(pageOf([row({ requestId: "tab-1", occurredAt: "2026-11-04T10:00:00Z" })], 2, "cursor-tab"));
+        if (after === "cursor-tab") return Promise.resolve(pageOf([row({ requestId: "tab-2", occurredAt: "2026-11-04T09:00:00Z" })], 2, null));
+        return Promise.reject(new Error(`unexpected cursor ${after}`));
+      });
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(container.querySelector('select[aria-label="Filter by status"]')).not.toBeNull());
+      });
+      const statusSelect = container.querySelector('select[aria-label="Filter by status"]') as HTMLSelectElement;
+      await act(async () => {
+        statusSelect.value = "success";
+        statusSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({ status: "success", from: DEFAULT_FROM }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expect(container.querySelector("tbody tr")).not.toBeNull());
+      });
+      await clickButton("Next");
+      const pageTwoTime = formatDateTime("2026-11-04T09:00:00Z", { includeSeconds: true });
+      await act(async () => {
+        await vi.waitFor(() => expect([...container.querySelectorAll("tbody tr td:first-child")].map((td) => td.textContent)).toEqual([pageTwoTime]));
+      });
+      const logsCalls = usageLogsMock.mock.calls.length;
+      const summaryCalls = usageSummaryMock.mock.calls.length;
+      // The switch itself triggers no reads — the queries stay mounted and
+      // only the card's content is swapped.
+      await clickTab("Providers");
+      expect(usageLogsMock.mock.calls.length).toBe(logsCalls);
+      expect(usageSummaryMock.mock.calls.length).toBe(summaryCalls);
+      expect(container.querySelector("table")).toBeNull();
+      await clickTab("Models");
+      expect(usageLogsMock.mock.calls.length).toBe(logsCalls);
+      expect(usageSummaryMock.mock.calls.length).toBe(summaryCalls);
+      // Back: the full view returns exactly where it was — same filter, same
+      // cursor-anchored page, no refetch.
+      await clickTab("Request logs");
+      expect(usageLogsMock.mock.calls.length).toBe(logsCalls);
+      expect(usageSummaryMock.mock.calls.length).toBe(summaryCalls);
+      expect(tabByLabel("Request logs").getAttribute("aria-selected")).toBe("true");
+      expect([...container.querySelectorAll("tbody tr td:first-child")].map((td) => td.textContent)).toEqual([pageTwoTime]);
+      expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { status: "success", from: DEFAULT_FROM }, 20, "cursor-tab");
+      expectLocationParams({ status: "success", from: DEFAULT_FROM });
+    });
+  });
+
   describe("pagination", () => {
     /** Rows for the walk test: seven distinct requests across three pages. */
     const walkRows: UsageRequestLogRow[] = Array.from({ length: 7 }, (_, index) =>

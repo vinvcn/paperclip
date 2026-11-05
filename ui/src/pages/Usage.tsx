@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ScrollText, RefreshCw } from "lucide-react";
+import { ScrollText, RefreshCw, Layers } from "lucide-react";
 import { USAGE_STATUS_FILTERS, type UsageStatusFilter, type UsageSummaryFacets } from "@paperclipai/shared";
 import { usageApi, type UsageLogFilters } from "../api/usage";
 import {
@@ -17,7 +17,9 @@ import {
 import { ApiError } from "../api/client";
 import { EmptyState } from "../components/EmptyState";
 import { PageSkeleton } from "../components/PageSkeleton";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { NativeSelect } from "@/components/ui/select";
 import { useSearchParams } from "@/lib/router";
@@ -213,6 +215,23 @@ function requestCostCell(row: UsageRequestLogRow) {
 /** Spec metric: null means the denominator was zero, never 0%. */
 function formatCacheHitRate(rate: number | null): string {
   return rate == null ? "—" : `${(rate * 100).toFixed(1)}%`;
+}
+
+/** The table card's tabs (docs/specs/usage-request-logs.md, UI). */
+type UsageTableTab = "logs" | "providers" | "models";
+
+const TABLE_TAB_BADGE = "font-normal text-muted-foreground";
+
+/**
+ * The P1 placeholder view behind the Providers and Models tabs: one honest
+ * sentence, no promised date, and never an empty table that would read as
+ * "no provider data" (docs/specs/usage-request-logs.md, UI).
+ */
+function TableTabPlaceholder({ view }: { view: Exclude<UsageTableTab, "logs"> }) {
+  const message = view === "providers"
+    ? "A per-provider breakdown of the window's requests is planned for P2; until then the Request logs tab is the complete view."
+    : "A per-model breakdown of the window's requests is planned for P2; until then the Request logs tab is the complete view.";
+  return <EmptyState icon={Layers} title="Coming in P2" message={message} />;
 }
 
 function SummaryMetric({ label, value, badge }: { label: string; value: string | number; badge?: string }) {
@@ -565,6 +584,15 @@ export function Usage() {
   const activeCursor = onFirstPage ? null : pagination.cursor;
   const activeHistory = onFirstPage ? [] : pagination.history;
   const page = activeHistory.length + 1;
+  /**
+   * The table card's tab is deliberately page state — not URL, not storage
+   * (docs/specs/usage-request-logs.md, UI): the spec asks only for the
+   * layout and an honest P2 placeholder, and every visit or shared link
+   * should land on the one implemented view rather than a placeholder. The
+   * reads below stay mounted while a placeholder is shown, so switching
+   * tabs fetches nothing and switching back restores the exact view.
+   */
+  const [tableTab, setTableTab] = useState<UsageTableTab>("logs");
   const logsQuery = useQuery({
     queryKey: queryKeys.usageRequestLogs(companyId, filters, preferences.pageSize, activeCursor),
     queryFn: () => usageApi.logs(companyId, filters, preferences.pageSize, activeCursor),
@@ -648,90 +676,112 @@ export function Usage() {
             onRefresh={onRefresh}
           />
           <Card aria-busy={bridging} className={cn("gap-3 py-4", bridging && "opacity-60 transition-opacity")}>
-            <CardHeader className="gap-0 px-5">
-              <CardTitle className="text-base">Request logs</CardTitle>
-              <CardDescription>Newest provider requests, newest first.</CardDescription>
-            </CardHeader>
-            <CardContent className="px-5">
-              {(logsQuery.data?.rows.length ?? 0) === 0 ? (
-                activeFilterNames.length > 0 ? (
-                  <EmptyState
-                    icon={ScrollText}
-                    title="No requests match the current filters"
-                    message={`No observed requests match ${activeFilterNames.join(", ")}. Clear a filter to widen the view.`}
-                  />
-                ) : (
-                  <EmptyState
-                    icon={ScrollText}
-                    title="No requests observed yet"
-                    message="Model calls made through the runner's provider proxy appear here as they happen. Requests that bypass the proxy — legacy adapters and direct provider traffic — are not captured yet."
-                  />
-                )
-              ) : (
-                <div className="overflow-x-auto">
-                  <table aria-label="Usage request logs" className="w-full text-sm">
-                    <thead className="text-muted-foreground">
-                      <tr className="border-b border-border">
-                        <th scope="col" className="py-2 pr-4 text-left font-medium">Time</th>
-                        <th scope="col" className="px-4 py-2 text-left font-medium">App</th>
-                        <th scope="col" className="px-4 py-2 text-left font-medium">Provider</th>
-                        <th scope="col" className="px-4 py-2 text-left font-medium">Model</th>
-                        <th scope="col" className="px-4 py-2 text-right font-medium">Cost</th>
-                        <th scope="col" className="px-4 py-2 text-right font-medium">Status</th>
-                        <th scope="col" className="py-2 pl-4 text-right font-medium">Duration</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {logsQuery.data!.rows.map((row) => (
-                        <tr key={row.id} className="border-b border-border last:border-0">
-                          <td className="whitespace-nowrap py-3 pr-4 tabular-nums text-muted-foreground">
-                            {formatDateTime(row.occurredAt, { includeSeconds: true })}
-                          </td>
-                          <td className="px-4 py-3">{row.app}</td>
-                          <td className="px-4 py-3">{providerDisplayName(row.provider)}</td>
-                          <td className="px-4 py-3 font-mono">{row.model}</td>
-                          <td className="whitespace-nowrap px-4 py-3 text-right tabular-nums">
-                            {requestCostCell(row)}
-                          </td>
-                          {/* Aligned with the status classes: 6xx+ transport errors read as "other", not failures. */}
-                          <td className={`px-4 py-3 text-right tabular-nums${row.httpStatus != null && row.httpStatus >= 400 && row.httpStatus < 600 ? " text-destructive" : ""}`}>
-                            {formatRequestStatus(row.httpStatus)}
-                          </td>
-                          <td className="whitespace-nowrap py-3 pl-4 text-right tabular-nums">
-                            {formatRequestDuration(row.durationMs)}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+            <Tabs value={tableTab} onValueChange={(value) => setTableTab(value as UsageTableTab)} className="gap-0">
+              <CardHeader className="gap-0 px-5">
+                <div className="max-w-full overflow-x-auto pb-2">
+                  <TabsList variant="line" className="justify-start">
+                    <TabsTrigger value="logs">Request logs</TabsTrigger>
+                    <TabsTrigger value="providers">
+                      Providers
+                      <Badge variant="outline" className={TABLE_TAB_BADGE}>P2</Badge>
+                    </TabsTrigger>
+                    <TabsTrigger value="models">
+                      Models
+                      <Badge variant="outline" className={TABLE_TAB_BADGE}>P2</Badge>
+                    </TabsTrigger>
+                  </TabsList>
                 </div>
-              )}
-              {logsQuery.data && logsQuery.data.rows.length > 0 ? (
-                <div className="mt-3 flex items-center justify-between border-t border-border pt-3">
-                  <p aria-live="polite" className="text-xs tabular-nums text-muted-foreground">
-                    {logsQuery.data.total} matching {logsQuery.data.total === 1 ? "request" : "requests"}
-                  </p>
-                  <div className="flex items-center gap-2">
-                    {/* While the placeholder bridge shows the previous read
-                        behind a changed epoch, its cursor is meaningless for
-                        the pending read — both turns are dead until the real
-                        page settles. */}
-                    <Button variant="outline" size="sm" disabled={page === 1 || logsQuery.isPlaceholderData} onClick={onPrevPage}>
-                      Previous
-                    </Button>
-                    <span className="text-xs tabular-nums text-muted-foreground">Page {page}</span>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={!logsQuery.data.nextCursor || logsQuery.isPlaceholderData}
-                      onClick={onNextPage}
-                    >
-                      Next
-                    </Button>
-                  </div>
-                </div>
-              ) : null}
-            </CardContent>
+              </CardHeader>
+              <CardContent className="px-5">
+                <TabsContent value="logs">
+                  <CardDescription className="mb-3">Newest provider requests, newest first.</CardDescription>
+                  {(logsQuery.data?.rows.length ?? 0) === 0 ? (
+                    activeFilterNames.length > 0 ? (
+                      <EmptyState
+                        icon={ScrollText}
+                        title="No requests match the current filters"
+                        message={`No observed requests match ${activeFilterNames.join(", ")}. Clear a filter to widen the view.`}
+                      />
+                    ) : (
+                      <EmptyState
+                        icon={ScrollText}
+                        title="No requests observed yet"
+                        message="Model calls made through the runner's provider proxy appear here as they happen. Requests that bypass the proxy — legacy adapters and direct provider traffic — are not captured yet."
+                      />
+                    )
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table aria-label="Usage request logs" className="w-full text-sm">
+                        <thead className="text-muted-foreground">
+                          <tr className="border-b border-border">
+                            <th scope="col" className="py-2 pr-4 text-left font-medium">Time</th>
+                            <th scope="col" className="px-4 py-2 text-left font-medium">App</th>
+                            <th scope="col" className="px-4 py-2 text-left font-medium">Provider</th>
+                            <th scope="col" className="px-4 py-2 text-left font-medium">Model</th>
+                            <th scope="col" className="px-4 py-2 text-right font-medium">Cost</th>
+                            <th scope="col" className="px-4 py-2 text-right font-medium">Status</th>
+                            <th scope="col" className="py-2 pl-4 text-right font-medium">Duration</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {logsQuery.data!.rows.map((row) => (
+                            <tr key={row.id} className="border-b border-border last:border-0">
+                              <td className="whitespace-nowrap py-3 pr-4 tabular-nums text-muted-foreground">
+                                {formatDateTime(row.occurredAt, { includeSeconds: true })}
+                              </td>
+                              <td className="px-4 py-3">{row.app}</td>
+                              <td className="px-4 py-3">{providerDisplayName(row.provider)}</td>
+                              <td className="px-4 py-3 font-mono">{row.model}</td>
+                              <td className="whitespace-nowrap px-4 py-3 text-right tabular-nums">
+                                {requestCostCell(row)}
+                              </td>
+                              {/* Aligned with the status classes: 6xx+ transport errors read as "other", not failures. */}
+                              <td className={`px-4 py-3 text-right tabular-nums${row.httpStatus != null && row.httpStatus >= 400 && row.httpStatus < 600 ? " text-destructive" : ""}`}>
+                                {formatRequestStatus(row.httpStatus)}
+                              </td>
+                              <td className="whitespace-nowrap py-3 pl-4 text-right tabular-nums">
+                                {formatRequestDuration(row.durationMs)}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                  {logsQuery.data && logsQuery.data.rows.length > 0 ? (
+                    <div className="mt-3 flex items-center justify-between border-t border-border pt-3">
+                      <p aria-live="polite" className="text-xs tabular-nums text-muted-foreground">
+                        {logsQuery.data.total} matching {logsQuery.data.total === 1 ? "request" : "requests"}
+                      </p>
+                      <div className="flex items-center gap-2">
+                        {/* While the placeholder bridge shows the previous read
+                            behind a changed epoch, its cursor is meaningless for
+                            the pending read — both turns are dead until the real
+                            page settles. */}
+                        <Button variant="outline" size="sm" disabled={page === 1 || logsQuery.isPlaceholderData} onClick={onPrevPage}>
+                          Previous
+                        </Button>
+                        <span className="text-xs tabular-nums text-muted-foreground">Page {page}</span>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={!logsQuery.data.nextCursor || logsQuery.isPlaceholderData}
+                          onClick={onNextPage}
+                        >
+                          Next
+                        </Button>
+                      </div>
+                    </div>
+                  ) : null}
+                </TabsContent>
+                <TabsContent value="providers">
+                  <TableTabPlaceholder view="providers" />
+                </TabsContent>
+                <TabsContent value="models">
+                  <TableTabPlaceholder view="models" />
+                </TabsContent>
+              </CardContent>
+            </Tabs>
           </Card>
         </>
       )}
