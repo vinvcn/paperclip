@@ -19,7 +19,12 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
 import { PROVIDER_REQUEST_USAGE_KIND, usageProviderAndBillerFromModel } from "../vendor/paperclip-runner/index.js";
-import { allocateRunCosts, sweepRunUsageRequestLogEvents, usageRequestLogService } from "./usage-request-logs.js";
+import {
+  allocateRunCosts,
+  sweepRunUsageRequestLogEvents,
+  usageRequestLogService,
+  type UsageRequestFilters,
+} from "./usage-request-logs.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -720,7 +725,7 @@ describeEmbeddedPostgres("usage request log persistence", () => {
       expect(filtered.facets.providers).toHaveLength(2);
     });
 
-    it.each([
+    it.each<[UsageRequestFilters, number]>([
       [{ app: "opencode" }, 3],
       [{ provider: "openrouter" }, 3],
       [{ model: "openai/gpt-5.2" }, 2],
@@ -730,7 +735,7 @@ describeEmbeddedPostgres("usage request log persistence", () => {
       [{ status: "other" }, 1],
       [{ app: "opencode", status: "success" }, 1],
       [{ app: "codex", status: "success" }, 0],
-    ] as const)("narrows the summary totals, series and log list with the same filters %j", async (filters, expected) => {
+    ])("narrows the summary totals, series and log list with the same filters %j", async (filters, expected) => {
       const service = usageRequestLogService(db);
       const summary = await service.summary(filterCompanyId, undefined, "UTC", filters);
       expect(summary.totalRequests).toBe(expected);

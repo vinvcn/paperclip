@@ -1,8 +1,8 @@
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
-import { USAGE_STATUS_FILTERS, type UsageRequestFilters, type UsageStatusFilter } from "@paperclipai/shared";
+import { USAGE_STATUS_FILTERS, type UsageStatusFilter } from "@paperclipai/shared";
 import { accessService } from "../services/index.js";
-import { usageRequestLogService } from "../services/usage-request-logs.js";
+import { usageRequestLogService, type UsageRequestFilters } from "../services/usage-request-logs.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 import { parseCostDateRange } from "./costs.js";
 import { badRequest } from "../errors.js";
