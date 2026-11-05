@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ScrollText } from "lucide-react";
+import { ScrollText, RefreshCw } from "lucide-react";
 import { USAGE_STATUS_FILTERS, type UsageStatusFilter, type UsageSummaryFacets } from "@paperclipai/shared";
 import { usageApi, type UsageLogFilters } from "../api/usage";
 import {
@@ -274,7 +274,7 @@ function SummaryCards({ summary, busy }: { summary: UsageSummary | undefined; bu
  * control writes the URL (window and filters) or the remembered preferences
  * (page size), so a filtered view can be shared or restored next visit.
  */
-function UsageFilterBar({ facets, filters, onFilterChange, selectedRange, onRangeChange, pageSize, onPageSizeChange }: {
+function UsageFilterBar({ facets, filters, onFilterChange, selectedRange, onRangeChange, pageSize, onPageSizeChange, refreshing, onRefresh }: {
   facets: UsageSummaryFacets | undefined;
   filters: UsageLogFilters;
   onFilterChange: (key: "app" | "provider" | "model" | "status", value: string | null) => void;
@@ -282,6 +282,8 @@ function UsageFilterBar({ facets, filters, onFilterChange, selectedRange, onRang
   onRangeChange: (range: UsageTimeRange) => void;
   pageSize: UsagePageSize;
   onPageSizeChange: (size: UsagePageSize) => void;
+  refreshing: boolean;
+  onRefresh: () => void;
 }) {
   const selectClass = "w-auto min-w-40";
   return (
@@ -302,6 +304,10 @@ function UsageFilterBar({ facets, filters, onFilterChange, selectedRange, onRang
             never silently lies about which window is applied. */}
         {selectedRange === "custom" ? <option value="custom">Custom range</option> : null}
       </NativeSelect>
+      <Button variant="outline" size="sm" aria-label="Refresh usage data" onClick={onRefresh}>
+        <RefreshCw className={cn("h-3.5 w-3.5", refreshing && "animate-spin")} />
+        Refresh
+      </Button>
       <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Filter by app">
         <Button
           variant={filters.app ? "ghost" : "secondary"}
@@ -500,6 +506,16 @@ export function Usage() {
   };
 
   /**
+   * Manual refresh: re-read both endpoints for the current view (docs/specs/
+   * usage-request-logs.md, UI). The poll's clock is not disturbed —
+   * refetch() simply brings the next read forward.
+   */
+  const onRefresh = () => {
+    logsQuery.refetch();
+    summaryQuery.refetch();
+  };
+
+  /**
    * Keyset page turns (docs/specs/usage-request-logs.md, API). Next anchors
    * the next read at this page's `nextCursor`; Previous replays the stored
    * cursor of the page before. Both stamp the current epoch, so the state
@@ -548,6 +564,11 @@ export function Usage() {
     queryFn: () => usageApi.logs(companyId, filters, preferences.pageSize, activeCursor),
     enabled: !!selectedCompanyId,
     placeholderData: keepPreviousDataForSameCompany<UsageRequestLogPage>(companyId),
+    // Refresh on mount, on demand, and every 30 seconds while the page is
+    // open; the poll pauses while the tab is hidden (docs/specs/
+    // usage-request-logs.md, UI).
+    refetchInterval: USAGE_POLL_MS,
+    refetchIntervalInBackground: false,
   });
   const summaryQuery = useQuery({
     queryKey: queryKeys.usageSummary(companyId, filters),
@@ -555,6 +576,8 @@ export function Usage() {
     queryFn: () => usageApi.summary(companyId, Intl.DateTimeFormat().resolvedOptions().timeZone, filters),
     enabled: !!selectedCompanyId,
     placeholderData: keepPreviousDataForSameCompany<UsageSummary>(companyId),
+    refetchInterval: USAGE_POLL_MS,
+    refetchIntervalInBackground: false,
   });
   // While a filter change refetches behind the placeholder bridge, the chips
   // and selects already read as applied but the cards/chart/table still show
@@ -562,7 +585,7 @@ export function Usage() {
   // figures are not mistaken for the answer (initial load keeps its skeleton;
   // this only covers the bridged case — a background poll refetches real data
   // and must not flicker the page).
-  const usageFetching = logsQuery.isFetching || summaryQuery.isFetching;
+  const refreshing = logsQuery.isFetching || summaryQuery.isFetching;
   const bridging =
     (logsQuery.isFetching && logsQuery.isPlaceholderData) || (summaryQuery.isFetching && summaryQuery.isPlaceholderData);
 
@@ -605,8 +628,8 @@ export function Usage() {
         <PageSkeleton />
       ) : (
         <>
-          <SummaryCards summary={summaryQuery.data} busy={usageFetching} />
-          <UsageTokensChart series={summaryQuery.data?.series} busy={usageFetching} />
+          <SummaryCards summary={summaryQuery.data} busy={bridging} />
+          <UsageTokensChart series={summaryQuery.data?.series} busy={bridging} />
           <UsageFilterBar
             facets={summaryQuery.data?.facets}
             filters={filters}
@@ -615,8 +638,10 @@ export function Usage() {
             onRangeChange={onRangeChange}
             pageSize={preferences.pageSize}
             onPageSizeChange={onPageSizeChange}
+            refreshing={refreshing}
+            onRefresh={onRefresh}
           />
-          <Card aria-busy={usageFetching} className={cn("gap-3 py-4", usageFetching && "opacity-60 transition-opacity")}>
+          <Card aria-busy={bridging} className={cn("gap-3 py-4", bridging && "opacity-60 transition-opacity")}>
             <CardHeader className="gap-0 px-5">
               <CardTitle className="text-base">Request logs</CardTitle>
               <CardDescription>Newest provider requests, newest first.</CardDescription>

@@ -180,6 +180,15 @@ describe("Usage page", () => {
     return container.querySelector('[data-testid="location-probe"]')!.textContent ?? "";
   }
 
+    async function clickButton(label: "Next" | "Previous") {
+      const button = [...container.querySelectorAll("button")].find((el) => el.textContent === label)!;
+      await act(async () => {
+        button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await Promise.resolve();
+      });
+    }
+
+
 
 /**
  * The shareable URL's params, compared parsed: URLSearchParams serializes
@@ -588,14 +597,6 @@ function expectLocationParams(pairs: Record<string, string>) {
       });
     }
 
-    async function clickButton(label: "Next" | "Previous") {
-      const button = [...container.querySelectorAll("button")].find((el) => el.textContent === label)!;
-      await act(async () => {
-        button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-        await Promise.resolve();
-      });
-    }
-
     it("walks every row exactly once across pages: no duplicates, no gaps", async () => {
       mockThreePages();
       renderPage();
@@ -900,6 +901,161 @@ function expectLocationParams(pairs: Record<string, string>) {
       });
       // The previous company's window did not leak into the new company's URL.
       expectLocationParams({ app: "opencode" });
+    });
+  });
+
+  describe("polling and refresh", () => {
+    /**
+     * One flush pass under faked timers: microtasks plus a 0ms tick —
+     * react-query's store notification lands on the (faked) timer tick, not
+     * a bare microtask, so the render needs it to catch up.
+     */
+    async function flushPass() {
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(0);
+      });
+    }
+
+    /** Drains the fetch promise chain under faked timers (no clock movement). */
+    async function settle() {
+      for (let turn = 0; turn < 6; turn += 1) {
+        await flushPass();
+      }
+    }
+
+    /** Flushes until a condition holds (vi.waitFor would advance the faked clock). */
+    async function settleUntil(check: () => boolean) {
+      for (let turn = 0; turn < 50 && !check(); turn += 1) {
+        await flushPass();
+      }
+      expect(check()).toBe(true);
+    }
+
+    function setTabHidden(hidden: boolean) {
+      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => (hidden ? "hidden" : "visible") });
+      window.dispatchEvent(new Event("visibilitychange"));
+    }
+
+    afterEach(() => {
+      // Drop the visibilityState override so jsdom's own getter applies again.
+      delete (document as { visibilityState?: unknown }).visibilityState;
+    });
+
+    it("re-reads both endpoints every 30 seconds while the page is open", async () => {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"], now: NOW });
+      renderPage();
+      await settle();
+      const logsCalls = usageLogsMock.mock.calls.length;
+      const summaryCalls = usageSummaryMock.mock.calls.length;
+      expect(logsCalls).toBeGreaterThan(0);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      await settle();
+      expect(usageLogsMock.mock.calls.length).toBeGreaterThan(logsCalls);
+      expect(usageSummaryMock.mock.calls.length).toBeGreaterThan(summaryCalls);
+    });
+
+    it("pauses the poll while the tab is hidden and resumes when it is visible again", async () => {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"], now: NOW });
+      renderPage();
+      await settle();
+      const callsAtHide = usageLogsMock.mock.calls.length;
+      setTabHidden(true);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(90_000);
+      });
+      await settle();
+      // Three poll ticks passed without a single extra read.
+      expect(usageLogsMock.mock.calls.length).toBe(callsAtHide);
+      setTabHidden(false);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      await settle();
+      expect(usageLogsMock.mock.calls.length).toBeGreaterThan(callsAtHide);
+    });
+
+    it("keeps a cursor-anchored page stable when a poll brings newer rows", async () => {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"], now: NOW });
+      const pageTwoRow = row({ requestId: "req-anchored", occurredAt: "2026-11-04T11:00:00Z" });
+      usageLogsMock.mockImplementation((_companyId: string, _filters: unknown, _limit: number, after: string | null) => {
+        if (after == null) {
+          // Page one keeps admitting newer rows on every read.
+          return Promise.resolve(pageOf([row({ requestId: `newer-${usageLogsMock.mock.calls.length}` })], 4, "cursor-1"));
+        }
+        return Promise.resolve(pageOf([pageTwoRow], 4, null));
+      });
+      renderPage();
+      await settle();
+      await settleUntil(() => [...container.querySelectorAll("button")].some((el) => el.textContent === "Next"));
+      await clickButton("Next");
+      await settle();
+      // The anchored page fetched once through its cursor.
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith(
+          "company-1",
+          { from: DEFAULT_FROM },
+          20,
+          "cursor-1",
+        ));
+      });
+      const anchoredCells = [...container.querySelectorAll("tbody tr td")].map((td) => td.textContent);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      await settle();
+      // The poll re-read the SAME anchored page — the cursor survived, so the
+      // newer rows that landed on page one cannot shift this view.
+      expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { from: DEFAULT_FROM }, 20, "cursor-1");
+      expect([...container.querySelectorAll("tbody tr td")].map((td) => td.textContent)).toEqual(anchoredCells);
+    });
+
+    it("does not flicker the busy state while a background poll refetches", async () => {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"], now: NOW });
+      renderPage();
+      await settle();
+      expect(document.querySelector('[aria-busy="true"]')).toBeNull();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      await settle();
+      // The poll re-read real data: the cards and table stay marked not-busy.
+      expect(document.querySelector('[aria-busy="true"]')).toBeNull();
+    });
+
+    it("re-reads both endpoints on the manual refresh button", async () => {
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: DEFAULT_FROM },
+          20,
+          null,
+        ));
+      });
+      let refreshButton: HTMLButtonElement | null = null;
+      await act(async () => {
+        await vi.waitFor(() => {
+          refreshButton = container.querySelector('button[aria-label="Refresh usage data"]');
+          expect(refreshButton).not.toBeNull();
+        });
+      });
+      usageLogsMock.mockClear();
+      usageSummaryMock.mockClear();
+      await act(async () => {
+        (refreshButton as unknown as HTMLButtonElement).dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await Promise.resolve();
+      });
+      await act(async () => {
+        await vi.waitFor(() => {
+          expect(usageLogsMock).toHaveBeenCalledTimes(1);
+          expect(usageSummaryMock).toHaveBeenCalledTimes(1);
+        });
+      });
+      // The refresh re-reads the current view, cursor included.
+      expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { from: DEFAULT_FROM }, 20, null);
     });
   });
 });
