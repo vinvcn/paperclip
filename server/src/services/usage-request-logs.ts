@@ -70,6 +70,9 @@ export async function allocateRunCosts(db: Db, companyId: string, runId: string)
     .limit(1);
   if (alreadyPriced) return 0;
 
+  // A `subscription_included` receipt carries cost 0 and still prices its
+  // matched rows — at $0.00, not left unpriced: the cost is known-free,
+  // which is a different fact from an unmeasured (unknown) request.
   const receipts = await db.select({
       model: costEvents.model,
       cents: sql<string>`sum(${costEvents.costCents})::text`,
