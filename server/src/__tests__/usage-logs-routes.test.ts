@@ -25,7 +25,7 @@ const summaryFixture = {
   cacheHitRate: 0.25,
   unpricedCount: 12,
   series: [],
-  facets: { apps: [], providers: [], models: [] },
+  facets: { apps: [], providers: [], models: [], modelsTruncated: false },
 };
 
 function app(type: "board" | "agent" = "board", role = "member") {
@@ -50,12 +50,12 @@ beforeEach(() => {
 });
 
 describe("usage request log route authorization", () => {
-  it("returns the latest rows for board readers with the cost-scope read decision", async () => {
-    const rows = [{ requestId: "r1" }];
-    mocks.latest.mockResolvedValue(rows);
+  it("returns the latest rows page for board readers with the cost-scope read decision", async () => {
+    const page = { rows: [{ requestId: "r1" }], total: 1, nextCursor: null };
+    mocks.latest.mockResolvedValue(page);
     const response = await request(app()).get(`${logsPath}?limit=5`);
     expect(response.status).toBe(200);
-    expect(response.body).toEqual(rows);
+    expect(response.body).toEqual(page);
     expect(mocks.latest).toHaveBeenCalledExactlyOnceWith(companyId, 5, {});
     expect(mocks.decide).toHaveBeenCalledWith(expect.objectContaining({
       action: "company_scope:read",
@@ -179,6 +179,41 @@ describe("usage filter params", () => {
     expect((await request(app()).get(`${logsPath}?status=nope`)).status).toBe(400);
     expect((await request(app()).get(`${logsPath}?from=nope`)).status).toBe(400);
     expect((await request(app()).get(`${logsPath}?provider=a&provider=b`)).status).toBe(400);
+    expect(mocks.latest).not.toHaveBeenCalled();
+  });
+});
+
+describe("usage logs keyset cursor", () => {
+  it("parses the after cursor into an occurred-at instant and row id for the service", async () => {
+    const occurredAt = "2026-11-04T12:00:00.000Z";
+    const id = "22222222-2222-4222-8222-222222222222";
+    await request(app()).get(`${logsPath}?after=${encodeURIComponent(`${occurredAt},${id}`)}`);
+    expect(mocks.latest).toHaveBeenCalledExactlyOnceWith(companyId, 20, {
+      after: { occurredAt: new Date(occurredAt), id },
+    });
+  });
+
+  it("treats an absent or empty after cursor as page one", async () => {
+    await request(app()).get(logsPath);
+    await request(app()).get(`${logsPath}?after=`);
+    expect(mocks.latest).toHaveBeenNthCalledWith(1, companyId, 20, {});
+    expect(mocks.latest).toHaveBeenNthCalledWith(2, companyId, 20, {});
+  });
+
+  it("rejects malformed cursors with 400 before reading rows", async () => {
+    for (const after of [
+      "nope",
+      "nope,nope",
+      "2026-11-04T12:00:00Z",
+      ",22222222-2222-4222-8222-222222222222",
+      // A valid instant whose row id is not a uuid would otherwise reach the
+      // service's `::uuid` cast and surface as a 500.
+      "2026-11-04T12:00:00Z,not-a-uuid",
+    ]) {
+      const response = await request(app()).get(`${logsPath}?after=${encodeURIComponent(after)}`);
+      expect(response.status).toBe(400);
+    }
+    expect((await request(app()).get(`${logsPath}?after=a&after=b`)).status).toBe(400);
     expect(mocks.latest).not.toHaveBeenCalled();
   });
 });

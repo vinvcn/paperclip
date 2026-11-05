@@ -17,6 +17,28 @@ export function parseUsageLimit(query: Record<string, unknown>) {
   return limit;
 }
 
+/** Row ids are uuids; anything else would reach the SQL as a `::uuid` cast error. */
+const USAGE_CURSOR_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The logs list's keyset cursor (docs/specs/usage-request-logs.md, API):
+ * `after` is the previous response's `nextCursor`, encoded as
+ * `<occurred-at ISO>,<row id>`. Both halves are validated — a cursor the
+ * server cannot parse is a 400, never a silently restarted page one, so a
+ * broken client sees its bug instead of silently duplicated rows.
+ */
+export function parseUsageCursor(query: Record<string, unknown>): { occurredAt: Date; id: string } | undefined {
+  const raw = query.after;
+  if (raw == null || raw === "") return undefined;
+  if (typeof raw !== "string") throw badRequest("invalid 'after' value");
+  const separator = raw.indexOf(",");
+  if (separator === -1) throw badRequest("invalid 'after' value");
+  const occurredAt = new Date(raw.slice(0, separator));
+  const id = raw.slice(separator + 1);
+  if (Number.isNaN(occurredAt.getTime()) || !USAGE_CURSOR_ID_PATTERN.test(id)) throw badRequest("invalid 'after' value");
+  return { occurredAt, id };
+}
+
 /**
  * The summary's series is bucketed in the viewer's timezone (an IANA name the
  * browser reports via `Intl.DateTimeFormat().resolvedOptions().timeZone`).
@@ -65,10 +87,9 @@ export function parseUsageFilters(query: Record<string, unknown>): UsageRequestF
 
 /**
  * Usage request log reads (docs/specs/usage-request-logs.md). P1 exposes the
- * filtered newest rows plus the aggregated summary with facets; keyset
- * pagination follows with the persistence ticket. Authorization mirrors the
- * costs read endpoints: board actors with the company cost-scope read
- * decision.
+ * keyset-paginated filtered newest rows plus the aggregated summary with
+ * facets. Authorization mirrors the costs read endpoints: board actors with
+ * the company cost-scope read decision.
  */
 export function usageRoutes(db: Db) {
   const router = Router();
@@ -97,7 +118,8 @@ export function usageRoutes(db: Db) {
     const limit = parseUsageLimit(req.query);
     const range = parseCostDateRange(req.query);
     const filters = parseUsageFilters(req.query);
-    res.json(await logs.latest(companyId, limit, { ...filters, range }));
+    const after = parseUsageCursor(req.query);
+    res.json(await logs.latest(companyId, limit, { ...filters, range, ...(after ? { after } : {}) }));
   });
 
   router.get("/companies/:companyId/usage/summary", async (req, res) => {

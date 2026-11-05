@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Usage } from "./Usage";
 import { ApiError } from "../api/client";
 import { formatDateTime } from "../lib/utils";
-import type { UsageRequestLogRow, UsageSummary } from "@paperclipai/shared";
+import type { UsageRequestLogPage, UsageRequestLogRow, UsageSummary } from "@paperclipai/shared";
 
 const usageLogsMock = vi.hoisted(() => vi.fn());
 const usageSummaryMock = vi.hoisted(() => vi.fn());
@@ -40,6 +40,25 @@ function createDeferred<T>() {
     resolve = nextResolve;
   });
   return { promise, resolve };
+}
+
+/** The frozen clock the preference tests read windows against. */
+const NOW = new Date("2026-11-05T12:00:00Z");
+const DEFAULT_FROM = "2026-11-04T12:00:00.000Z"; // last 24 hours
+const FROM_7D = "2026-10-29T12:00:00.000Z";
+const FROM_30D = "2026-10-06T12:00:00.000Z";
+
+/** One keyset page as the logs endpoint now answers (docs/specs/usage-request-logs.md, API). */
+function pageOf(rows: UsageRequestLogRow[], total: number = rows.length, nextCursor: string | null = null): UsageRequestLogPage {
+  return { rows, total, nextCursor };
+}
+
+/**
+ * Every logs read carries the page size and the keyset cursor (null on page
+ * one) on top of the filters, per the paginated endpoint contract.
+ */
+function expectLastLogsCall(filters: Record<string, unknown>, limit: number = 20, after: string | null = null) {
+  expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", filters, limit, after);
 }
 
 function row(overrides: Partial<UsageRequestLogRow> = {}): UsageRequestLogRow {
@@ -85,7 +104,7 @@ function summary(overrides: Partial<UsageSummary> = {}): UsageSummary {
     cacheHitRate: 0.25,
     unpricedCount: 12,
     series: [],
-    facets: { apps: [], providers: [], models: [] },
+    facets: { apps: [], providers: [], models: [], modelsTruncated: false },
     ...overrides,
   };
 }
@@ -96,6 +115,7 @@ function summaryWithFacets(): UsageSummary {
       apps: [{ value: "opencode", requests: 5 }],
       providers: [{ value: "openrouter", requests: 3 }, { value: "anthropic", requests: 2 }],
       models: [{ value: "z-ai/glm-4.6", requests: 5 }],
+      modelsTruncated: false,
     },
   });
 }
@@ -103,9 +123,11 @@ function summaryWithFacets(): UsageSummary {
 describe("Usage page", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot> | null = null;
+  let activeQueryClient: QueryClient | null = null;
 
   function renderPage(initialUrl = "/") {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    activeQueryClient = queryClient;
     root = createRoot(container);
     act(() => {
       root!.render(
@@ -120,6 +142,26 @@ describe("Usage page", () => {
       );
     });
     return queryClient;
+  }
+
+  /**
+   * Re-renders the mounted page in place (same router and query client), so
+   * a test can change the mocked company selection mid-flight the way a
+   * company switch does in the app.
+   */
+  function rerenderPage() {
+    act(() => {
+      root!.render(
+        <MemoryRouter initialEntries={[]}>
+          <QueryClientProvider client={activeQueryClient!}>
+            <div>
+              <Usage />
+              <LocationProbe />
+            </div>
+          </QueryClientProvider>
+        </MemoryRouter>,
+      );
+    });
   }
 
   /** Read one summary metric by its label, as the cards present it. */
@@ -138,12 +180,35 @@ describe("Usage page", () => {
     return container.querySelector('[data-testid="location-probe"]')!.textContent ?? "";
   }
 
+    async function clickButton(label: "Next" | "Previous") {
+      const button = [...container.querySelectorAll("button")].find((el) => el.textContent === label)!;
+      await act(async () => {
+        button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await Promise.resolve();
+      });
+    }
+
+
+
+/**
+ * The shareable URL's params, compared parsed: URLSearchParams serializes
+ * the colons of an ISO `from` as %3A, which would make exact-string
+ * assertions unreadable without saying anything about the state.
+ */
+function expectLocationParams(pairs: Record<string, string>) {
+  const actual = new URLSearchParams(locationSearch());
+  const keys = Object.keys(pairs);
+  expect([...actual.keys()].sort()).toEqual([...keys].sort());
+  for (const key of keys) expect(actual.get(key)).toBe(pairs[key]);
+}
+
   beforeEach(() => {
     container = document.createElement("div");
     document.body.appendChild(container);
     companyState.selectedCompanyId = "company-1";
+    vi.useFakeTimers({ toFake: ["Date"], now: NOW });
     usageLogsMock.mockReset();
-    usageLogsMock.mockResolvedValue([]);
+    usageLogsMock.mockResolvedValue(pageOf([]));
     usageSummaryMock.mockReset();
     usageSummaryMock.mockResolvedValue(summary());
   });
@@ -152,19 +217,21 @@ describe("Usage page", () => {
     act(() => root?.unmount());
     root = null;
     container.remove();
+    localStorage.clear();
     vi.clearAllMocks();
+    vi.useRealTimers();
   });
 
   it("fetches the usage logs endpoint for the selected company", async () => {
     renderPage();
     await act(async () => {
-      await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith("company-1", {}));
+      await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith("company-1", { from: DEFAULT_FROM }, 20, null));
     });
     expect(setBreadcrumbsMock).toHaveBeenCalledWith([{ label: "Usage" }]);
   });
 
   it("renders request rows with the P1 skeleton columns", async () => {
-    usageLogsMock.mockResolvedValue([
+    usageLogsMock.mockResolvedValue(pageOf([
       row(),
       row({
         id: "33333333-3333-4333-8333-333333333333",
@@ -175,7 +242,7 @@ describe("Usage page", () => {
         durationMs: 12_400,
         occurredAt: "2026-11-04T13:30:00Z",
       }),
-    ]);
+    ]));
     renderPage();
     await act(async () => {
       await vi.waitFor(() => expect(container.querySelector("tbody tr")).not.toBeNull());
@@ -200,10 +267,10 @@ describe("Usage page", () => {
   });
 
   it("renders per-row cost as the allocated amount, or Unpriced in a warning tone", async () => {
-    usageLogsMock.mockResolvedValue([
+    usageLogsMock.mockResolvedValue(pageOf([
       row({ costCents: "150.0000000", costStatus: "priced" }),
       row({ id: "44444444-4444-4444-8444-444444444444", requestId: "req-unpriced", costCents: null, costStatus: "unpriced" }),
-    ]);
+    ]));
     renderPage();
     await act(async () => {
       await vi.waitFor(() => expect(container.querySelectorAll("tbody tr")).toHaveLength(2));
@@ -226,7 +293,7 @@ describe("Usage page", () => {
       await vi.waitFor(() => expect(usageSummaryMock).toHaveBeenCalledExactlyOnceWith(
         "company-1",
         Intl.DateTimeFormat().resolvedOptions().timeZone,
-        {},
+        { from: DEFAULT_FROM },
       ));
     });
   });
@@ -248,7 +315,7 @@ describe("Usage page", () => {
   });
 
   it("renders the summary cards with formatted totals inside one bordered block", async () => {
-    usageLogsMock.mockResolvedValue([row()]);
+    usageLogsMock.mockResolvedValue(pageOf([row()]));
     usageSummaryMock.mockResolvedValue(summary({ totalCostCents: "1250.0000000" }));
     renderPage();
     await act(async () => {
@@ -292,9 +359,9 @@ describe("Usage page", () => {
   });
 
   it("renders missing status and duration as em dashes", async () => {
-    usageLogsMock.mockResolvedValue([
+    usageLogsMock.mockResolvedValue(pageOf([
       row({ httpStatus: null, durationMs: null }),
-    ]);
+    ]));
     renderPage();
     await act(async () => {
       await vi.waitFor(() => expect(container.querySelector("tbody tr")).not.toBeNull());
@@ -370,7 +437,7 @@ describe("Usage page", () => {
         await vi.waitFor(() => expect(appChipLabels()).toEqual(["All", "opencode"]));
       });
       // No dead chip for "ghost" — but the filter still applies to the data.
-      expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { app: "ghost" });
+      expectLastLogsCall({ app: "ghost", from: DEFAULT_FROM });
     });
 
     it("applies the clicked app chip to both reads and the URL", async () => {
@@ -385,20 +452,17 @@ describe("Usage page", () => {
         chip.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });
       await act(async () => {
-        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { app: "opencode" }));
+        await vi.waitFor(() => expectLastLogsCall({ app: "opencode", from: DEFAULT_FROM }));
       });
-      expect(usageSummaryMock).toHaveBeenLastCalledWith("company-1", expect.any(String), { app: "opencode" });
-      expect(locationSearch()).toBe("?app=opencode");
+      expect(usageSummaryMock).toHaveBeenLastCalledWith("company-1", expect.any(String), { app: "opencode", from: DEFAULT_FROM });
+      expectLocationParams({ app: "opencode", from: DEFAULT_FROM });
     });
 
     it("initializes filters from the URL and drops them again on All", async () => {
       usageSummaryMock.mockResolvedValue(summaryWithFacets());
       renderPage("/?app=opencode&status=client_error");
       await act(async () => {
-        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith(
-          "company-1",
-          { app: "opencode", status: "client_error" },
-        ));
+        await vi.waitFor(() => expectLastLogsCall({ app: "opencode", status: "client_error", from: DEFAULT_FROM }));
       });
       await act(async () => {
         await vi.waitFor(() => expect(container.querySelector('div[aria-label="Filter by app"]')).not.toBeNull());
@@ -408,9 +472,9 @@ describe("Usage page", () => {
         allChip.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });
       await act(async () => {
-        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { status: "client_error" }));
+        await vi.waitFor(() => expectLastLogsCall({ status: "client_error", from: DEFAULT_FROM }));
       });
-      expect(locationSearch()).toBe("?status=client_error");
+      expectLocationParams({ status: "client_error", from: DEFAULT_FROM });
     });
 
     it("applies the provider, model and status selects to both reads and the URL", async () => {
@@ -425,7 +489,7 @@ describe("Usage page", () => {
         providerSelect.dispatchEvent(new Event("change", { bubbles: true }));
       });
       await act(async () => {
-        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { provider: "openrouter" }));
+        await vi.waitFor(() => expectLastLogsCall({ provider: "openrouter", from: DEFAULT_FROM }));
       });
 
       const modelSelect = container.querySelector('select[aria-label="Filter by model"]') as HTMLSelectElement;
@@ -446,17 +510,33 @@ describe("Usage page", () => {
         statusSelect.dispatchEvent(new Event("change", { bubbles: true }));
       });
       await act(async () => {
-        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith(
-          "company-1",
-          { provider: "openrouter", model: "z-ai/glm-4.6", status: "server_error" },
-        ));
+        await vi.waitFor(() => expectLastLogsCall({ provider: "openrouter", model: "z-ai/glm-4.6", status: "server_error", from: DEFAULT_FROM }));
       });
       expect(usageSummaryMock).toHaveBeenLastCalledWith(
         "company-1",
         expect.any(String),
-        { provider: "openrouter", model: "z-ai/glm-4.6", status: "server_error" },
+        { provider: "openrouter", model: "z-ai/glm-4.6", status: "server_error", from: DEFAULT_FROM },
       );
-      expect(locationSearch()).toBe("?provider=openrouter&model=z-ai%2Fglm-4.6&status=server_error");
+      expectLocationParams({ provider: "openrouter", model: "z-ai/glm-4.6", status: "server_error", from: DEFAULT_FROM });
+    });
+
+    it("keeps showing a selected model the window's facets no longer list", async () => {
+      usageSummaryMock.mockResolvedValue(summaryWithFacets());
+      // A shared/remembered URL can name a model outside the current window's
+      // top-50 facets — the select must still display the applied value.
+      renderPage("/?model=openai/gpt-5.2");
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({ model: "openai/gpt-5.2", from: DEFAULT_FROM }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expect(container.querySelector('select[aria-label="Filter by model"]')).not.toBeNull());
+      });
+      const modelSelect = container.querySelector('select[aria-label="Filter by model"]') as HTMLSelectElement;
+      await act(async () => {
+        await vi.waitFor(() => expect(modelSelect.value).toBe("openai/gpt-5.2"));
+      });
+      const option = modelSelect.querySelector('option[value="openai/gpt-5.2"]')!;
+      expect(option.textContent).toBe("openai/gpt-5.2");
     });
 
     it("shows the filtered empty state naming the current filters", async () => {
@@ -500,6 +580,538 @@ describe("Usage page", () => {
         await vi.waitFor(() => expect(container.querySelector('[aria-busy="true"]')).toBeNull());
       });
       expect(metricValue("Total requests")).toBe("3");
+    });
+  });
+
+  describe("pagination", () => {
+    /** Rows for the walk test: seven distinct requests across three pages. */
+    const walkRows: UsageRequestLogRow[] = Array.from({ length: 7 }, (_, index) =>
+      row({
+        id: `55555555-5555-4555-8555-${String(index).padStart(12, "0")}`,
+        requestId: `req-${index}`,
+        occurredAt: new Date(Date.UTC(2026, 10, 4, 12, index)).toISOString(),
+      }),
+    );
+    /** The Time-cell text each walk row renders (the table's row identity). */
+    const times = (rows: UsageRequestLogRow[]) =>
+      rows.map((r) => formatDateTime(r.occurredAt, { includeSeconds: true }));
+
+    /** Three keyset pages keyed by the `after` cursor, as the server would serve them. */
+    function mockThreePages() {
+      usageLogsMock.mockImplementation((_companyId: string, _filters: unknown, _limit: number, after: string | null) => {
+        if (after == null) return Promise.resolve(pageOf(walkRows.slice(0, 3), 7, "cursor-1"));
+        if (after === "cursor-1") return Promise.resolve(pageOf(walkRows.slice(3, 6), 7, "cursor-2"));
+        if (after === "cursor-2") return Promise.resolve(pageOf(walkRows.slice(6, 7), 7, null));
+        return Promise.reject(new Error(`unexpected cursor ${after}`));
+      });
+    }
+
+    function renderedRowTimes(): string[] {
+      return [...container.querySelectorAll("tbody tr td:first-child")].map((td) => td.textContent!);
+    }
+
+    async function waitForRendered(expected: string[]) {
+      await act(async () => {
+        await vi.waitFor(() => expect(renderedRowTimes()).toEqual(expected));
+      });
+    }
+
+    it("walks every row exactly once across pages: no duplicates, no gaps", async () => {
+      mockThreePages();
+      renderPage();
+      const seen: string[] = [];
+      await waitForRendered(times(walkRows.slice(0, 3)));
+      seen.push(...renderedRowTimes());
+      await clickButton("Next");
+      await waitForRendered(times(walkRows.slice(3, 6)));
+      seen.push(...renderedRowTimes());
+      await clickButton("Next");
+      await waitForRendered(times(walkRows.slice(6, 7)));
+      seen.push(...renderedRowTimes());
+      // Every row, in order, exactly once.
+      expect(seen).toEqual(times(walkRows));
+      expect(new Set(seen).size).toBe(seen.length);
+      expect(usageLogsMock).toHaveBeenNthCalledWith(2, "company-1", { from: DEFAULT_FROM }, 20, "cursor-1");
+      expect(usageLogsMock).toHaveBeenNthCalledWith(3, "company-1", { from: DEFAULT_FROM }, 20, "cursor-2");
+    });
+
+    it("renders the total matching count and disables turning past the last page", async () => {
+      mockThreePages();
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(container.textContent).toContain("7 matching requests"));
+      });
+      await clickButton("Next");
+      await waitForRendered(times(walkRows.slice(3, 6)));
+      await clickButton("Next");
+      await waitForRendered(times(walkRows.slice(6, 7)));
+      expect(container.textContent).toContain("Page 3");
+      const next = [...container.querySelectorAll("button")].find((button) => button.textContent === "Next")!;
+      expect(next.hasAttribute("disabled")).toBe(true);
+    });
+
+    it("returns to the previous page's anchored read with Previous", async () => {
+      mockThreePages();
+      renderPage();
+      await waitForRendered(times(walkRows.slice(0, 3)));
+      await clickButton("Next");
+      await waitForRendered(times(walkRows.slice(3, 6)));
+      await clickButton("Previous");
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { from: DEFAULT_FROM }, 20, null));
+      });
+      await waitForRendered(times(walkRows.slice(0, 3)));
+      expect(container.textContent).toContain("Page 1");
+    });
+
+    it("disables both page turns while a filter change bridges the previous page", async () => {
+      mockThreePages();
+      renderPage();
+      await waitForRendered(times(walkRows.slice(0, 3)));
+      await clickButton("Next");
+      await waitForRendered(times(walkRows.slice(3, 6)));
+      // The narrowed read hangs: the placeholder bridge keeps page two (and
+      // its nextCursor) on screen while the new epoch's page one is in
+      // flight — its cursor must not be reachable.
+      const deferred = createDeferred<UsageRequestLogPage>();
+      usageLogsMock.mockImplementation(() => deferred.promise);
+      const statusSelect = container.querySelector('select[aria-label="Filter by status"]') as HTMLSelectElement;
+      await act(async () => {
+        statusSelect.value = "server_error";
+        statusSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => {
+          const next = [...container.querySelectorAll("button")].find((button) => button.textContent === "Next")!;
+          expect(next.hasAttribute("disabled")).toBe(true);
+        });
+      });
+      const previous = [...container.querySelectorAll("button")].find((button) => button.textContent === "Previous")!;
+      expect(previous.hasAttribute("disabled")).toBe(true);
+      await act(async () => {
+        deferred.resolve(pageOf(walkRows.slice(0, 3), 7, "cursor-filtered"));
+        await deferred.promise;
+      });
+      // The real page settles and the turns come back.
+      await act(async () => {
+        await vi.waitFor(() => {
+          const next = [...container.querySelectorAll("button")].find((button) => button.textContent === "Next")!;
+          expect(next.hasAttribute("disabled")).toBe(false);
+        });
+      });
+    });
+
+    it("starts over at page one when a filter changes", async () => {
+      mockThreePages();
+      renderPage();
+      await waitForRendered(times(walkRows.slice(0, 3)));
+      await clickButton("Next");
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { from: DEFAULT_FROM }, 20, "cursor-1"));
+      });
+      const statusSelect = container.querySelector('select[aria-label="Filter by status"]') as HTMLSelectElement;
+      await act(async () => {
+        statusSelect.value = "success";
+        statusSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      // The narrowed read is a fresh walk: page one, no cursor, no stale history.
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({ status: "success", from: DEFAULT_FROM }));
+      });
+      expect(container.textContent).toContain("Page 1");
+    });
+
+    it("changes the page size, restarts at page one and remembers it", async () => {
+      mockThreePages();
+      renderPage();
+      await waitForRendered(times(walkRows.slice(0, 3)));
+      await clickButton("Next");
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { from: DEFAULT_FROM }, 20, "cursor-1"));
+      });
+      const sizeSelect = container.querySelector('select[aria-label="Rows per page"]') as HTMLSelectElement;
+      await act(async () => {
+        sizeSelect.value = "50";
+        sizeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      // A different page size is a different walk: page one, no cursor.
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { from: DEFAULT_FROM }, 50, null));
+      });
+      expect(container.textContent).toContain("Page 1");
+      expect(JSON.parse(localStorage.getItem("paperclip.usagePrefs:company-1")!))
+        .toEqual(expect.objectContaining({ pageSize: 50 }));
+    });
+  });
+
+  describe("remembered preferences and time range", () => {
+    function seedPreferences(companyId: string, preferences: unknown) {
+      localStorage.setItem(`paperclip.usagePrefs:${companyId}`, JSON.stringify(preferences));
+    }
+    function storedPreferences(companyId: string): Record<string, unknown> {
+      return JSON.parse(localStorage.getItem(`paperclip.usagePrefs:${companyId}`)!);
+    }
+
+    /** The filter bar renders once the first read lands; wait for a select. */
+    async function selectByLabel(label: string): Promise<HTMLSelectElement> {
+      let select: HTMLSelectElement | null = null;
+      await act(async () => {
+        await vi.waitFor(() => {
+          select = container.querySelector(`select[aria-label="${label}"]`);
+          expect(select).not.toBeNull();
+        });
+      });
+      return select as unknown as HTMLSelectElement;
+    }
+
+    it("seeds a first visit with the spec defaults — last 24 hours, 20 rows — and writes nothing", async () => {
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: DEFAULT_FROM },
+          20,
+          null,
+        ));
+      });
+      // The URL carries the resolved absolute window so the view stays shareable.
+      expectLocationParams({ from: DEFAULT_FROM });
+      expect((await selectByLabel("Time range")).value).toBe("24h");
+      expect((await selectByLabel("Rows per page")).value).toBe("20");
+      // A first visit's defaults are implied by absent storage.
+      expect(localStorage.getItem("paperclip.usagePrefs:company-1")).toBeNull();
+    });
+
+    it("restores the remembered range, page size and filters, producing the same request on the next visit", async () => {
+      seedPreferences("company-1", {
+        range: "7d",
+        pageSize: 50,
+        filters: { provider: "openrouter", status: "server_error" },
+      });
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: FROM_7D, provider: "openrouter", status: "server_error" },
+          50,
+          null,
+        ));
+      });
+      expectLocationParams({ from: FROM_7D, provider: "openrouter", status: "server_error" });
+      // The next visit replays the identical request against the same storage.
+      act(() => root?.unmount());
+      container.remove();
+      container = document.createElement("div");
+      document.body.appendChild(container);
+      usageLogsMock.mockClear();
+      // waitFor polls advance the faked clock; re-anchor it so the rolling
+      // window re-derives the same absolute bounds.
+      vi.setSystemTime(NOW);
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: FROM_7D, provider: "openrouter", status: "server_error" },
+          50,
+          null,
+        ));
+      });
+    });
+
+    it("lets an explicit URL param win over the remembered filters, seeding only the absent ones", async () => {
+      seedPreferences("company-1", { range: "7d", pageSize: 20, filters: { app: "opencode" } });
+      renderPage("/?provider=anthropic");
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: FROM_7D, app: "opencode", provider: "anthropic" },
+          20,
+          null,
+        ));
+      });
+    });
+
+    it("ignores a from the browser cannot parse and falls back to the remembered preset", async () => {
+      seedPreferences("company-1", { range: "30d", pageSize: 20, filters: {} });
+      renderPage("/?from=nope");
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: FROM_30D },
+          20,
+          null,
+        ));
+      });
+      // The seed pass replaced the unusable bound with the preset's.
+      expectLocationParams({ from: FROM_30D });
+    });
+
+    it("ignores a reversed window the same way", async () => {
+      renderPage("/?from=2026-11-05T00:00:00Z&to=2026-11-04T00:00:00Z");
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: DEFAULT_FROM },
+          20,
+          null,
+        ));
+      });
+      expectLocationParams({ from: DEFAULT_FROM });
+    });
+
+    it("applies a custom from/to handed in the URL and labels the select Custom", async () => {
+      renderPage("/?from=2026-11-01T00:00:00Z&to=2026-11-02T00:00:00Z");
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: "2026-11-01T00:00:00Z", to: "2026-11-02T00:00:00Z" },
+          20,
+          null,
+        ));
+      });
+      expect((await selectByLabel("Time range")).value).toBe("custom");
+      // Custom bounds are a view state, never written over the remembered preset.
+      expect(localStorage.getItem("paperclip.usagePrefs:company-1")).toBeNull();
+    });
+
+    it("applies a preset selection to the URL and remembers it, including All time", async () => {
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: DEFAULT_FROM },
+          20,
+          null,
+        ));
+      });
+      const rangeSelect = await selectByLabel("Time range");
+      // waitFor polls advance the faked clock; re-anchor it so the preset's
+      // fresh window derives the exact absolute bounds.
+      vi.setSystemTime(NOW);
+      await act(async () => {
+        rangeSelect.value = "30d";
+        rangeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({ from: FROM_30D }));
+      });
+      expectLocationParams({ from: FROM_30D });
+      expect(storedPreferences("company-1")).toEqual(expect.objectContaining({ range: "30d" }));
+      // "All time" bounds nothing — no from, no to.
+      await act(async () => {
+        rangeSelect.value = "all";
+        rangeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({}));
+      });
+      expect(locationSearch()).toBe("");
+      expect(storedPreferences("company-1")).toEqual(expect.objectContaining({ range: "all" }));
+    });
+
+    it("does not resurrect a cleared filter from storage after the seed pass", async () => {
+      seedPreferences("company-1", { range: "24h", pageSize: 20, filters: { app: "opencode" } });
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({ app: "opencode", from: DEFAULT_FROM }));
+      });
+      let allChip: HTMLButtonElement | null = null;
+      await act(async () => {
+        await vi.waitFor(() => {
+          allChip = container.querySelector('div[aria-label="Filter by app"] button');
+          expect(allChip).not.toBeNull();
+        });
+      });
+      await act(async () => {
+        (allChip as unknown as HTMLButtonElement).dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({ from: DEFAULT_FROM }));
+      });
+      expectLocationParams({ from: DEFAULT_FROM });
+      // The cleared state is the new remembered one.
+      expect(storedPreferences("company-1")).toEqual(expect.objectContaining({ filters: {} }));
+    });
+
+    it("switches companies to their own remembered selection", async () => {
+      seedPreferences("company-1", { range: "7d", pageSize: 20, filters: {} });
+      seedPreferences("company-2", { range: "all", pageSize: 100, filters: { app: "opencode" } });
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: FROM_7D },
+          20,
+          null,
+        ));
+      });
+      companyState.selectedCompanyId = "company-2";
+      rerenderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith(
+          "company-2",
+          { app: "opencode" },
+          100,
+          null,
+        ));
+      });
+      // The previous company's window did not leak into the new company's URL.
+      expectLocationParams({ app: "opencode" });
+    });
+  });
+
+  describe("polling and refresh", () => {
+    /**
+     * One flush pass under faked timers: microtasks plus a 0ms tick —
+     * react-query's store notification lands on the (faked) timer tick, not
+     * a bare microtask, so the render needs it to catch up.
+     */
+    async function flushPass() {
+      await act(async () => {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(0);
+      });
+    }
+
+    /** Drains the fetch promise chain under faked timers (no clock movement). */
+    async function settle() {
+      for (let turn = 0; turn < 6; turn += 1) {
+        await flushPass();
+      }
+    }
+
+    /** Flushes until a condition holds (vi.waitFor would advance the faked clock). */
+    async function settleUntil(check: () => boolean) {
+      for (let turn = 0; turn < 50 && !check(); turn += 1) {
+        await flushPass();
+      }
+      expect(check()).toBe(true);
+    }
+
+    function setTabHidden(hidden: boolean) {
+      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => (hidden ? "hidden" : "visible") });
+      window.dispatchEvent(new Event("visibilitychange"));
+    }
+
+    afterEach(() => {
+      // Drop the visibilityState override so jsdom's own getter applies again.
+      delete (document as { visibilityState?: unknown }).visibilityState;
+    });
+
+    it("re-reads both endpoints every 30 seconds while the page is open", async () => {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"], now: NOW });
+      renderPage();
+      await settle();
+      const logsCalls = usageLogsMock.mock.calls.length;
+      const summaryCalls = usageSummaryMock.mock.calls.length;
+      expect(logsCalls).toBeGreaterThan(0);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      await settle();
+      expect(usageLogsMock.mock.calls.length).toBeGreaterThan(logsCalls);
+      expect(usageSummaryMock.mock.calls.length).toBeGreaterThan(summaryCalls);
+    });
+
+    it("pauses the poll while the tab is hidden and resumes when it is visible again", async () => {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"], now: NOW });
+      renderPage();
+      await settle();
+      const callsAtHide = usageLogsMock.mock.calls.length;
+      setTabHidden(true);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(90_000);
+      });
+      await settle();
+      // Three poll ticks passed without a single extra read.
+      expect(usageLogsMock.mock.calls.length).toBe(callsAtHide);
+      setTabHidden(false);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      await settle();
+      expect(usageLogsMock.mock.calls.length).toBeGreaterThan(callsAtHide);
+    });
+
+    it("keeps a cursor-anchored page stable when a poll brings newer rows", async () => {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"], now: NOW });
+      const pageTwoRow = row({ requestId: "req-anchored", occurredAt: "2026-11-04T11:00:00Z" });
+      usageLogsMock.mockImplementation((_companyId: string, _filters: unknown, _limit: number, after: string | null) => {
+        if (after == null) {
+          // Page one keeps admitting newer rows on every read.
+          return Promise.resolve(pageOf([row({ requestId: `newer-${usageLogsMock.mock.calls.length}` })], 4, "cursor-1"));
+        }
+        return Promise.resolve(pageOf([pageTwoRow], 4, null));
+      });
+      renderPage();
+      await settle();
+      await settleUntil(() => [...container.querySelectorAll("button")].some((el) => el.textContent === "Next"));
+      await clickButton("Next");
+      await settle();
+      // The anchored page fetched once through its cursor.
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith(
+          "company-1",
+          { from: DEFAULT_FROM },
+          20,
+          "cursor-1",
+        ));
+      });
+      const anchoredCells = [...container.querySelectorAll("tbody tr td")].map((td) => td.textContent);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      await settle();
+      // The poll re-read the SAME anchored page — the cursor survived, so the
+      // newer rows that landed on page one cannot shift this view.
+      expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { from: DEFAULT_FROM }, 20, "cursor-1");
+      expect([...container.querySelectorAll("tbody tr td")].map((td) => td.textContent)).toEqual(anchoredCells);
+    });
+
+    it("does not flicker the busy state while a background poll refetches", async () => {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"], now: NOW });
+      renderPage();
+      await settle();
+      expect(document.querySelector('[aria-busy="true"]')).toBeNull();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      await settle();
+      // The poll re-read real data: the cards and table stay marked not-busy.
+      expect(document.querySelector('[aria-busy="true"]')).toBeNull();
+    });
+
+    it("re-reads both endpoints on the manual refresh button", async () => {
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: DEFAULT_FROM },
+          20,
+          null,
+        ));
+      });
+      let refreshButton: HTMLButtonElement | null = null;
+      await act(async () => {
+        await vi.waitFor(() => {
+          refreshButton = container.querySelector('button[aria-label="Refresh usage data"]');
+          expect(refreshButton).not.toBeNull();
+        });
+      });
+      usageLogsMock.mockClear();
+      usageSummaryMock.mockClear();
+      await act(async () => {
+        (refreshButton as unknown as HTMLButtonElement).dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await Promise.resolve();
+      });
+      await act(async () => {
+        await vi.waitFor(() => {
+          expect(usageLogsMock).toHaveBeenCalledTimes(1);
+          expect(usageSummaryMock).toHaveBeenCalledTimes(1);
+        });
+      });
+      // The refresh re-reads the current view, cursor included.
+      expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { from: DEFAULT_FROM }, 20, null);
     });
   });
 });

@@ -1256,6 +1256,7 @@ export type {
   CostWindowSpendRow,
   CostByProject,
   UsageRequestLogRow,
+  UsageRequestLogPage,
   UsageStatusFilter,
   UsageSummary,
   UsageSummaryFacet,

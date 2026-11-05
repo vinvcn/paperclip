@@ -5867,13 +5867,22 @@ registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/usage/logs",
   tags: ["usage"],
-  summary: "Usage request log: newest provider request rows",
-  description: "One row per provider HTTP call the runner proxy observed. Requires the same access as cost reads. P1 returns the newest rows with an optional limit; filters and pagination follow.",
+  summary: "Usage request log: one keyset page of newest provider request rows",
+  description: "One row per provider HTTP call the runner proxy observed. Requires the same access as cost reads. Keyset pagination over (occurred_at, id) descending: pass the previous page's nextCursor as `after`; the response carries the matching rows, the total matching count and the next cursor (null on the last page). Optional from/to bounds and the app/provider/model/status filters narrow the read.",
   request: {
     params: z.object({ companyId: z.string() }),
-    query: z.object({ limit: z.coerce.number().int().min(1).max(500).optional() }),
+    query: z.object({
+      limit: z.coerce.number().int().min(1).max(500).optional(),
+      from: z.string().optional(),
+      to: z.string().optional(),
+      after: z.string().optional(),
+      app: z.string().optional(),
+      provider: z.string().optional(),
+      model: z.string().optional(),
+      status: z.string().optional(),
+    }),
   },
-  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
