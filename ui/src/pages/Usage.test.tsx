@@ -42,6 +42,12 @@ function createDeferred<T>() {
   return { promise, resolve };
 }
 
+/** The frozen clock the preference tests read windows against. */
+const NOW = new Date("2026-11-05T12:00:00Z");
+const DEFAULT_FROM = "2026-11-04T12:00:00.000Z"; // last 24 hours
+const FROM_7D = "2026-10-29T12:00:00.000Z";
+const FROM_30D = "2026-10-06T12:00:00.000Z";
+
 /** One keyset page as the logs endpoint now answers (docs/specs/usage-request-logs.md, API). */
 function pageOf(rows: UsageRequestLogRow[], total: number = rows.length, nextCursor: string | null = null): UsageRequestLogPage {
   return { rows, total, nextCursor };
@@ -117,9 +123,11 @@ function summaryWithFacets(): UsageSummary {
 describe("Usage page", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot> | null = null;
+  let activeQueryClient: QueryClient | null = null;
 
   function renderPage(initialUrl = "/") {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    activeQueryClient = queryClient;
     root = createRoot(container);
     act(() => {
       root!.render(
@@ -134,6 +142,26 @@ describe("Usage page", () => {
       );
     });
     return queryClient;
+  }
+
+  /**
+   * Re-renders the mounted page in place (same router and query client), so
+   * a test can change the mocked company selection mid-flight the way a
+   * company switch does in the app.
+   */
+  function rerenderPage() {
+    act(() => {
+      root!.render(
+        <MemoryRouter initialEntries={[]}>
+          <QueryClientProvider client={activeQueryClient!}>
+            <div>
+              <Usage />
+              <LocationProbe />
+            </div>
+          </QueryClientProvider>
+        </MemoryRouter>,
+      );
+    });
   }
 
   /** Read one summary metric by its label, as the cards present it. */
@@ -152,10 +180,24 @@ describe("Usage page", () => {
     return container.querySelector('[data-testid="location-probe"]')!.textContent ?? "";
   }
 
+
+/**
+ * The shareable URL's params, compared parsed: URLSearchParams serializes
+ * the colons of an ISO `from` as %3A, which would make exact-string
+ * assertions unreadable without saying anything about the state.
+ */
+function expectLocationParams(pairs: Record<string, string>) {
+  const actual = new URLSearchParams(locationSearch());
+  const keys = Object.keys(pairs);
+  expect([...actual.keys()].sort()).toEqual([...keys].sort());
+  for (const key of keys) expect(actual.get(key)).toBe(pairs[key]);
+}
+
   beforeEach(() => {
     container = document.createElement("div");
     document.body.appendChild(container);
     companyState.selectedCompanyId = "company-1";
+    vi.useFakeTimers({ toFake: ["Date"], now: NOW });
     usageLogsMock.mockReset();
     usageLogsMock.mockResolvedValue(pageOf([]));
     usageSummaryMock.mockReset();
@@ -166,13 +208,15 @@ describe("Usage page", () => {
     act(() => root?.unmount());
     root = null;
     container.remove();
+    localStorage.clear();
     vi.clearAllMocks();
+    vi.useRealTimers();
   });
 
   it("fetches the usage logs endpoint for the selected company", async () => {
     renderPage();
     await act(async () => {
-      await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith("company-1", {}, 20, null));
+      await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith("company-1", { from: DEFAULT_FROM }, 20, null));
     });
     expect(setBreadcrumbsMock).toHaveBeenCalledWith([{ label: "Usage" }]);
   });
@@ -240,7 +284,7 @@ describe("Usage page", () => {
       await vi.waitFor(() => expect(usageSummaryMock).toHaveBeenCalledExactlyOnceWith(
         "company-1",
         Intl.DateTimeFormat().resolvedOptions().timeZone,
-        {},
+        { from: DEFAULT_FROM },
       ));
     });
   });
@@ -384,7 +428,7 @@ describe("Usage page", () => {
         await vi.waitFor(() => expect(appChipLabels()).toEqual(["All", "opencode"]));
       });
       // No dead chip for "ghost" — but the filter still applies to the data.
-      expectLastLogsCall({ app: "ghost" });
+      expectLastLogsCall({ app: "ghost", from: DEFAULT_FROM });
     });
 
     it("applies the clicked app chip to both reads and the URL", async () => {
@@ -399,17 +443,17 @@ describe("Usage page", () => {
         chip.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });
       await act(async () => {
-        await vi.waitFor(() => expectLastLogsCall({ app: "opencode" }));
+        await vi.waitFor(() => expectLastLogsCall({ app: "opencode", from: DEFAULT_FROM }));
       });
-      expect(usageSummaryMock).toHaveBeenLastCalledWith("company-1", expect.any(String), { app: "opencode" });
-      expect(locationSearch()).toBe("?app=opencode");
+      expect(usageSummaryMock).toHaveBeenLastCalledWith("company-1", expect.any(String), { app: "opencode", from: DEFAULT_FROM });
+      expectLocationParams({ app: "opencode", from: DEFAULT_FROM });
     });
 
     it("initializes filters from the URL and drops them again on All", async () => {
       usageSummaryMock.mockResolvedValue(summaryWithFacets());
       renderPage("/?app=opencode&status=client_error");
       await act(async () => {
-        await vi.waitFor(() => expectLastLogsCall({ app: "opencode", status: "client_error" }));
+        await vi.waitFor(() => expectLastLogsCall({ app: "opencode", status: "client_error", from: DEFAULT_FROM }));
       });
       await act(async () => {
         await vi.waitFor(() => expect(container.querySelector('div[aria-label="Filter by app"]')).not.toBeNull());
@@ -419,9 +463,9 @@ describe("Usage page", () => {
         allChip.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });
       await act(async () => {
-        await vi.waitFor(() => expectLastLogsCall({ status: "client_error" }));
+        await vi.waitFor(() => expectLastLogsCall({ status: "client_error", from: DEFAULT_FROM }));
       });
-      expect(locationSearch()).toBe("?status=client_error");
+      expectLocationParams({ status: "client_error", from: DEFAULT_FROM });
     });
 
     it("applies the provider, model and status selects to both reads and the URL", async () => {
@@ -436,7 +480,7 @@ describe("Usage page", () => {
         providerSelect.dispatchEvent(new Event("change", { bubbles: true }));
       });
       await act(async () => {
-        await vi.waitFor(() => expectLastLogsCall({ provider: "openrouter" }));
+        await vi.waitFor(() => expectLastLogsCall({ provider: "openrouter", from: DEFAULT_FROM }));
       });
 
       const modelSelect = container.querySelector('select[aria-label="Filter by model"]') as HTMLSelectElement;
@@ -457,14 +501,14 @@ describe("Usage page", () => {
         statusSelect.dispatchEvent(new Event("change", { bubbles: true }));
       });
       await act(async () => {
-        await vi.waitFor(() => expectLastLogsCall({ provider: "openrouter", model: "z-ai/glm-4.6", status: "server_error" }));
+        await vi.waitFor(() => expectLastLogsCall({ provider: "openrouter", model: "z-ai/glm-4.6", status: "server_error", from: DEFAULT_FROM }));
       });
       expect(usageSummaryMock).toHaveBeenLastCalledWith(
         "company-1",
         expect.any(String),
-        { provider: "openrouter", model: "z-ai/glm-4.6", status: "server_error" },
+        { provider: "openrouter", model: "z-ai/glm-4.6", status: "server_error", from: DEFAULT_FROM },
       );
-      expect(locationSearch()).toBe("?provider=openrouter&model=z-ai%2Fglm-4.6&status=server_error");
+      expectLocationParams({ provider: "openrouter", model: "z-ai/glm-4.6", status: "server_error", from: DEFAULT_FROM });
     });
 
     it("shows the filtered empty state naming the current filters", async () => {
@@ -567,8 +611,8 @@ describe("Usage page", () => {
       // Every row, in order, exactly once.
       expect(seen).toEqual(times(walkRows));
       expect(new Set(seen).size).toBe(seen.length);
-      expect(usageLogsMock).toHaveBeenNthCalledWith(2, "company-1", {}, 20, "cursor-1");
-      expect(usageLogsMock).toHaveBeenNthCalledWith(3, "company-1", {}, 20, "cursor-2");
+      expect(usageLogsMock).toHaveBeenNthCalledWith(2, "company-1", { from: DEFAULT_FROM }, 20, "cursor-1");
+      expect(usageLogsMock).toHaveBeenNthCalledWith(3, "company-1", { from: DEFAULT_FROM }, 20, "cursor-2");
     });
 
     it("renders the total matching count and disables turning past the last page", async () => {
@@ -594,7 +638,7 @@ describe("Usage page", () => {
       await waitForRendered(times(walkRows.slice(3, 6)));
       await clickButton("Previous");
       await act(async () => {
-        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", {}, 20, null));
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { from: DEFAULT_FROM }, 20, null));
       });
       await waitForRendered(times(walkRows.slice(0, 3)));
       expect(container.textContent).toContain("Page 1");
@@ -606,7 +650,7 @@ describe("Usage page", () => {
       await waitForRendered(times(walkRows.slice(0, 3)));
       await clickButton("Next");
       await act(async () => {
-        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", {}, 20, "cursor-1"));
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { from: DEFAULT_FROM }, 20, "cursor-1"));
       });
       const statusSelect = container.querySelector('select[aria-label="Filter by status"]') as HTMLSelectElement;
       await act(async () => {
@@ -615,9 +659,247 @@ describe("Usage page", () => {
       });
       // The narrowed read is a fresh walk: page one, no cursor, no stale history.
       await act(async () => {
-        await vi.waitFor(() => expectLastLogsCall({ status: "success" }));
+        await vi.waitFor(() => expectLastLogsCall({ status: "success", from: DEFAULT_FROM }));
       });
       expect(container.textContent).toContain("Page 1");
+    });
+
+    it("changes the page size, restarts at page one and remembers it", async () => {
+      mockThreePages();
+      renderPage();
+      await waitForRendered(times(walkRows.slice(0, 3)));
+      await clickButton("Next");
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { from: DEFAULT_FROM }, 20, "cursor-1"));
+      });
+      const sizeSelect = container.querySelector('select[aria-label="Rows per page"]') as HTMLSelectElement;
+      await act(async () => {
+        sizeSelect.value = "50";
+        sizeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      // A different page size is a different walk: page one, no cursor.
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { from: DEFAULT_FROM }, 50, null));
+      });
+      expect(container.textContent).toContain("Page 1");
+      expect(JSON.parse(localStorage.getItem("paperclip.usagePrefs:company-1")!))
+        .toEqual(expect.objectContaining({ pageSize: 50 }));
+    });
+  });
+
+  describe("remembered preferences and time range", () => {
+    function seedPreferences(companyId: string, preferences: unknown) {
+      localStorage.setItem(`paperclip.usagePrefs:${companyId}`, JSON.stringify(preferences));
+    }
+    function storedPreferences(companyId: string): Record<string, unknown> {
+      return JSON.parse(localStorage.getItem(`paperclip.usagePrefs:${companyId}`)!);
+    }
+
+    /** The filter bar renders once the first read lands; wait for a select. */
+    async function selectByLabel(label: string): Promise<HTMLSelectElement> {
+      let select: HTMLSelectElement | null = null;
+      await act(async () => {
+        await vi.waitFor(() => {
+          select = container.querySelector(`select[aria-label="${label}"]`);
+          expect(select).not.toBeNull();
+        });
+      });
+      return select as unknown as HTMLSelectElement;
+    }
+
+    it("seeds a first visit with the spec defaults — last 24 hours, 20 rows — and writes nothing", async () => {
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: DEFAULT_FROM },
+          20,
+          null,
+        ));
+      });
+      // The URL carries the resolved absolute window so the view stays shareable.
+      expectLocationParams({ from: DEFAULT_FROM });
+      expect((await selectByLabel("Time range")).value).toBe("24h");
+      expect((await selectByLabel("Rows per page")).value).toBe("20");
+      // A first visit's defaults are implied by absent storage.
+      expect(localStorage.getItem("paperclip.usagePrefs:company-1")).toBeNull();
+    });
+
+    it("restores the remembered range, page size and filters, producing the same request on the next visit", async () => {
+      seedPreferences("company-1", {
+        range: "7d",
+        pageSize: 50,
+        filters: { provider: "openrouter", status: "server_error" },
+      });
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: FROM_7D, provider: "openrouter", status: "server_error" },
+          50,
+          null,
+        ));
+      });
+      expectLocationParams({ from: FROM_7D, provider: "openrouter", status: "server_error" });
+      // The next visit replays the identical request against the same storage.
+      act(() => root?.unmount());
+      container.remove();
+      container = document.createElement("div");
+      document.body.appendChild(container);
+      usageLogsMock.mockClear();
+      // waitFor polls advance the faked clock; re-anchor it so the rolling
+      // window re-derives the same absolute bounds.
+      vi.setSystemTime(NOW);
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: FROM_7D, provider: "openrouter", status: "server_error" },
+          50,
+          null,
+        ));
+      });
+    });
+
+    it("lets an explicit URL param win over the remembered filters, seeding only the absent ones", async () => {
+      seedPreferences("company-1", { range: "7d", pageSize: 20, filters: { app: "opencode" } });
+      renderPage("/?provider=anthropic");
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: FROM_7D, app: "opencode", provider: "anthropic" },
+          20,
+          null,
+        ));
+      });
+    });
+
+    it("ignores a from the browser cannot parse and falls back to the remembered preset", async () => {
+      seedPreferences("company-1", { range: "30d", pageSize: 20, filters: {} });
+      renderPage("/?from=nope");
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: FROM_30D },
+          20,
+          null,
+        ));
+      });
+      // The seed pass replaced the unusable bound with the preset's.
+      expectLocationParams({ from: FROM_30D });
+    });
+
+    it("ignores a reversed window the same way", async () => {
+      renderPage("/?from=2026-11-05T00:00:00Z&to=2026-11-04T00:00:00Z");
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: DEFAULT_FROM },
+          20,
+          null,
+        ));
+      });
+      expectLocationParams({ from: DEFAULT_FROM });
+    });
+
+    it("applies a custom from/to handed in the URL and labels the select Custom", async () => {
+      renderPage("/?from=2026-11-01T00:00:00Z&to=2026-11-02T00:00:00Z");
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: "2026-11-01T00:00:00Z", to: "2026-11-02T00:00:00Z" },
+          20,
+          null,
+        ));
+      });
+      expect((await selectByLabel("Time range")).value).toBe("custom");
+      // Custom bounds are a view state, never written over the remembered preset.
+      expect(localStorage.getItem("paperclip.usagePrefs:company-1")).toBeNull();
+    });
+
+    it("applies a preset selection to the URL and remembers it, including All time", async () => {
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: DEFAULT_FROM },
+          20,
+          null,
+        ));
+      });
+      const rangeSelect = await selectByLabel("Time range");
+      // waitFor polls advance the faked clock; re-anchor it so the preset's
+      // fresh window derives the exact absolute bounds.
+      vi.setSystemTime(NOW);
+      await act(async () => {
+        rangeSelect.value = "30d";
+        rangeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({ from: FROM_30D }));
+      });
+      expectLocationParams({ from: FROM_30D });
+      expect(storedPreferences("company-1")).toEqual(expect.objectContaining({ range: "30d" }));
+      // "All time" bounds nothing — no from, no to.
+      await act(async () => {
+        rangeSelect.value = "all";
+        rangeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({}));
+      });
+      expect(locationSearch()).toBe("");
+      expect(storedPreferences("company-1")).toEqual(expect.objectContaining({ range: "all" }));
+    });
+
+    it("does not resurrect a cleared filter from storage after the seed pass", async () => {
+      seedPreferences("company-1", { range: "24h", pageSize: 20, filters: { app: "opencode" } });
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({ app: "opencode", from: DEFAULT_FROM }));
+      });
+      let allChip: HTMLButtonElement | null = null;
+      await act(async () => {
+        await vi.waitFor(() => {
+          allChip = container.querySelector('div[aria-label="Filter by app"] button');
+          expect(allChip).not.toBeNull();
+        });
+      });
+      await act(async () => {
+        (allChip as unknown as HTMLButtonElement).dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({ from: DEFAULT_FROM }));
+      });
+      expectLocationParams({ from: DEFAULT_FROM });
+      // The cleared state is the new remembered one.
+      expect(storedPreferences("company-1")).toEqual(expect.objectContaining({ filters: {} }));
+    });
+
+    it("switches companies to their own remembered selection", async () => {
+      seedPreferences("company-1", { range: "7d", pageSize: 20, filters: {} });
+      seedPreferences("company-2", { range: "all", pageSize: 100, filters: { app: "opencode" } });
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith(
+          "company-1",
+          { from: FROM_7D },
+          20,
+          null,
+        ));
+      });
+      companyState.selectedCompanyId = "company-2";
+      rerenderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith(
+          "company-2",
+          { app: "opencode" },
+          100,
+          null,
+        ));
+      });
+      // The previous company's window did not leak into the new company's URL.
+      expectLocationParams({ app: "opencode" });
     });
   });
 });

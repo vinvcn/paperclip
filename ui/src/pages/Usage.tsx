@@ -3,6 +3,17 @@ import { useQuery } from "@tanstack/react-query";
 import { ScrollText } from "lucide-react";
 import { USAGE_STATUS_FILTERS, type UsageStatusFilter, type UsageSummaryFacets } from "@paperclipai/shared";
 import { usageApi, type UsageLogFilters } from "../api/usage";
+import {
+  USAGE_PAGE_SIZES,
+  USAGE_TIME_RANGE_LABELS,
+  USAGE_TIME_RANGE_MS,
+  type UsagePageSize,
+  type UsagePreferenceFilters,
+  type UsagePreferences,
+  type UsageTimeRange,
+  readUsagePreferences,
+  writeUsagePreferences,
+} from "../lib/usage-preferences";
 import { ApiError } from "../api/client";
 import { EmptyState } from "../components/EmptyState";
 import { PageSkeleton } from "../components/PageSkeleton";
@@ -20,8 +31,16 @@ import type { UsageRequestLogPage, UsageRequestLogRow, UsageSummary } from "@pap
 
 const NO_COMPANY = "__none__";
 
-/** Rows per log page (docs/specs/usage-request-logs.md, UI: 20 / 50 / 100). */
-const LOGS_PAGE_SIZE = 20;
+/** How often the page re-reads the usage endpoints while it is visible. */
+const USAGE_POLL_MS = 30_000;
+
+/**
+ * How far the URL's absolute window start may drift from a preset's span and
+ * still label the select with that preset. Only client-written bounds are
+ * ever exact; a shared link opened later reads as a custom range, which is
+ * honest — its window is anchored to when the link was made, not now.
+ */
+const PRESET_MATCH_TOLERANCE_MS = 60_000;
 
 /** URL-friendly status classes with the labels the log table's Status column speaks. */
 const STATUS_FILTER_OPTIONS: { value: UsageStatusFilter; label: string }[] = [
@@ -40,13 +59,13 @@ function isUsageStatusFilter(value: string | null): value is UsageStatusFilter {
 }
 
 /**
- * The page's filters are the URL's search params — shareable, and they
- * survive a refresh (the Costs page precedent). An unrecognized status
- * class in a hand-edited URL is dropped rather than sent to the server,
- * which would 400 it; the selects only ever write known values.
+ * The page's request-filter dimensions read from the URL's search params —
+ * shareable, and they survive a refresh (the Costs page precedent). An
+ * unrecognized status class in a hand-edited URL is dropped rather than sent
+ * to the server, which would 400 it; the selects only ever write known values.
  */
-function filtersFromSearchParams(searchParams: URLSearchParams): UsageLogFilters {
-  const filters: UsageLogFilters = {};
+function filterDimsFromSearchParams(searchParams: URLSearchParams): UsagePreferenceFilters {
+  const filters: UsagePreferenceFilters = {};
   const app = searchParams.get("app");
   if (app) filters.app = app;
   const provider = searchParams.get("provider");
@@ -55,11 +74,109 @@ function filtersFromSearchParams(searchParams: URLSearchParams): UsageLogFilters
   if (model) filters.model = model;
   const status = searchParams.get("status");
   if (isUsageStatusFilter(status)) filters.status = status;
-  const from = searchParams.get("from");
-  if (from) filters.from = from;
-  const to = searchParams.get("to");
-  if (to) filters.to = to;
   return filters;
+}
+
+function isDateParam(value: string | null): value is string {
+  return value != null && !Number.isNaN(new Date(value).getTime());
+}
+
+/**
+ * The time window the URL carries, as the server receives it: `from`/`to`
+ * bounds a read, absence means all time. A hand-edited URL is user input,
+ * not API traffic — a bound the browser cannot parse (or a reversed window)
+ * is ignored here and the view falls back to the remembered preset, instead
+ * of forwarding it and 400-ing the whole page. That is the same asymmetry as
+ * the status class above (05 review F4): direct API callers still get the
+ * server's strict validation; the page never forwards what it cannot parse.
+ * The pair is dropped as a unit because the window is one control.
+ */
+function boundsFromSearchParams(searchParams: URLSearchParams): { from?: string; to?: string } {
+  const from = searchParams.get("from");
+  const to = searchParams.get("to");
+  if (!isDateParam(from) || !isDateParam(to)) {
+    if (from == null && to == null) return {};
+    if (from == null && isDateParam(to)) return { to };
+    if (to == null && isDateParam(from)) return { from };
+    return {};
+  }
+  if (new Date(from) > new Date(to)) return {};
+  return { from, to };
+}
+
+/**
+ * The absolute window of a range preset (docs/specs/usage-request-logs.md,
+ * UI): presets are rolling and open-ended, so a bounded preset sends only
+ * `from` and polling keeps admitting newer rows; "all" bounds nothing.
+ * The preset name — never these absolutes — is what localStorage remembers.
+ */
+function presetBounds(range: UsageTimeRange): { from?: string; to?: string } {
+  if (range === "all") return {};
+  return { from: new Date(Date.now() - USAGE_TIME_RANGE_MS[range]).toISOString() };
+}
+
+/**
+ * The preset a window's bounds correspond to, for the select's label; null
+ * when the bounds are custom (an explicit `to`, or a `from` no preset's
+ * rolling span matches within tolerance). Evaluated against a frozen clock
+ * so the label cannot drift to "custom" while the page sits open.
+ */
+function presetForBounds(bounds: { from?: string; to?: string }): UsageTimeRange | null {
+  if (!bounds.from && !bounds.to) return "all";
+  if (!bounds.from || bounds.to) return null;
+  const span = Date.now() - new Date(bounds.from).getTime();
+  for (const range of ["24h", "7d", "30d"] as const) {
+    if (Math.abs(span - USAGE_TIME_RANGE_MS[range]) <= PRESET_MATCH_TOLERANCE_MS) return range;
+  }
+  return null;
+}
+
+const WINDOW_PARAM_KEYS = ["app", "provider", "model", "status", "from", "to"] as const;
+
+/**
+ * The URL params the page wants, given the URL it has, the company's stored
+ * preferences and the remembered preset's absolute window. This one pure
+ * function drives both the reads (the page never queries the raw URL) and
+ * the URL writer effect below, so the two can never disagree.
+ *
+ * Per dimension an explicit param wins — that is what makes a shared link
+ * show what it says — and an absent one is seeded from the stored
+ * preferences. When `wholesale` is set (a company switch: the params in the
+ * URL describe the previous company's view) every dimension is re-seeded
+ * from the new company's preferences instead. An unusable window (absent,
+ * unparseable or reversed — see boundsFromSearchParams) is always replaced
+ * by the preset window.
+ */
+function normalizedParams(
+  current: URLSearchParams,
+  stored: UsagePreferences,
+  presetWindow: { from?: string; to?: string },
+  wholesale: boolean,
+): URLSearchParams {
+  const next = new URLSearchParams(current);
+  if (wholesale) {
+    for (const key of WINDOW_PARAM_KEYS) next.delete(key);
+  }
+  const rawFrom = next.get("from");
+  const rawTo = next.get("to");
+  const usableWindow =
+    (isDateParam(rawFrom) || rawFrom == null) &&
+    (isDateParam(rawTo) || rawTo == null) &&
+    !(isDateParam(rawFrom) && isDateParam(rawTo) && new Date(rawFrom) > new Date(rawTo)) &&
+    (rawFrom != null || rawTo != null);
+  if (!usableWindow) {
+    if (presetWindow.from) next.set("from", presetWindow.from);
+    else next.delete("from");
+    next.delete("to"); // presets are open-ended so polling admits new rows
+  }
+  if (!next.get("app") && stored.filters.app) next.set("app", stored.filters.app);
+  if (!next.get("provider") && stored.filters.provider) next.set("provider", stored.filters.provider);
+  if (!next.get("model") && stored.filters.model) next.set("model", stored.filters.model);
+  if (!isUsageStatusFilter(next.get("status"))) {
+    next.delete("status");
+    if (stored.filters.status) next.set("status", stored.filters.status);
+  }
+  return next;
 }
 
 /**
@@ -149,20 +266,42 @@ function SummaryCards({ summary, busy }: { summary: UsageSummary | undefined; bu
 }
 
 /**
- * The Usage filter bar: data-driven app chips (All + one per facet value,
- * never an app without requests in the window), provider/model/status
- * selects fed by the same facets, and the status classes matching the log
- * table's Status column. Every control writes the URL, so a filtered view
- * can be shared or refreshed.
+ * The Usage filter bar: the time-range preset select (whose selection is
+ * computed client-side into the URL's absolute from/to), data-driven app
+ * chips (All + one per facet value, never an app without requests in the
+ * window), provider/model/status selects fed by the same facets, the status
+ * classes matching the log table's Status column, and the page size. Every
+ * control writes the URL (window and filters) or the remembered preferences
+ * (page size), so a filtered view can be shared or restored next visit.
  */
-function UsageFilterBar({ facets, filters, onFilterChange }: {
+function UsageFilterBar({ facets, filters, onFilterChange, selectedRange, onRangeChange, pageSize, onPageSizeChange }: {
   facets: UsageSummaryFacets | undefined;
   filters: UsageLogFilters;
   onFilterChange: (key: "app" | "provider" | "model" | "status", value: string | null) => void;
+  selectedRange: UsageTimeRange | "custom";
+  onRangeChange: (range: UsageTimeRange) => void;
+  pageSize: UsagePageSize;
+  onPageSizeChange: (size: UsagePageSize) => void;
 }) {
   const selectClass = "w-auto min-w-40";
   return (
     <div className="flex flex-wrap items-center gap-2">
+      <NativeSelect
+        aria-label="Time range"
+        className={selectClass}
+        value={selectedRange}
+        onChange={(event) => {
+          const range = event.target.value;
+          if (range !== "custom") onRangeChange(range as UsageTimeRange);
+        }}
+      >
+        {(Object.keys(USAGE_TIME_RANGE_LABELS) as UsageTimeRange[]).map((range) => (
+          <option key={range} value={range}>{USAGE_TIME_RANGE_LABELS[range]}</option>
+        ))}
+        {/* Present only when the URL's bounds match no preset, so the select
+            never silently lies about which window is applied. */}
+        {selectedRange === "custom" ? <option value="custom">Custom range</option> : null}
+      </NativeSelect>
       <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Filter by app">
         <Button
           variant={filters.app ? "ghost" : "secondary"}
@@ -218,6 +357,16 @@ function UsageFilterBar({ facets, filters, onFilterChange }: {
           <option key={option.value} value={option.value}>{option.label}</option>
         ))}
       </NativeSelect>
+      <NativeSelect
+        aria-label="Rows per page"
+        className={selectClass}
+        value={String(pageSize)}
+        onChange={(event) => onPageSizeChange(Number(event.target.value) as UsagePageSize)}
+      >
+        {USAGE_PAGE_SIZES.map((size) => (
+          <option key={size} value={String(size)}>{size} / page</option>
+        ))}
+      </NativeSelect>
     </div>
   );
 }
@@ -231,10 +380,88 @@ export function Usage() {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
   const [searchParams, setSearchParams] = useSearchParams();
-  const filters = useMemo(() => filtersFromSearchParams(searchParams), [searchParams]);
+  const companyId = selectedCompanyId ?? NO_COMPANY;
 
-  /** Write one filter to the URL; `null` removes the param so links stay clean. */
+  // Per-company display preferences (docs/specs/usage-request-logs.md, UI):
+  // the time-range preset, page size and request filters are remembered in
+  // localStorage and restored on the next visit. The state below is the live
+  // selection — initialized from storage per company and kept in step with
+  // the storage by the handlers. The derivation must read this state, never
+  // a mount-time snapshot: a snapshot would resurrect a filter the user just
+  // cleared, because the URL transition lags the click by one router pass.
+  const [preferences, setPreferences] = useState<UsagePreferences>(() => readUsagePreferences(companyId));
+  const [preferencesFor, setPreferencesFor] = useState(companyId);
+  if (preferencesFor !== companyId) {
+    // Company switch: re-read the new company's remembered selection. Doing
+    // it during render (the "reset state when a prop changes" pattern) keeps
+    // the first render of the new company already on its own preferences.
+    setPreferencesFor(companyId);
+    setPreferences(readUsagePreferences(companyId));
+  }
+
+  // The remembered preset's absolute window, anchored when the selection is
+  // made (mount or a range change) — not recomputed per render, or the URL
+  // normalization below would mint a new `from` on every pass and refetch.
+  const presetWindow = useMemo(() => presetBounds(preferences.range), [companyId, preferences.range]);
+
+  // What the URL should look like. On a first visit an explicit param wins
+  // (a shared link shows what it says) and absent dimensions are seeded from
+  // the company's preferences; when the URL still carries a previous
+  // company's view, everything is re-seeded from the new company instead.
+  // The reads always consume this derived state — never the raw URL — so a
+  // router transition that has not landed yet cannot make the page read the
+  // wrong window, and the seed write below is cosmetic (shareability).
+  const [seededFor, setSeededFor] = useState<string | null>(null);
+  const urlCarriesOtherCompany = seededFor != null && seededFor !== companyId;
+  const expectedParams = useMemo(
+    () => normalizedParams(searchParams, preferences, presetWindow, urlCarriesOtherCompany),
+    [searchParams, preferences, presetWindow, urlCarriesOtherCompany],
+  );
+  const normalized = useMemo(
+    () => searchParams.toString() === expectedParams.toString(),
+    [searchParams, expectedParams],
+  );
+
+  // Keep the shareable URL in step with the derived state (replace: true —
+  // view state, not history). This also cleans a hand-edited unparseable
+  // window on the next pass, and re-seeds wholesale after a company switch.
+  useEffect(() => {
+    if (!selectedCompanyId || normalized) return;
+    setSearchParams(() => expectedParams, { replace: true });
+  }, [selectedCompanyId, normalized, expectedParams]);
+
+  // Acknowledge the URL as this company's once it is normalized: the next
+  // company change then re-seeds wholesale instead of merging into it.
+  useEffect(() => {
+    if (selectedCompanyId && normalized && seededFor !== companyId) setSeededFor(companyId);
+  }, [selectedCompanyId, normalized, seededFor, companyId]);
+
+  const filterDims = useMemo(() => filterDimsFromSearchParams(expectedParams), [expectedParams]);
+  const bounds = useMemo(() => boundsFromSearchParams(expectedParams), [expectedParams]);
+  const filters = useMemo<UsageLogFilters>(() => ({ ...filterDims, ...bounds }), [filterDims, bounds]);
+
+  /**
+   * Adopt a new preference set: the live state first (the derivation reads
+   * it), then the company's storage key. The window is stored as the preset
+   * name (never absolute dates), so "last 24 hours" re-anchors to the visit,
+   * not to when it was picked.
+   */
+  const persistPreferences = (next: UsagePreferences) => {
+    setPreferences(next);
+    if (selectedCompanyId) writeUsagePreferences(selectedCompanyId, next);
+  };
+
+  /** Write one filter to the URL and the company's remembered filters; `null` removes the param so links stay clean. */
   const onFilterChange = (key: "app" | "provider" | "model" | "status", value: string | null) => {
+    const dims: UsagePreferenceFilters = { ...filterDims };
+    if (value) {
+      // The status select only ever offers the known classes.
+      if (key === "status") dims.status = value as UsageStatusFilter;
+      else dims[key] = value;
+    } else {
+      delete dims[key];
+    }
+    persistPreferences({ ...preferences, filters: dims });
     setSearchParams(
       (current) => {
         const next = new URLSearchParams(current);
@@ -244,6 +471,32 @@ export function Usage() {
       },
       { replace: true },
     );
+  };
+
+  /**
+   * Apply a time-range preset: the preset name is remembered, and the URL
+   * receives its freshly computed absolute bounds so the shareable link
+   * stays complete. Selecting a bounded preset deletes `to` — presets are
+   * open-ended, which keeps polling admitting newer rows.
+   */
+  const onRangeChange = (range: UsageTimeRange) => {
+    persistPreferences({ ...preferences, range });
+    setSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        const preset = presetBounds(range);
+        if (preset.from) next.set("from", preset.from);
+        else next.delete("from");
+        next.delete("to");
+        return next;
+      },
+      { replace: true },
+    );
+  };
+
+  /** Page size lives in the preferences only — it is not part of a shareable URL. */
+  const onPageSizeChange = (size: UsagePageSize) => {
+    persistPreferences({ ...preferences, pageSize: size });
   };
 
   /**
@@ -270,7 +523,6 @@ export function Usage() {
     setBreadcrumbs([{ label: "Usage" }]);
   }, [setBreadcrumbs]);
 
-  const companyId = selectedCompanyId ?? NO_COMPANY;
   // Filter switches keep the previous rows/cards on screen while the narrowed
   // read loads — a full-page skeleton per chip click reads as breakage. The
   // placeholder only ever bridges within one company.
@@ -286,14 +538,14 @@ export function Usage() {
     cursor: null,
     history: [],
   });
-  const paginationEpoch = `${companyId}|${JSON.stringify(filters)}|${LOGS_PAGE_SIZE}`;
+  const paginationEpoch = `${companyId}|${JSON.stringify(filters)}|${preferences.pageSize}`;
   const onFirstPage = pagination.epoch !== paginationEpoch;
   const activeCursor = onFirstPage ? null : pagination.cursor;
   const activeHistory = onFirstPage ? [] : pagination.history;
   const page = activeHistory.length + 1;
   const logsQuery = useQuery({
-    queryKey: queryKeys.usageRequestLogs(companyId, filters, LOGS_PAGE_SIZE, activeCursor),
-    queryFn: () => usageApi.logs(companyId, filters, LOGS_PAGE_SIZE, activeCursor),
+    queryKey: queryKeys.usageRequestLogs(companyId, filters, preferences.pageSize, activeCursor),
+    queryFn: () => usageApi.logs(companyId, filters, preferences.pageSize, activeCursor),
     enabled: !!selectedCompanyId,
     placeholderData: keepPreviousDataForSameCompany<UsageRequestLogPage>(companyId),
   });
@@ -308,19 +560,26 @@ export function Usage() {
   // and selects already read as applied but the cards/chart/table still show
   // the previous (unfiltered) numbers — mark those regions busy so the stale
   // figures are not mistaken for the answer (initial load keeps its skeleton;
-  // this only covers the bridged case).
+  // this only covers the bridged case — a background poll refetches real data
+  // and must not flicker the page).
   const usageFetching = logsQuery.isFetching || summaryQuery.isFetching;
+  const bridging =
+    (logsQuery.isFetching && logsQuery.isPlaceholderData) || (summaryQuery.isFetching && summaryQuery.isPlaceholderData);
+
+  // The select's label: which preset the current window's bounds correspond
+  // to, or custom. Memoized on the bounds so the label is computed against a
+  // frozen clock and cannot drift to "custom" while the page sits open.
+  const selectedRange = useMemo(() => presetForBounds(bounds) ?? "custom", [bounds]);
 
   // Human names for the active filters; the filtered empty state points at
-  // them instead of showing a bare empty table.
+  // them instead of showing a bare empty table. The time window is not named
+  // here — it is a first-class control in the filter bar.
   const activeFilterNames = useMemo(() => [
-    filters.app && `app "${filters.app}"`,
-    filters.provider && `provider "${providerDisplayName(filters.provider)}"`,
-    filters.model && `model "${filters.model}"`,
-    filters.status && `status ${STATUS_FILTER_LABELS[filters.status]}`,
-    filters.from && `from ${filters.from}`,
-    filters.to && `to ${filters.to}`,
-  ].filter((name): name is string => typeof name === "string"), [filters]);
+    filterDims.app && `app "${filterDims.app}"`,
+    filterDims.provider && `provider "${providerDisplayName(filterDims.provider)}"`,
+    filterDims.model && `model "${filterDims.model}"`,
+    filterDims.status && `status ${STATUS_FILTER_LABELS[filterDims.status]}`,
+  ].filter((name): name is string => typeof name === "string"), [filterDims]);
 
   if (!selectedCompanyId) {
     return <EmptyState icon={ScrollText} message="Select an organization to view usage." />;
@@ -352,6 +611,10 @@ export function Usage() {
             facets={summaryQuery.data?.facets}
             filters={filters}
             onFilterChange={onFilterChange}
+            selectedRange={selectedRange}
+            onRangeChange={onRangeChange}
+            pageSize={preferences.pageSize}
+            onPageSizeChange={onPageSizeChange}
           />
           <Card aria-busy={usageFetching} className={cn("gap-3 py-4", usageFetching && "opacity-60 transition-opacity")}>
             <CardHeader className="gap-0 px-5">
