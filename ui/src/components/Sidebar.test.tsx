@@ -520,7 +520,9 @@ describe("Sidebar", () => {
       .map((anchor) => anchor.textContent?.trim());
 
     expect(labels(workSection)).toEqual(["Tasks", "Projects", "Routines", "Artifacts"]);
-    expect(labels(orgSection)).toEqual(["Agents", "Skills", "Connectors", "Audit"]);
+    expect(labels(orgSection)).toEqual(["Agents", "Skills", "Connectors", "Usage", "Audit"]);
+    // Usage is reachable in the streamlined shell and pinned before Audit.
+    expect(orgSection?.querySelector('a[href="/usage"]')).toBeTruthy();
     expect(sections.indexOf(workSection!)).toBeLessThan(sections.indexOf(orgSection!));
     expect(
       workSection?.querySelector('a[href="/issues"] svg')?.classList.contains("lucide-circle-check"),

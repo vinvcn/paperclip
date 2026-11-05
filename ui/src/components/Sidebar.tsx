@@ -282,6 +282,7 @@ function ClassicSidebar({ children }: { children?: ReactNode }) {
             <SidebarNavItem to="/agents" label="Agents" icon={Users} />
             <SidebarNavItem to="/skills" label="Skills" icon={Boxes} />
             <SidebarNavItem to="/apps" label="Connectors" icon={Unplug} />
+            <SidebarNavItem to="/usage" label="Usage" icon={ScrollText} />
             <SidebarNavItem to="/activity" label="Audit" icon={History} />
           </SidebarSection>
         ) : null}

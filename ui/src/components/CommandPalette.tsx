@@ -29,6 +29,7 @@ import {
   LayoutDashboard,
   Inbox,
   DollarSign,
+  ScrollText,
   History,
   SquarePen,
   FileCode2,
@@ -383,6 +384,10 @@ export function CommandPalette() {
           <CommandItem onSelect={() => go("/costs")}>
             <DollarSign className="mr-2 h-4 w-4" />
             Costs
+          </CommandItem>
+          <CommandItem onSelect={() => go("/usage")}>
+            <ScrollText className="mr-2 h-4 w-4" />
+            Usage
           </CommandItem>
           <CommandItem onSelect={() => go("/activity")}>
             <History className="mr-2 h-4 w-4" />

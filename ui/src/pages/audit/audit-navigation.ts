@@ -1,4 +1,11 @@
-export type AuditSection = "activity" | "runs" | "costs" | "budgets" | "timeline" | "commentary";
+export type AuditSection =
+  | "activity"
+  | "runs"
+  | "costs"
+  | "usage"
+  | "budgets"
+  | "timeline"
+  | "commentary";
 
 export const AUDIT_SECTIONS: ReadonlyArray<{
   value: AuditSection;
@@ -9,6 +16,8 @@ export const AUDIT_SECTIONS: ReadonlyArray<{
   { value: "runs", label: "Runs", href: "/activity/runs" },
   { value: "commentary", label: "Commentary", href: "/activity/commentary" },
   { value: "costs", label: "Costs", href: "/activity/costs" },
+  // Usage lives on its own first-class route; the hub tab redirects there.
+  { value: "usage", label: "Usage", href: "/usage" },
   { value: "budgets", label: "Budgets", href: "/activity/budgets" },
   { value: "timeline", label: "Timeline", href: "/activity/timeline" },
 ];

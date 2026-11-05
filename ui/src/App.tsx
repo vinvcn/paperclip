@@ -380,8 +380,10 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       <Route path="activity/costs" element={<AuditHub section="costs" />} />
       <Route path="activity/budgets" element={<AuditHub section="budgets" />} />
       <Route path="activity/timeline" element={<AuditHub section="timeline" />} />
-      {/* Usage is a first-class surface in both shells: the streamlined Audit
-          hub has no request-log section for it to redirect into. */}
+      {/* Usage is a first-class surface in both shells: the streamlined shell
+          reaches it from the Org sidebar group and an Audit hub tab (the tab
+          redirects here), and the legacy shell links it from the Organization
+          sidebar group. */}
       <Route path="usage" element={<Usage />} />
       {streamlinedUiEnabled ? (
         <>

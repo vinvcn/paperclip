@@ -5,7 +5,7 @@ import { PageTabBar } from "@/components/PageTabBar";
 import { Tabs } from "@/components/ui/tabs";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useCompany } from "@/context/CompanyContext";
-import { useNavigate, useSearchParams } from "@/lib/router";
+import { useNavigate, useSearchParams, Navigate } from "@/lib/router";
 import { Costs } from "@/pages/Costs";
 import { Timeline } from "@/pages/Timeline";
 import { AuditFeed, type AuditFeedMode } from "./AuditFeed";
@@ -159,6 +159,10 @@ export function AuditHub({ section }: { section: AuditSection }) {
         <Costs embedded initialTab="budgets" lockTab />
       ) : section === "timeline" ? (
         <Timeline embedded />
+      ) : section === "usage" ? (
+        // Usage is a standalone page, not an embedded section; the tab sends
+        // you there (prefix-aware Navigate keeps the active company).
+        <Navigate to="/usage" replace />
       ) : (
         <Costs embedded initialTab="overview" hideBudgetsTab />
       )}

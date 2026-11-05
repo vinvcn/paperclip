@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  AUDIT_SECTIONS,
   agentAuditHref,
   auditScopeFromSearchParams,
   auditSectionHref,
@@ -14,8 +15,14 @@ describe("audit navigation", () => {
     expect(auditSectionHref("commentary")).toBe("/activity/commentary");
     expect(auditSectionHref("runs")).toBe("/activity/runs");
     expect(auditSectionHref("costs")).toBe("/activity/costs");
+    expect(auditSectionHref("usage")).toBe("/usage");
     expect(auditSectionHref("budgets")).toBe("/activity/budgets");
     expect(auditSectionHref("timeline")).toBe("/activity/timeline");
+  });
+
+  it("orders the Usage tab immediately after Costs", () => {
+    const values = AUDIT_SECTIONS.map((section) => section.value);
+    expect(values.indexOf("usage")).toBe(values.indexOf("costs") + 1);
   });
 
   it("provides agent, routine, and run scoped links", () => {
