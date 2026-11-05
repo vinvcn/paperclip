@@ -61,6 +61,7 @@ function summary(overrides: Partial<UsageSummary> = {}): UsageSummary {
   return {
     companyId: "company-1",
     totalRequests: 12,
+    totalCostCents: "0",
     freshInputTokens: 1500,
     cachedInputTokens: 500,
     cacheWriteTokens: 200,

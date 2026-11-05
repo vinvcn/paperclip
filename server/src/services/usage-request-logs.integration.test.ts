@@ -5,6 +5,7 @@ import type { Db } from "@paperclipai/db";
 import {
   agents,
   companies,
+  costEvents,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -12,12 +13,13 @@ import {
   projects,
   usageRequestLogs,
 } from "@paperclipai/db";
+import { centsToUnits } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
 import { PROVIDER_REQUEST_USAGE_KIND, usageProviderAndBillerFromModel } from "../vendor/paperclip-runner/index.js";
-import { sweepRunUsageRequestLogEvents, usageRequestLogService } from "./usage-request-logs.js";
+import { allocateRunCosts, sweepRunUsageRequestLogEvents, usageRequestLogService } from "./usage-request-logs.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -406,6 +408,7 @@ describeEmbeddedPostgres("usage request log persistence", () => {
       expect(await service.summary(randomUUID())).toEqual({
         companyId: expect.any(String),
         totalRequests: 0,
+        totalCostCents: "0",
         freshInputTokens: 0,
         cachedInputTokens: 0,
         cacheWriteTokens: 0,
@@ -613,5 +616,209 @@ describeEmbeddedPostgres("usage request log persistence", () => {
     const [row] = await db.select().from(usageRequestLogs)
       .where(and(eq(usageRequestLogs.companyId, companyId), eq(usageRequestLogs.requestId, requestId)));
     expect(row.metadata).toEqual({ usageMissing: true });
+  });
+
+  describe("run cost allocation", () => {
+    const model = "openrouter/anthropic/claude-sonnet-4";
+    const otherModel = "openai/gpt-5.2";
+    const createdCompanyIds: string[] = [];
+
+    afterAll(async () => {
+      for (const companyId of createdCompanyIds) {
+        await db.delete(usageRequestLogs).where(eq(usageRequestLogs.companyId, companyId));
+        await db.delete(costEvents).where(eq(costEvents.companyId, companyId));
+        await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+        await db.delete(agents).where(eq(agents.companyId, companyId));
+        await db.delete(companies).where(eq(companies.id, companyId));
+      }
+    });
+
+    /** One isolated company + succeeded run per test: allocation state must never leak between cases. */
+    async function freshAllocationRun() {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Usage Allocation",
+        issuePrefix: companyId.replaceAll("-", "").slice(0, 4).toUpperCase(),
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "UsageAllocation",
+        role: "engineer",
+        status: "idle",
+        adapterType: "paperclip_runner",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "on_demand",
+        status: "succeeded",
+        contextSnapshot: {},
+      });
+      createdCompanyIds.push(companyId);
+      return { companyId, agentId, runId };
+    }
+
+    /** A cost_events receipt row for the run, exactly as accountRunCost writes them. */
+    async function receipt(
+      ids: { companyId: string; agentId: string; runId: string },
+      receiptModel: string,
+      costCents: number,
+      overrides: Partial<typeof costEvents.$inferInsert> = {},
+    ) {
+      await db.insert(costEvents).values({
+        companyId: ids.companyId,
+        agentId: ids.agentId,
+        heartbeatRunId: ids.runId,
+        provider: "openrouter",
+        biller: "openrouter",
+        model: receiptModel,
+        billingType: "metered_api",
+        costStatus: "reported",
+        costCents,
+        idempotencyKey: `heartbeat:${ids.runId}:${randomUUID()}`,
+        occurredAt: new Date(),
+        ...overrides,
+      });
+    }
+
+    async function requestRow(
+      ids: { companyId: string; runId: string },
+      rowModel: string,
+      tokens: { input?: number | null; cached?: number | null; write?: number | null; output?: number | null } = {},
+    ) {
+      await db.insert(usageRequestLogs).values({
+        companyId: ids.companyId,
+        runId: ids.runId,
+        app: "opencode",
+        provider: "openrouter",
+        biller: "openrouter",
+        model: rowModel,
+        inputTokens: tokens.input ?? null,
+        cachedInputTokens: tokens.cached ?? null,
+        cacheWriteTokens: tokens.write ?? null,
+        outputTokens: tokens.output ?? null,
+        requestId: randomUUID(),
+        occurredAt: new Date(),
+      });
+    }
+
+    async function pricedRows(companyId: string) {
+      const rows = await db.select().from(usageRequestLogs).where(eq(usageRequestLogs.companyId, companyId));
+      return new Map(rows.map((row) => [row.requestId, row]));
+    }
+
+    it("distributes a multi-event receipt across a run's requests and sums exactly to it", async () => {
+      const ids = await freshAllocationRun();
+      await requestRow(ids, model, { input: 1000, cached: 200, write: 50, output: 100 }); // billed 1150
+      await requestRow(ids, model, { input: 500, output: 30 });                            // billed 530
+      await requestRow(ids, model, { input: 0, output: 7 });                               // billed 7
+      await requestRow(ids, otherModel, { input: 400, output: 50 });                       // billed 450
+      await receipt(ids, model, 1.5);
+      await receipt(ids, model, 0.3333333);
+      await receipt(ids, otherModel, 0.5);
+
+      const priced = await allocateRunCosts(db, ids.companyId, ids.runId);
+      expect(priced).toBe(4);
+      const rows = [...(await pricedRows(ids.companyId)).values()];
+      const modelRows = rows.filter((row) => row.model === model);
+      const otherRows = rows.filter((row) => row.model === otherModel);
+      // The (run, model) receipt is fully consumed by that model's rows and
+      // nothing else: sum of allocated cents === sum of receipt cents, exactly.
+      const sumUnits = (list: typeof rows) => list.reduce((sum, row) => sum + centsToUnits(row.costCents!), 0n);
+      expect(sumUnits(modelRows)).toBe(centsToUnits("1.8333333"));
+      expect(sumUnits(otherRows)).toBe(centsToUnits("0.5"));
+      for (const row of rows) {
+        expect(row.costCents).not.toBeNull();
+        expect(row.costStatus).toBe("priced");
+      }
+      // Idempotent: a repeated call prices nothing anew.
+      expect(await allocateRunCosts(db, ids.companyId, ids.runId)).toBe(0);
+    });
+
+    it("splits a single receipt between two requests by billed token share", async () => {
+      const ids = await freshAllocationRun();
+      // Billed tokens = fresh input + cache write + output + cached input,
+      // which is not the Tokens Processed formula (cache write counts).
+      await requestRow(ids, model, { input: 1200, cached: 300, write: 100, output: 450 }); // billed 1750
+      await requestRow(ids, model, { input: 250, output: 0 });                             // billed 250
+      await receipt(ids, model, 2);
+
+      expect(await allocateRunCosts(db, ids.companyId, ids.runId)).toBe(2);
+      const rows = [...(await pricedRows(ids.companyId)).values()].sort((a, b) => a.inputTokens! - b.inputTokens!);
+      expect(rows[0]!.costCents).toBe("0.2500000");
+      expect(rows[0]!.costStatus).toBe("priced");
+      expect(rows[1]!.costCents).toBe("1.7500000");
+    });
+
+    it("leaves receipt-less and token-less rows unpriced while the summary separates them", async () => {
+      const ids = await freshAllocationRun();
+      await requestRow(ids, model, { input: 800, cached: 100, write: 20, output: 60 }); // priced
+      await requestRow(ids, model, { input: null, cached: null, write: null, output: null }); // usage never observed
+      await requestRow(ids, model, { input: 0, cached: 0, write: 0, output: 0 });       // no allocation basis
+      await requestRow(ids, otherModel, { input: 900, output: 90 });                    // no receipt for this model
+      await receipt(ids, model, 1);
+
+      expect(await allocateRunCosts(db, ids.companyId, ids.runId)).toBe(1);
+      const rows = await pricedRows(ids.companyId);
+      const priced = [...rows.values()].find((row) => row.costStatus === "priced");
+      expect(priced).toMatchObject({ model, costCents: "1.0000000" });
+      for (const row of rows.values()) {
+        if (row !== priced) {
+          expect(row.costCents).toBeNull();
+          expect(row.costStatus).toBe("unpriced");
+        }
+      }
+      // Total Cost counts only priced rows; the badge counts the unpriced ones.
+      const summary = await usageRequestLogService(db).summary(ids.companyId);
+      expect(summary.totalCostCents).toBe("1.0000000");
+      expect(summary.unpricedCount).toBe(3);
+    });
+
+    it("prices each run once: rows arriving after allocation stay unpriced", async () => {
+      const ids = await freshAllocationRun();
+      await requestRow(ids, model, { input: 600, output: 40 });
+      await receipt(ids, model, 0.8);
+      expect(await allocateRunCosts(db, ids.companyId, ids.runId)).toBe(1);
+
+      // A provider_request record that lands after the ledger closed (late
+      // sweep, retry delivery) must not reopen it.
+      await requestRow(ids, model, { input: 999, output: 999 });
+      expect(await allocateRunCosts(db, ids.companyId, ids.runId)).toBe(0);
+      const rows = await pricedRows(ids.companyId);
+      expect(rows.size).toBe(2);
+      const late = [...rows.values()].find((row) => row.inputTokens === 999)!;
+      expect(late.costCents).toBeNull();
+      expect(late.costStatus).toBe("unpriced");
+    });
+
+    it("keeps every row unpriced when the run has no receipt or only an unpriced one", async () => {
+      const failed = await freshAllocationRun();
+      await requestRow(failed, model, { input: 500, output: 50 });
+      // A failed run without a receipt: nothing to allocate.
+      expect(await allocateRunCosts(db, failed.companyId, failed.runId)).toBe(0);
+
+      const unpriced = await freshAllocationRun();
+      await requestRow(unpriced, model, { input: 500, output: 50 });
+      await receipt(unpriced, model, 0, { costStatus: "unpriced" });
+      // An unpriced receipt carries no money; allocating its zero would fake
+      // precision the ledger does not have.
+      expect(await allocateRunCosts(db, unpriced.companyId, unpriced.runId)).toBe(0);
+      for (const ids of [failed, unpriced]) {
+        for (const row of (await pricedRows(ids.companyId)).values()) {
+          expect(row.costCents).toBeNull();
+          expect(row.costStatus).toBe("unpriced");
+        }
+      }
+    });
   });
 });

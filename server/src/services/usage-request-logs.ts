@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, lte, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, gte, isNotNull, isNull, lte, sql, type SQL } from "drizzle-orm";
 import { centsToUnits, unitsToCents } from "@paperclipai/shared";
 import { costEvents, heartbeatRunEvents, issues, usageRequestLogs, type Db } from "@paperclipai/db";
 import type { UsageSummary, UsageSummarySeriesPoint } from "@paperclipai/shared";
@@ -41,6 +41,103 @@ export function allocateUnitsByWeight(totalUnits: bigint, weights: number[]): bi
     shares[row.index] += 1n;
   }
   return shares;
+}
+
+/**
+ * Distribute a run's authoritative receipt (its `cost_events` rows) across
+ * that run's request rows, per model, pro-rata by billed tokens — fresh
+ * input + cache write + output + cached input (docs/specs/
+ * usage-request-logs.md, Cost attribution). This is an allocation view, not
+ * a second ledger: `cost_events` is never written here.
+ *
+ * Allocation runs once per run, when accounting closes. The first pass marks
+ * the rows it priced; rows that arrive afterwards, carry no billed tokens,
+ * or match no priced receipt stay `unpriced` and contribute zero to the
+ * Total Cost instead of reopening the ledger. Unpriced receipt rows carry no
+ * money by definition, so they never price a request row either. Returns the
+ * number of rows priced.
+ */
+export async function allocateRunCosts(db: Db, companyId: string, runId: string): Promise<number> {
+  // Once-per-run gate: any priced row means this run's receipt was already
+  // distributed, so later arrivals must stay unpriced.
+  const [alreadyPriced] = await db.select({ id: usageRequestLogs.id })
+    .from(usageRequestLogs)
+    .where(and(
+      eq(usageRequestLogs.companyId, companyId),
+      eq(usageRequestLogs.runId, runId),
+      isNotNull(usageRequestLogs.costCents),
+    ))
+    .limit(1);
+  if (alreadyPriced) return 0;
+
+  const receipts = await db.select({
+      model: costEvents.model,
+      cents: sql<string>`sum(${costEvents.costCents})::text`,
+    })
+    .from(costEvents)
+    .where(and(
+      eq(costEvents.companyId, companyId),
+      eq(costEvents.heartbeatRunId, runId),
+      sql`${costEvents.costStatus} <> 'unpriced'`,
+    ))
+    .groupBy(costEvents.model);
+  if (receipts.length === 0) return 0;
+
+  const rows = await db.select({
+      id: usageRequestLogs.id,
+      model: usageRequestLogs.model,
+      inputTokens: usageRequestLogs.inputTokens,
+      cachedInputTokens: usageRequestLogs.cachedInputTokens,
+      cacheWriteTokens: usageRequestLogs.cacheWriteTokens,
+      outputTokens: usageRequestLogs.outputTokens,
+    })
+    .from(usageRequestLogs)
+    .where(and(
+      eq(usageRequestLogs.companyId, companyId),
+      eq(usageRequestLogs.runId, runId),
+      isNull(usageRequestLogs.costCents),
+      eq(usageRequestLogs.costStatus, "unpriced"),
+    ));
+  if (rows.length === 0) return 0;
+
+  const rowsByModel = new Map<string, { id: string; billedTokens: number }[]>();
+  for (const row of rows) {
+    // Billed tokens (the allocation basis) differ from Tokens Processed:
+    // cache write is billed and cached input stays part of the billed prompt.
+    const billedTokens =
+      Math.max((row.inputTokens ?? 0) - (row.cachedInputTokens ?? 0), 0) +
+      (row.cacheWriteTokens ?? 0) + (row.outputTokens ?? 0) + (row.cachedInputTokens ?? 0);
+    if (billedTokens <= 0) continue; // No basis: the row stays unpriced.
+    const group = rowsByModel.get(row.model) ?? [];
+    group.push({ id: row.id, billedTokens });
+    rowsByModel.set(row.model, group);
+  }
+
+  const priced: { id: string; cents: string }[] = [];
+  for (const receipt of receipts) {
+    const group = rowsByModel.get(receipt.model);
+    if (!group?.length) continue; // Receipt money without a matching request row stays unallocated.
+    const shares = allocateUnitsByWeight(centsToUnits(receipt.cents), group.map((row) => row.billedTokens));
+    for (const [index, share] of shares.entries()) {
+      priced.push({ id: group[index]!.id, cents: unitsToCents(share) });
+    }
+  }
+  if (priced.length === 0) return 0;
+
+  // One bulk write with a per-row price list; the unpriced guard keeps a
+  // racing invocation from ever stacking a second allocation onto a row.
+  await db.execute(sql`
+    update usage_request_logs
+    set cost_cents = priced.cost_cents,
+        cost_status = 'priced'
+    from (values ${sql.join(priced.map((row) => sql`(${row.id}::uuid, ${row.cents}::numeric)`), sql`, `)}) as priced (id, cost_cents)
+    where usage_request_logs.id = priced.id
+      and usage_request_logs.company_id = ${companyId}
+      and usage_request_logs.run_id = ${runId}
+      and usage_request_logs.cost_cents is null
+      and usage_request_logs.cost_status = 'unpriced'
+  `);
+  return priced.length;
 }
 
 function recordObject(value: unknown): Record<string, unknown> {
@@ -123,7 +220,9 @@ export function usageRequestLogService(db: Db) {
      * total but add nothing to the token figures. The spec formulas are
      * applied to the aggregates: fresh input = input − cached input, tokens
      * processed = fresh + output + cached input, and the cache hit rate is
-     * null when its denominator is zero.
+     * null when its denominator is zero. `totalCostCents` sums only the
+     * priced rows' allocated costs — unpriced rows contribute zero — and
+     * `unpricedCount` drives the Total Cost card's "N unpriced" badge.
      *
      * `timeZone` (an IANA name, validated by the route) buckets the returned
      * series in the viewer's local time; the window matches this summary's
@@ -140,6 +239,7 @@ export function usageRequestLogService(db: Db) {
       const [row] = await db
         .select({
           totalRequests: sql<number>`count(*)::int`,
+          totalCostCents: sql<string>`coalesce(sum(${usageRequestLogs.costCents}) filter (where ${usageRequestLogs.costStatus} <> 'unpriced'), 0)::text`,
           inputTokens: sql<number>`coalesce(sum(coalesce(${usageRequestLogs.inputTokens}, 0)), 0)::double precision`,
           cachedInputTokens: sql<number>`coalesce(sum(coalesce(${usageRequestLogs.cachedInputTokens}, 0)), 0)::double precision`,
           cacheWriteTokens: sql<number>`coalesce(sum(coalesce(${usageRequestLogs.cacheWriteTokens}, 0)), 0)::double precision`,
@@ -157,6 +257,7 @@ export function usageRequestLogService(db: Db) {
       return {
         companyId,
         totalRequests: row?.totalRequests ?? 0,
+        totalCostCents: row?.totalCostCents ?? "0",
         freshInputTokens: freshInput,
         cachedInputTokens: cached,
         cacheWriteTokens: cacheWrite,

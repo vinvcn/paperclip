@@ -1,5 +1,5 @@
 import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
-import { sweepRunUsageRequestLogEvents } from "../usage-request-logs.js";
+import { allocateRunCosts, sweepRunUsageRequestLogEvents } from "../usage-request-logs.js";
 import { nativeTaskSessionPublicationHandled } from "../native-runtime/native-task-session-publication.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
 import { measureRunPhase } from "../execution-preparation-timing.js";
@@ -328,6 +328,21 @@ export function isWorkspaceSyncConflictFailure(
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+/**
+ * Cost attribution (docs/specs/usage-request-logs.md): once a run's accounting
+ * closes, distribute its receipt across the request rows the proxy observed.
+ * Runs after the usage sweep and accountRunCost, so the allocation sees every
+ * row the run produced; it is best-effort like the sweep and must never affect
+ * the settled run outcome.
+ */
+async function allocateCompletedRunCosts(db: Db, companyId: string, runId: string) {
+  try {
+    await allocateRunCosts(db, companyId, runId);
+  } catch (error) {
+    logger.warn({ error, runId }, "usage cost allocation failed without affecting run outcome");
+  }
 }
 
 // Keep the watchdog's closed cause and timings so the run and its failure
@@ -732,6 +747,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         await measureRunPhase("completion.cost", () => accountRunCost(db, run.id, budgetHooks)).catch((err) => {
           logger.error({ err, runId: run.id }, "Late run accounting queued for recovery");
         });
+        // The reconciler may have closed this accounting moments ago; either
+        // way the ledger is shut now, so distribute the receipt once.
+        await allocateCompletedRunCosts(db, run.companyId, run.id);
         logger.info(
           {
             runId: run.id,
@@ -748,6 +766,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       await measureRunPhase("completion.cost", () => accountRunCost(db, persistedRun!.id, budgetHooks)).catch((err) => {
         logger.error({ err, runId: run.id }, "Run accounting queued for recovery");
       });
+      // The sweep collected every committed provider_request row before the
+      // terminal write, and the ledger just closed: attribute the receipt now.
+      await allocateCompletedRunCosts(db, persistedRun!.companyId, persistedRun!.id);
       persistedRun =
         (await measureRunPhase("completion.liveness", () => classifyAndPersistRunLiveness(
           persistedRun!,
