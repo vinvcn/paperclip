@@ -17,6 +17,9 @@ export function parseUsageLimit(query: Record<string, unknown>) {
   return limit;
 }
 
+/** Row ids are uuids; anything else would reach the SQL as a `::uuid` cast error. */
+const USAGE_CURSOR_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * The logs list's keyset cursor (docs/specs/usage-request-logs.md, API):
  * `after` is the previous response's `nextCursor`, encoded as
@@ -32,7 +35,7 @@ export function parseUsageCursor(query: Record<string, unknown>): { occurredAt: 
   if (separator === -1) throw badRequest("invalid 'after' value");
   const occurredAt = new Date(raw.slice(0, separator));
   const id = raw.slice(separator + 1);
-  if (Number.isNaN(occurredAt.getTime()) || id === "") throw badRequest("invalid 'after' value");
+  if (Number.isNaN(occurredAt.getTime()) || !USAGE_CURSOR_ID_PATTERN.test(id)) throw badRequest("invalid 'after' value");
   return { occurredAt, id };
 }
 

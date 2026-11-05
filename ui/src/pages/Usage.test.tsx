@@ -520,6 +520,25 @@ function expectLocationParams(pairs: Record<string, string>) {
       expectLocationParams({ provider: "openrouter", model: "z-ai/glm-4.6", status: "server_error", from: DEFAULT_FROM });
     });
 
+    it("keeps showing a selected model the window's facets no longer list", async () => {
+      usageSummaryMock.mockResolvedValue(summaryWithFacets());
+      // A shared/remembered URL can name a model outside the current window's
+      // top-50 facets — the select must still display the applied value.
+      renderPage("/?model=openai/gpt-5.2");
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({ model: "openai/gpt-5.2", from: DEFAULT_FROM }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expect(container.querySelector('select[aria-label="Filter by model"]')).not.toBeNull());
+      });
+      const modelSelect = container.querySelector('select[aria-label="Filter by model"]') as HTMLSelectElement;
+      await act(async () => {
+        await vi.waitFor(() => expect(modelSelect.value).toBe("openai/gpt-5.2"));
+      });
+      const option = modelSelect.querySelector('option[value="openai/gpt-5.2"]')!;
+      expect(option.textContent).toBe("openai/gpt-5.2");
+    });
+
     it("shows the filtered empty state naming the current filters", async () => {
       renderPage("/?app=opencode&status=client_error");
       await act(async () => {
@@ -643,6 +662,43 @@ function expectLocationParams(pairs: Record<string, string>) {
       });
       await waitForRendered(times(walkRows.slice(0, 3)));
       expect(container.textContent).toContain("Page 1");
+    });
+
+    it("disables both page turns while a filter change bridges the previous page", async () => {
+      mockThreePages();
+      renderPage();
+      await waitForRendered(times(walkRows.slice(0, 3)));
+      await clickButton("Next");
+      await waitForRendered(times(walkRows.slice(3, 6)));
+      // The narrowed read hangs: the placeholder bridge keeps page two (and
+      // its nextCursor) on screen while the new epoch's page one is in
+      // flight — its cursor must not be reachable.
+      const deferred = createDeferred<UsageRequestLogPage>();
+      usageLogsMock.mockImplementation(() => deferred.promise);
+      const statusSelect = container.querySelector('select[aria-label="Filter by status"]') as HTMLSelectElement;
+      await act(async () => {
+        statusSelect.value = "server_error";
+        statusSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => {
+          const next = [...container.querySelectorAll("button")].find((button) => button.textContent === "Next")!;
+          expect(next.hasAttribute("disabled")).toBe(true);
+        });
+      });
+      const previous = [...container.querySelectorAll("button")].find((button) => button.textContent === "Previous")!;
+      expect(previous.hasAttribute("disabled")).toBe(true);
+      await act(async () => {
+        deferred.resolve(pageOf(walkRows.slice(0, 3), 7, "cursor-filtered"));
+        await deferred.promise;
+      });
+      // The real page settles and the turns come back.
+      await act(async () => {
+        await vi.waitFor(() => {
+          const next = [...container.querySelectorAll("button")].find((button) => button.textContent === "Next")!;
+          expect(next.hasAttribute("disabled")).toBe(false);
+        });
+      });
     });
 
     it("starts over at page one when a filter changes", async () => {

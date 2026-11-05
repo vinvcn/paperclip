@@ -351,6 +351,12 @@ function UsageFilterBar({ facets, filters, onFilterChange, selectedRange, onRang
         {(facets?.models ?? []).map((facet) => (
           <option key={facet.value} value={facet.value}>{facet.value}</option>
         ))}
+        {/* Present only when the URL's (or a remembered) model sits outside
+            the window's top-50 facets, so the select keeps showing the value
+            that is actually applied instead of silently reading as All. */}
+        {filters.model != null && !(facets?.models ?? []).some((facet) => facet.value === filters.model) ? (
+          <option value={filters.model}>{filters.model}</option>
+        ) : null}
       </NativeSelect>
       <NativeSelect
         aria-label="Filter by status"
@@ -706,11 +712,20 @@ export function Usage() {
                     {logsQuery.data.total} matching {logsQuery.data.total === 1 ? "request" : "requests"}
                   </p>
                   <div className="flex items-center gap-2">
-                    <Button variant="outline" size="sm" disabled={page === 1} onClick={onPrevPage}>
+                    {/* While the placeholder bridge shows the previous read
+                        behind a changed epoch, its cursor is meaningless for
+                        the pending read — both turns are dead until the real
+                        page settles. */}
+                    <Button variant="outline" size="sm" disabled={page === 1 || logsQuery.isPlaceholderData} onClick={onPrevPage}>
                       Previous
                     </Button>
                     <span className="text-xs tabular-nums text-muted-foreground">Page {page}</span>
-                    <Button variant="outline" size="sm" disabled={!logsQuery.data.nextCursor} onClick={onNextPage}>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={!logsQuery.data.nextCursor || logsQuery.isPlaceholderData}
+                      onClick={onNextPage}
+                    >
                       Next
                     </Button>
                   </div>

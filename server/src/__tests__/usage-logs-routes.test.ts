@@ -201,7 +201,15 @@ describe("usage logs keyset cursor", () => {
   });
 
   it("rejects malformed cursors with 400 before reading rows", async () => {
-    for (const after of ["nope", "nope,nope", "2026-11-04T12:00:00Z", ",22222222-2222-4222-8222-222222222222"]) {
+    for (const after of [
+      "nope",
+      "nope,nope",
+      "2026-11-04T12:00:00Z",
+      ",22222222-2222-4222-8222-222222222222",
+      // A valid instant whose row id is not a uuid would otherwise reach the
+      // service's `::uuid` cast and surface as a 500.
+      "2026-11-04T12:00:00Z,not-a-uuid",
+    ]) {
       const response = await request(app()).get(`${logsPath}?after=${encodeURIComponent(after)}`);
       expect(response.status).toBe(400);
     }
