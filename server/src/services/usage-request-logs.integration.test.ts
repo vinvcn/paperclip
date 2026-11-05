@@ -648,14 +648,19 @@ describeEmbeddedPostgres("usage request log persistence", () => {
       });
       createdCompanyIds.push(filterCompanyId);
 
-      // Five rows spanning every filter dimension. The last one sits 3h in
+      // Seven rows spanning every filter dimension. The last one sits 3h in
       // the past so a 1h window can prove facets drop values without rows.
+      // The 302 and 600 rows stand in for the statuses the proxy still
+      // records outside 2xx/4xx/5xx: a redirect and a transport error —
+      // both belong to the "other" class, neither to success/4xx/5xx.
       const rows = [
         { app: "opencode", provider: "openrouter", model: "openai/gpt-5.2", httpStatus: 200, inputTokens: 120, outputTokens: 80, ageMinutes: 10 },
         { app: "opencode", provider: "anthropic", model: "anthropic/claude-sonnet-4-5", httpStatus: 429, inputTokens: null, outputTokens: null, ageMinutes: 20 },
         { app: "codex", provider: "openrouter", model: "openai/gpt-5.2", httpStatus: 503, inputTokens: null, outputTokens: null, ageMinutes: 30 },
         { app: "opencode", provider: "anthropic", model: "anthropic/claude-haiku-4-5", httpStatus: null, inputTokens: null, outputTokens: null, ageMinutes: 40 },
         { app: "legacy-cli", provider: "openrouter", model: "openai/gpt-5.2-mini", httpStatus: 200, inputTokens: null, outputTokens: null, ageMinutes: 180 },
+        { app: "opencode", provider: "anthropic", model: "anthropic/claude-sonnet-4-5", httpStatus: 302, inputTokens: null, outputTokens: null, ageMinutes: 5 },
+        { app: "codex", provider: "openrouter", model: "openai/gpt-5.2", httpStatus: 600, inputTokens: null, outputTokens: null, ageMinutes: 6 },
       ] as const;
       for (const row of rows) {
         await db.insert(usageRequestLogs).values({
@@ -689,17 +694,17 @@ describeEmbeddedPostgres("usage request log persistence", () => {
       const summary = await usageRequestLogService(db).summary(filterCompanyId, { from: new Date(Date.now() - 60 * 60_000) });
       // Facets are ordered by request volume, then by value.
       expect(summary.facets.apps).toEqual([
-        { value: "opencode", requests: 3 },
-        { value: "codex", requests: 1 },
+        { value: "opencode", requests: 4 },
+        { value: "codex", requests: 2 },
       ]);
       expect(summary.facets.providers).toEqual([
-        { value: "anthropic", requests: 2 },
-        { value: "openrouter", requests: 2 },
+        { value: "anthropic", requests: 3 },
+        { value: "openrouter", requests: 3 },
       ]);
       expect(summary.facets.models).toEqual([
-        { value: "openai/gpt-5.2", requests: 2 },
+        { value: "openai/gpt-5.2", requests: 3 },
+        { value: "anthropic/claude-sonnet-4-5", requests: 2 },
         { value: "anthropic/claude-haiku-4-5", requests: 1 },
-        { value: "anthropic/claude-sonnet-4-5", requests: 1 },
       ]);
     });
 
@@ -714,25 +719,25 @@ describeEmbeddedPostgres("usage request log persistence", () => {
 
     it("keeps facets describing the unfiltered window while filters narrow the totals", async () => {
       const filtered = await usageRequestLogService(db).summary(filterCompanyId, undefined, "UTC", { app: "opencode" });
-      expect(filtered.totalRequests).toBe(3);
+      expect(filtered.totalRequests).toBe(4);
       // Chips must not disappear once selected: facets still show every app
       // with rows, including the ones the filter excludes.
       expect(filtered.facets.apps).toEqual([
-        { value: "opencode", requests: 3 },
-        { value: "codex", requests: 1 },
+        { value: "opencode", requests: 4 },
+        { value: "codex", requests: 2 },
         { value: "legacy-cli", requests: 1 },
       ]);
       expect(filtered.facets.providers).toHaveLength(2);
     });
 
     it.each<[UsageRequestFilters, number]>([
-      [{ app: "opencode" }, 3],
-      [{ provider: "openrouter" }, 3],
-      [{ model: "openai/gpt-5.2" }, 2],
+      [{ app: "opencode" }, 4],
+      [{ provider: "openrouter" }, 4],
+      [{ model: "openai/gpt-5.2" }, 3],
       [{ status: "success" }, 2],
       [{ status: "client_error" }, 1],
       [{ status: "server_error" }, 1],
-      [{ status: "other" }, 1],
+      [{ status: "other" }, 3],
       [{ app: "opencode", status: "success" }, 1],
       [{ app: "codex", status: "success" }, 0],
     ])("narrows the summary totals, series and log list with the same filters %j", async (filters, expected) => {
@@ -756,16 +761,18 @@ describeEmbeddedPostgres("usage request log persistence", () => {
       expect(summary.tokensProcessed).toBe(200);
     });
 
-    it("sorts a null upstream status into other, never success", async () => {
+    it("sorts null, redirect and transport-error statuses into other, never success", async () => {
       const other = await usageRequestLogService(db).summary(filterCompanyId, undefined, "UTC", { status: "other" });
-      expect(other.totalRequests).toBe(1);
+      expect(other.totalRequests).toBe(3);
       const rows = await usageRequestLogService(db).latest(filterCompanyId, 20, { status: "other" });
-      expect(rows[0]!.httpStatus).toBeNull();
+      // The proxy also records redirects (302) and transport errors (600);
+      // with the null-status row they form "other", never success/4xx/5xx.
+      expect([...rows.map((row) => row.httpStatus)].sort((a, b) => (a ?? -1) - (b ?? -1))).toEqual([null, 302, 600]);
     });
 
     it("accepts a from/to window on the log list", async () => {
       const windowed = await usageRequestLogService(db).latest(filterCompanyId, 20, { range: { from: new Date(Date.now() - 60 * 60_000) } });
-      expect(windowed).toHaveLength(4); // the 3h-old legacy row is out
+      expect(windowed).toHaveLength(6); // the 3h-old legacy row is out
     });
   });
 

@@ -14,7 +14,7 @@ import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
 import { keepPreviousDataForSameCompany } from "../lib/query-placeholder-data";
-import { formatCents, formatDateTime, formatDurationMs, formatTokens, providerDisplayName } from "../lib/utils";
+import { cn, formatCents, formatDateTime, formatDurationMs, formatTokens, providerDisplayName } from "../lib/utils";
 import { UsageTokensChart } from "./usage/UsageTokensChart";
 import type { UsageRequestLogRow, UsageSummary } from "@paperclipai/shared";
 
@@ -25,7 +25,7 @@ const STATUS_FILTER_OPTIONS: { value: UsageStatusFilter; label: string }[] = [
   { value: "success", label: "2xx success" },
   { value: "client_error", label: "4xx client error" },
   { value: "server_error", label: "5xx server error" },
-  { value: "other", label: "Other" },
+  { value: "other", label: "Other (1xx, 3xx, 6xx, no status)" },
 ];
 
 const STATUS_FILTER_LABELS = Object.fromEntries(
@@ -116,11 +116,13 @@ function SummaryMetric({ label, value, badge }: { label: string; value: string |
  * unpriced badge, Total Requests, Tokens Processed, Cache Hit Rate) and the
  * 4-up secondary row (Fresh Input, Output, Cache Write, Cache Hit), matching
  * the approved usage-page mock. Total Cost sums the window's priced rows;
- * the badge counts the unpriced rows the total does not cover.
+ * the badge counts the unpriced rows the total does not cover. `busy` marks
+ * the block while a bridged refetch is in flight — the stale numbers stay
+ * readable but clearly not final.
  */
-function SummaryCards({ summary }: { summary: UsageSummary | undefined }) {
+function SummaryCards({ summary, busy }: { summary: UsageSummary | undefined; busy: boolean }) {
   return (
-    <Card className="py-4">
+    <Card aria-busy={busy} className={cn("py-4", busy && "opacity-60 transition-opacity")}>
       <CardContent className="px-5">
         <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <SummaryMetric
@@ -262,6 +264,12 @@ export function Usage() {
     enabled: !!selectedCompanyId,
     placeholderData: keepPreviousDataForSameCompany<UsageSummary>(companyId),
   });
+  // While a filter change refetches behind the placeholder bridge, the chips
+  // and selects already read as applied but the cards/chart/table still show
+  // the previous (unfiltered) numbers — mark those regions busy so the stale
+  // figures are not mistaken for the answer (initial load keeps its skeleton;
+  // this only covers the bridged case).
+  const usageFetching = logsQuery.isFetching || summaryQuery.isFetching;
 
   // Human names for the active filters; the filtered empty state points at
   // them instead of showing a bare empty table.
@@ -298,14 +306,14 @@ export function Usage() {
         <PageSkeleton />
       ) : (
         <>
-          <SummaryCards summary={summaryQuery.data} />
-          <UsageTokensChart series={summaryQuery.data?.series} />
+          <SummaryCards summary={summaryQuery.data} busy={usageFetching} />
+          <UsageTokensChart series={summaryQuery.data?.series} busy={usageFetching} />
           <UsageFilterBar
             facets={summaryQuery.data?.facets}
             filters={filters}
             onFilterChange={onFilterChange}
           />
-          <Card className="gap-3 py-4">
+          <Card aria-busy={usageFetching} className={cn("gap-3 py-4", usageFetching && "opacity-60 transition-opacity")}>
             <CardHeader className="gap-0 px-5">
               <CardTitle className="text-base">Request logs</CardTitle>
               <CardDescription>Newest provider requests, newest first.</CardDescription>
@@ -351,7 +359,8 @@ export function Usage() {
                           <td className="whitespace-nowrap px-4 py-3 text-right tabular-nums">
                             {requestCostCell(row)}
                           </td>
-                          <td className={`px-4 py-3 text-right tabular-nums${row.httpStatus != null && row.httpStatus >= 400 ? " text-destructive" : ""}`}>
+                          {/* Aligned with the status classes: 6xx+ transport errors read as "other", not failures. */}
+                          <td className={`px-4 py-3 text-right tabular-nums${row.httpStatus != null && row.httpStatus >= 400 && row.httpStatus < 600 ? " text-destructive" : ""}`}>
                             {formatRequestStatus(row.httpStatus)}
                           </td>
                           <td className="whitespace-nowrap py-3 pl-4 text-right tabular-nums">

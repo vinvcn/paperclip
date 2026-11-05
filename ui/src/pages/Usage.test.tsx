@@ -34,6 +34,14 @@ function LocationProbe() {
   return <div data-testid="location-probe">{location.search}</div>;
 }
 
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((nextResolve) => {
+    resolve = nextResolve;
+  });
+  return { promise, resolve };
+}
+
 function row(overrides: Partial<UsageRequestLogRow> = {}): UsageRequestLogRow {
   return {
     id: "11111111-1111-4111-8111-111111111111",
@@ -460,6 +468,38 @@ describe("Usage page", () => {
       expect(container.textContent).toContain('app "opencode"');
       expect(container.textContent).toContain("status 4xx client error");
       expect(container.textContent).not.toContain("No requests observed yet");
+    });
+
+    it("marks the data regions busy while a filter change refetches behind the bridge", async () => {
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(metricValue("Total requests")).toBe("12"));
+      });
+      // The summary read for the narrowed window hangs: the placeholder
+      // bridge keeps the previous data on screen, now marked busy so the
+      // stale figures are not mistaken for the filtered answer.
+      const deferred = createDeferred<UsageSummary>();
+      usageSummaryMock.mockImplementation(() => deferred.promise);
+      const statusSelect = container.querySelector('select[aria-label="Filter by status"]') as HTMLSelectElement;
+      await act(async () => {
+        statusSelect.value = "server_error";
+        statusSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      // The logs read settles into the filtered empty state while the summary
+      // is still in flight — content, not skeleton.
+      await act(async () => {
+        await vi.waitFor(() => expect(container.textContent).toContain("No requests match the current filters"));
+      });
+      expect(container.querySelector('[aria-busy="true"]')).not.toBeNull();
+      expect(metricValue("Total requests")).toBe("12");
+      await act(async () => {
+        deferred.resolve(summary({ totalRequests: 3 }));
+        await deferred.promise;
+      });
+      await act(async () => {
+        await vi.waitFor(() => expect(container.querySelector('[aria-busy="true"]')).toBeNull());
+      });
+      expect(metricValue("Total requests")).toBe("3");
     });
   });
 });
