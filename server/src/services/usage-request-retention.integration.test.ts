@@ -13,6 +13,9 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
+import { PROVIDER_REQUEST_USAGE_KIND, usageProviderAndBillerFromModel } from "../vendor/paperclip-runner/index.js";
+import { DELIVERY_QUEUES, subscribeDeliveryWork } from "./delivery-work-notifications.js";
+import { usageRequestLogService } from "./usage-request-logs.js";
 import {
   USAGE_REQUEST_LOG_RETENTION_MS,
   USAGE_REQUEST_LOG_SWEEP_CHUNK,
@@ -218,7 +221,8 @@ describeEmbeddedPostgres("usage request log retention sweep", () => {
     expect(await retention.cleanupExpired(now)).toBe(1);
     const receipts = await db.select().from(costEvents);
     expect(receipts.map((row) => row.id).sort()).toEqual([recentReceipt, ancientReceipt].sort());
-    expect(receipts.find((row) => row.id === ancientReceipt)!.costCents).toBe("0.5");
+    // numeric({ mode: "number" }): the ledger row comes back untouched, value intact.
+    expect(receipts.find((row) => row.id === ancientReceipt)!.costCents).toBe(0.5);
   });
 
   it("reports the next retention deadline the scheduler waits on", async () => {
@@ -241,6 +245,55 @@ describeEmbeddedPostgres("usage request log retention sweep", () => {
     expect(await retention.nextRetentionDeadline()).toBeLessThanOrEqual(Date.now());
 
     expect(await retention.cleanupExpired(now)).toBe(1);
+    // The surviving fresh row's deadline is what the scheduler now waits on.
+    expect(await retention.nextRetentionDeadline()).toBe(
+      occurredAt.getTime() + USAGE_REQUEST_LOG_RETENTION_MS,
+    );
+  });
+
+  it("clears the deadline once the sweep has drained every expired row", async () => {
+    const retention = usageRequestRetentionService(db);
+    const now = new Date();
+    const overdueAt = new Date(now.getTime() - (USAGE_REQUEST_LOG_RETENTION_MS + 60_000));
+    await insertRow(overdueAt);
+    await insertRow(new Date(overdueAt.getTime() - 86_400_000));
+    expect(await retention.nextRetentionDeadline()).toBeLessThanOrEqual(Date.now());
+
+    expect(await retention.cleanupExpired(now)).toBe(2);
+    expect(await survivingRequestIds()).toHaveLength(0);
     expect(await retention.nextRetentionDeadline()).toBeNull();
+  });
+
+  it("signals the retention queue when a request row is recorded", async () => {
+    // The write hook is the worker's only learning path for a first insert
+    // into an empty table, whose deadline nothing else would re-probe.
+    // Subscriptions attach to the createDb connection itself.
+    let wakes = 0;
+    const unsubscribe = subscribeDeliveryWork(db, DELIVERY_QUEUES.usageRequestRetention, () => {
+      wakes += 1;
+    });
+    try {
+      const startedAtMs = Date.now() - 1_000;
+      await usageRequestLogService(db).recordForRun(
+        { companyId, runId, agentId, issueId: null },
+        {
+          kind: PROVIDER_REQUEST_USAGE_KIND,
+          request: {
+            requestId: randomUUID(),
+            app: "opencode",
+            ...usageProviderAndBillerFromModel("openrouter/anthropic/claude-sonnet-4"),
+            model: "openrouter/anthropic/claude-sonnet-4",
+            startedAtMs,
+            endedAtMs: startedAtMs + 100,
+            ttftMs: null,
+            httpStatus: 200,
+            providerRequestId: null,
+          },
+        },
+      );
+      expect(wakes).toBeGreaterThanOrEqual(1);
+    } finally {
+      unsubscribe();
+    }
   });
 });

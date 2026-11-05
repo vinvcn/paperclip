@@ -28,6 +28,7 @@ export const DELIVERY_QUEUES = {
   statusCardEvaluation: "status-card-evaluation",
   runEvidenceMigration: "run-evidence-migration",
   providerTraceRetention: "provider-trace-retention",
+  usageRequestRetention: "usage-request-retention",
   nativeRunnerEvidenceRetention: "native-runner-evidence-retention",
   skillVersionRetention: "skill-version-retention",
   externalObjectRefresh: "external-object-refresh",
