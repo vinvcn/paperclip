@@ -66,6 +66,22 @@ function normalizeEnv(input: unknown): Record<string, string> {
 const OPENCODE_AUTH_REQUIRED_RE =
   /(?:auth(?:entication)?\s+required|api\s*key|invalid\s*api\s*key|not\s+logged\s+in|opencode\s+auth\s+login|free\s+usage\s+exceeded)/i;
 
+/**
+ * Disables opencode's managed service inside an isolated config home by
+ * writing `opencode/service.json` with `{"disabled": true}`. Without this,
+ * `opencode run` reuses (or spawns) the fixed-port managed service instead of
+ * an inline server and never reads the isolated config's provider definitions.
+ */
+export async function writeProbeServiceDisableFlag(configHome: string): Promise<void> {
+  const serviceConfigDir = path.join(configHome, "opencode");
+  await fs.mkdir(serviceConfigDir, { recursive: true });
+  await fs.writeFile(
+    path.join(serviceConfigDir, "service.json"),
+    `${JSON.stringify({ disabled: true }, null, 2)}\n`,
+    "utf8",
+  );
+}
+
 export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
@@ -129,6 +145,29 @@ export async function testEnvironment(
   // Prevent OpenCode from writing an opencode.json into the working directory.
   env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
   const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
+  // The probe's isolated XDG_CONFIG_HOME does not isolate opencode v2's managed
+  // service: with a host `opencode serve --service` running, the probe child
+  // reuses that service, and its model routing never contains this agent's
+  // custom providers (e.g. paperclip/<model>), so the probe fails with
+  // `provider.no-route: Model unavailable`. With no host service, the probe
+  // spawns its own managed service and fails with EADDRINUSE on the fixed
+  // port. Disabling the managed service makes `opencode run` use the inline
+  // server, which reads this isolated config (custom providers included).
+  // Regular runs in execute.ts intentionally keep managed-service reuse.
+  if (preparedRuntimeConfig.env.XDG_CONFIG_HOME) {
+    try {
+      await writeProbeServiceDisableFlag(preparedRuntimeConfig.env.XDG_CONFIG_HOME);
+    } catch (err) {
+      // Best-effort flag: the hello probe below is the real verdict, so a
+      // failed write must not block the probe — surface it as a check instead.
+      checks.push({
+        code: "opencode_probe_service_disable_failed",
+        level: "warn",
+        message: "Could not disable the OpenCode managed service for the configuration probe.",
+        detail: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   if (asBoolean(config.dangerouslySkipPermissions, true)) {

@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -71,7 +71,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 
-import { testEnvironment } from "./test.js";
+import { testEnvironment, writeProbeServiceDisableFlag } from "./test.js";
 import { discoverOpenCodeModels, ensureOpenCodeModelConfiguredAndAvailable } from "./models.js";
 
 vi.mock("./models.js", async () => ({
@@ -210,5 +210,44 @@ describe("opencode remote environment diagnostics", () => {
     expect(probeCall?.[4].env.XDG_CONFIG_HOME).toBe(
       "/remote/workspace/.paperclip-runtime/runs/test/workspace/.paperclip-runtime/opencode/xdgConfig",
     );
+  });
+
+  describe("managed service isolation for the configuration probe", () => {
+    it("writes a disabled managed-service flag into the probe's isolated config home", async () => {
+      const baseProbe = runAdapterExecutionTargetProcess.getMockImplementation()!;
+      let probeServiceFlag: unknown;
+      runAdapterExecutionTargetProcess.mockImplementationOnce(async (...args: unknown[]) => {
+        const [, , , , options] = args as unknown as [
+          unknown,
+          unknown,
+          unknown,
+          unknown,
+          { env: Record<string, string> },
+        ];
+        // The probe's config home is deleted in `testEnvironment`'s finally
+        // block, so the flag must be read while the probe process would run.
+        probeServiceFlag = JSON.parse(
+          await readFile(path.join(options.env.XDG_CONFIG_HOME, "opencode", "service.json"), "utf8"),
+        );
+        return await baseProbe();
+      });
+      const result = await testEnvironment({ companyId: "company-1", adapterType: "paperclip_runner",
+        config: { model: "openrouter/deepseek/deepseek-v4-flash-0731", env: { XDG_CONFIG_HOME: configHome } } });
+      expect(result.status).toBe("pass");
+      expect(probeServiceFlag).toEqual({ disabled: true });
+    });
+
+    it("creates the opencode config directory when missing and overwrites an existing flag", async () => {
+      const bareHome = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-probe-flag-"));
+      configHomes.push(bareHome);
+      await writeProbeServiceDisableFlag(bareHome);
+      await expect(readFile(path.join(bareHome, "opencode", "service.json"), "utf8").then(JSON.parse))
+        .resolves.toEqual({ disabled: true });
+
+      await writeFile(path.join(bareHome, "opencode", "service.json"), JSON.stringify({ disabled: false }));
+      await writeProbeServiceDisableFlag(bareHome);
+      await expect(readFile(path.join(bareHome, "opencode", "service.json"), "utf8").then(JSON.parse))
+        .resolves.toEqual({ disabled: true });
+    });
   });
 });
