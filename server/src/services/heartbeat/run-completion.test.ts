@@ -2,11 +2,13 @@ import { createNativeUsageDelivery } from "../native-runtime/native-usage-delive
 import type { PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { agents, agentWakeupRequests, caseHandoffs, cases, companies, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { agents, agentWakeupRequests, caseHandoffs, cases, companies, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, usageRequestLogs } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import * as usageReceipts from "../usage-receipts.js";
+import { PROVIDER_REQUEST_USAGE_KIND } from "../../vendor/paperclip-runner/index.js";
+import { allocateRunCosts } from "../usage-request-logs.js";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { UnresolvedWorkspaceBaseRefError } from "../workspace-runtime.js";
 import { LegacyControllerLeaseLostError } from "../legacy-controller-lease.js";
@@ -20,6 +22,13 @@ import { createHeartbeatRunCompletion, type CompleteHeartbeatRunInput, type Fail
 import { createHeartbeatAgentStatus } from "./agent-status.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
+
+// Wrapped (not replaced) so every test keeps the real allocator and a single
+// test can stage a one-shot allocation failure without disturbing the rest.
+vi.mock("../usage-request-logs.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../usage-request-logs.js")>();
+  return { ...actual, allocateRunCosts: vi.fn(actual.allocateRunCosts) };
+});
 
 type Dependencies = HeartbeatRunCompletionDependencies;
 function callbacks(db: Db) {
@@ -149,15 +158,49 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
 
   it("persists usage, accounting, final logs, presentation and the next task session", async () => {
     const f = await fixture();
+    // Commit a provider_request diagnostic to the durable log so the
+    // completion sweep has a tail to persist before the receipt is
+    // distributed (docs/specs/usage-request-logs.md, Cost attribution).
+    const startedAtMs = Date.now() - 500;
+    // seq comes from the run's event counter, which is bumped here the same
+    // way appendRunEvent does — otherwise the completion path's own append
+    // collides on the (run_id, seq) unique index.
+    await db.insert(heartbeatRunEvents).values({
+      companyId: f.run.companyId, runId: f.run.id, agentId: f.run.agentId, seq: f.run.nextEventSeq,
+      eventType: "harness.diagnostic", stream: "system", level: "info",
+      payload: { prpEvent: { eventType: "harness.diagnostic", payload: {
+        kind: PROVIDER_REQUEST_USAGE_KIND,
+        request: { requestId: randomUUID(), app: "opencode", provider: "test", biller: "test", model: "test-model",
+          startedAtMs, endedAtMs: startedAtMs + 100, ttftMs: 10, httpStatus: 200, providerRequestId: "up-1",
+          usage: { inputTokens: 20, cachedInputTokens: 5, cacheWriteTokens: 0, outputTokens: 8 } },
+      } } },
+    });
+    await db.update(heartbeatRuns).set({ nextEventSeq: f.run.nextEventSeq + 1 }).where(eq(heartbeatRuns.id, f.run.id));
     await f.completion.completeRun(f.input);
     expect(await read(f.run.id)).toMatchObject({ status: "succeeded", sessionIdAfter: "provider-session", logBytes: 123, logSha256: "log-hash", logCompressed: true, stdoutExcerpt: "answer", costAccountingPending: false, costAccountedAt: expect.any(Date), usageJson: { inputTokens: 20, cachedInputTokens: 5, outputTokens: 8, usageSource: "per_run", configFreshness: { version: 1 } }, resultJson: { presentationDecision: { commentAction: "none" } } });
     expect(await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, f.run.id))).toHaveLength(1);
+    const requestRows = await db.select().from(usageRequestLogs).where(eq(usageRequestLogs.runId, f.run.id));
+    const [receipt] = await db.select({ cents: sql<string>`coalesce(sum(${costEvents.costCents}),0)::text` })
+      .from(costEvents).where(eq(costEvents.heartbeatRunId, f.run.id));
+    expect(requestRows).toHaveLength(1);
+    // The sweeped request row is priced by the run's receipt, and the
+    // allocation sums exactly to that receipt — no drift, nothing unpriced.
+    expect(requestRows[0]).toMatchObject({ costStatus: "priced" });
+    expect(requestRows.reduce((sum, row) => sum + Number(row.costCents ?? 0), 0)).toBe(Number(receipt!.cents));
     expect((await f.deps.getTaskSession(f.agent.companyId, f.agent.id, f.agent.adapterType, "completion-task"))?.sessionDisplayId).toBe("provider-session");
     expect(f.input.output.outputProgressState.pending?.bytes).toBe(123);
     expect(f.input.onProviderTraceFinalized).toHaveBeenCalledOnce();
     expect(f.deps.setWakeupStatus).toHaveBeenCalledWith(f.wake.id, "completed", expect.any(Object));
     expect(f.deps.releaseIssueExecutionAndPromote).toHaveBeenCalledOnce();
     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(f.agent.id, "succeeded", null, expect.any(Object));
+  });
+
+  it("keeps the run succeeded and the ledger settled when cost allocation throws", async () => {
+    const f = await fixture();
+    vi.mocked(allocateRunCosts).mockRejectedValueOnce(new Error("allocation exploded"));
+    await f.completion.completeRun(f.input);
+    expect(await read(f.run.id)).toMatchObject({ status: "succeeded", costAccountingPending: false, costAccountedAt: expect.any(Date) });
+    expect(await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, f.run.id))).toHaveLength(1);
   });
 
   it("settles the accepted native exact rate-card price without replacing it with zero", async () => {

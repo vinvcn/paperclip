@@ -61,6 +61,7 @@ function summary(overrides: Partial<UsageSummary> = {}): UsageSummary {
   return {
     companyId: "company-1",
     totalRequests: 12,
+    totalCostCents: "0",
     freshInputTokens: 1500,
     cachedInputTokens: 500,
     cacheWriteTokens: 200,
@@ -140,7 +141,7 @@ describe("Usage page", () => {
     });
 
     const headers = [...container.querySelectorAll("th[scope=col]")].map((th) => th.textContent);
-    expect(headers).toEqual(["Time", "App", "Provider", "Model", "Status", "Duration"]);
+    expect(headers).toEqual(["Time", "App", "Provider", "Model", "Cost", "Status", "Duration"]);
 
     const [first, second] = [...container.querySelectorAll("tbody tr")];
     // Times render in the browser's local timezone via the shared date formatter.
@@ -155,6 +156,27 @@ describe("Usage page", () => {
     expect(second.textContent).toContain("claude-sonnet-4-5");
     expect(second.textContent).toContain("502");
     expect(second.textContent).toContain("12.4s");
+  });
+
+  it("renders per-row cost as the allocated amount, or Unpriced in a warning tone", async () => {
+    usageLogsMock.mockResolvedValue([
+      row({ costCents: "150.0000000", costStatus: "priced" }),
+      row({ id: "44444444-4444-4444-8444-444444444444", requestId: "req-unpriced", costCents: null, costStatus: "unpriced" }),
+    ]);
+    renderPage();
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelectorAll("tbody tr")).toHaveLength(2));
+    });
+
+    const rows = [...container.querySelectorAll("tbody tr")];
+    const costCell = (tr: Element) => tr.querySelectorAll("td")[4]!;
+    // Priced rows show their allocated share; unpriced rows show the
+    // data-quality notice in a warning tone, never a $0.00 price.
+    expect(costCell(rows[0]!).textContent).toBe("$1.50");
+    expect(costCell(rows[1]!).textContent).toBe("Unpriced");
+    expect(costCell(rows[1]!).firstElementChild!.className).toMatch(/amber/);
+    // An unpriced row is a data-quality notice, never a zero price.
+    for (const tr of rows) expect(costCell(tr).textContent).not.toBe("$0.00");
   });
 
   it("fetches the usage summary endpoint with the browser's timezone for the selected company", async () => {
@@ -185,12 +207,15 @@ describe("Usage page", () => {
 
   it("renders the summary cards with formatted totals inside one bordered block", async () => {
     usageLogsMock.mockResolvedValue([row()]);
+    usageSummaryMock.mockResolvedValue(summary({ totalCostCents: "1250.0000000" }));
     renderPage();
     await act(async () => {
       await vi.waitFor(() => expect(metricValue("Total requests")).toBe("12"));
     });
-    // Headline row: Total Cost is a placeholder until cost attribution lands.
-    expect(metricValue("Total cost")).toBe("—");
+    // Headline row: the Total Cost card sums the window's priced rows and
+    // carries the unpriced badge while any row lacks an allocation.
+    expect(metricValue("Total cost")).toContain("$12.50");
+    expect(metricValue("Total cost")).toContain("12 unpriced");
     expect(metricValue("Total requests")).toBe("12");
     expect(metricValue("Tokens processed")).toBe("3.0k");
     expect(metricValue("Cache hit rate")).toBe("25.0%");
@@ -204,6 +229,15 @@ describe("Usage page", () => {
     expect(blocks).toHaveLength(2);
     expect(blocks[0]!.querySelectorAll("dt")).toHaveLength(4);
     expect(blocks[1]!.querySelectorAll("dt")).toHaveLength(4);
+  });
+
+  it("omits the unpriced badge once every request carries an allocation", async () => {
+    usageSummaryMock.mockResolvedValue(summary({ totalCostCents: "99.5000000", unpricedCount: 0 }));
+    renderPage();
+    await act(async () => {
+      await vi.waitFor(() => expect(metricValue("Total cost")).toContain("$1.00"));
+    });
+    expect(metricValue("Total cost")).not.toContain("unpriced");
   });
 
   it("renders the cache hit rate as an em dash when the denominator is zero", async () => {
@@ -224,8 +258,9 @@ describe("Usage page", () => {
       await vi.waitFor(() => expect(container.querySelector("tbody tr")).not.toBeNull());
     });
     const cells = [...container.querySelectorAll("tbody tr td")].map((td) => td.textContent);
-    expect(cells[4]).toBe("—");
+    expect(cells[4]).toBe("Unpriced");
     expect(cells[5]).toBe("—");
+    expect(cells[6]).toBe("—");
   });
 
   it("shows the explanatory empty state when no requests were observed", async () => {

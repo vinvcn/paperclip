@@ -10,6 +10,7 @@ import { budgetServiceInTransaction, type BudgetServiceHooks } from "./budgets.j
 import { logger } from "../middleware/logger.js";
 import { promises as fs } from "node:fs";
 import { replayUsageReceipts, indexPendingUsageReceipts, recoverPendingRunUsageReceipts, type UsageReceiptIndex } from "./usage-receipts.js";
+import { allocateRunCosts, sweepRunUsageRequestLogEvents } from "./usage-request-logs.js";
 
 const terminalStatuses = ["succeeded", "failed", "timed_out", "cancelled", "interrupted"];
 const object = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -205,7 +206,34 @@ export async function reconcileRunCosts(db: Db, hooks: BudgetServiceHooks = {}) 
   let accounted = 0;
   const receiptIndex = pending.length > 0 ? await indexPendingUsageReceipts() : undefined;
   for (const run of pending) {
-    try { if (await accountRunCost(db, run.id, hooks, receiptIndex)) accounted++; }
+    try { if (await accountRunCost(db, run.id, hooks, receiptIndex)) {
+      accounted++;
+      // Recovery can close a run's accounting long after completion lost the
+      // race (crashed runs never reach the completion path). Distribute the
+      // just-closed receipt across the request rows the live consumer
+      // recorded; a failure must not re-open the settled ledger, so it is
+      // caught independently of the accounting retry bookkeeping below.
+      const [settled] = await db.select({
+        companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+        issueId: sql<string | null>`${heartbeatRuns.usageJson}->'ledgerScope'->>'issueId'`,
+      }).from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      if (settled) {
+        // A crashed run never reaches the completion path, so the
+        // provider_request tail it committed to the durable log after the
+        // live consumer stopped is only persisted here: sweep before
+        // allocating, or the allocation basis misses those rows forever.
+        // Best-effort, exactly like the sweep in run completion.
+        try {
+          await sweepRunUsageRequestLogEvents(db, {
+            companyId: settled.companyId, runId: run.id,
+            agentId: settled.agentId, issueId: text(settled.issueId),
+          });
+        }
+        catch (error) { logger.warn({ err: error, runId: run.id }, "Usage request log sweep failed after accounting recovery"); }
+        try { await allocateRunCosts(db, settled.companyId, run.id); }
+        catch (error) { logger.warn({ err: error, runId: run.id }, "Usage cost allocation failed after accounting recovery"); }
+      }
+    } }
     catch (error) {
       // Move failed attempts behind other pending work so a poisoned receipt
       // cannot monopolize the bounded batch on every recovery tick.

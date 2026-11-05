@@ -9,9 +9,9 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
-import { formatDateTime, formatDurationMs, formatTokens, providerDisplayName } from "../lib/utils";
+import { formatCents, formatDateTime, formatDurationMs, formatTokens, providerDisplayName } from "../lib/utils";
 import { UsageTokensChart } from "./usage/UsageTokensChart";
-import type { UsageSummary } from "@paperclipai/shared";
+import type { UsageRequestLogRow, UsageSummary } from "@paperclipai/shared";
 
 const NO_COMPANY = "__none__";
 
@@ -32,33 +32,58 @@ function formatRequestStatus(httpStatus: number | null): string {
   return httpStatus == null ? "—" : String(httpStatus);
 }
 
+/**
+ * A row's Cost column is the allocation the run's receipt gave it, not a
+ * price the provider reported. Rows without an allocation (no matching
+ * receipt, no billed tokens, or the row landed after the run's ledger
+ * closed) are a data-quality notice — `Unpriced` in a warning tone, never a
+ * $0.00 that would read as free (docs/specs/usage-request-logs.md).
+ */
+function requestCostCell(row: UsageRequestLogRow) {
+  if (row.costStatus === "unpriced" || row.costCents == null) {
+    return <span className="text-amber-700 dark:text-amber-200">Unpriced</span>;
+  }
+  return formatCents(Number(row.costCents));
+}
+
 /** Spec metric: null means the denominator was zero, never 0%. */
 function formatCacheHitRate(rate: number | null): string {
   return rate == null ? "—" : `${(rate * 100).toFixed(1)}%`;
 }
 
-function SummaryMetric({ label, value }: { label: string; value: string | number }) {
+function SummaryMetric({ label, value, badge }: { label: string; value: string | number; badge?: string }) {
   return (
     <div>
       <dt className="text-xs font-medium text-muted-foreground">{label}</dt>
-      <dd className="mt-1 text-2xl font-semibold tracking-tight tabular-nums text-foreground">{value}</dd>
+      <dd className="mt-1 text-2xl font-semibold tracking-tight tabular-nums text-foreground">
+        {value}
+        {badge ? (
+          <span className="ml-2 inline-block rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 align-middle text-xs font-medium text-amber-700 dark:text-amber-200">
+            {badge}
+          </span>
+        ) : null}
+      </dd>
     </div>
   );
 }
 
 /**
- * One bordered block holding the 4-up headline row (Total Cost placeholder,
- * Total Requests, Tokens Processed, Cache Hit Rate) and the 4-up secondary
- * row (Fresh Input, Output, Cache Write, Cache Hit), matching the approved
- * usage-page mock. The Total Cost value stays a placeholder until the cost
- * attribution ticket fills it in.
+ * One bordered block holding the 4-up headline row (Total Cost with its
+ * unpriced badge, Total Requests, Tokens Processed, Cache Hit Rate) and the
+ * 4-up secondary row (Fresh Input, Output, Cache Write, Cache Hit), matching
+ * the approved usage-page mock. Total Cost sums the window's priced rows;
+ * the badge counts the unpriced rows the total does not cover.
  */
 function SummaryCards({ summary }: { summary: UsageSummary | undefined }) {
   return (
     <Card className="py-4">
       <CardContent className="px-5">
         <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <SummaryMetric label="Total cost" value="—" />
+          <SummaryMetric
+            label="Total cost"
+            value={summary ? formatCents(Number(summary.totalCostCents)) : "—"}
+            badge={summary && summary.unpricedCount > 0 ? `${summary.unpricedCount} unpriced` : undefined}
+          />
           <SummaryMetric label="Total requests" value={summary?.totalRequests ?? "—"} />
           <SummaryMetric label="Tokens processed" value={summary ? formatTokens(summary.tokensProcessed) : "—"} />
           <SummaryMetric label="Cache hit rate" value={summary ? formatCacheHitRate(summary.cacheHitRate) : "—"} />
@@ -147,6 +172,7 @@ export function Usage() {
                         <th scope="col" className="px-4 py-2 text-left font-medium">App</th>
                         <th scope="col" className="px-4 py-2 text-left font-medium">Provider</th>
                         <th scope="col" className="px-4 py-2 text-left font-medium">Model</th>
+                        <th scope="col" className="px-4 py-2 text-right font-medium">Cost</th>
                         <th scope="col" className="px-4 py-2 text-right font-medium">Status</th>
                         <th scope="col" className="py-2 pl-4 text-right font-medium">Duration</th>
                       </tr>
@@ -160,6 +186,9 @@ export function Usage() {
                           <td className="px-4 py-3">{row.app}</td>
                           <td className="px-4 py-3">{providerDisplayName(row.provider)}</td>
                           <td className="px-4 py-3 font-mono">{row.model}</td>
+                          <td className="whitespace-nowrap px-4 py-3 text-right tabular-nums">
+                            {requestCostCell(row)}
+                          </td>
                           <td className={`px-4 py-3 text-right tabular-nums${row.httpStatus != null && row.httpStatus >= 400 ? " text-destructive" : ""}`}>
                             {formatRequestStatus(row.httpStatus)}
                           </td>

@@ -45,12 +45,16 @@ export interface UsageRequestLogRow {
  * nothing to the sums. `freshInputTokens = input − cached input` and
  * `tokensProcessed = fresh + output + cached input` follow the spec formulas.
  * `cacheHitRate` is null when no observed request carries prompt input; the UI
- * renders it as an em dash. `unpricedCount` is a placeholder for the pricing
- * ticket, which introduces per-row cost attribution.
+ * renders it as an em dash. `totalCostCents` is a decimal string summing only
+ * the priced rows' allocated costs (unpriced rows contribute zero), and
+ * `unpricedCount` — rows with no allocation basis or matching receipt — drives
+ * the Total Cost card's "N unpriced" badge, marking the displayed total as
+ * incomplete.
  */
 export interface UsageSummary {
   companyId: string;
   totalRequests: number;
+  totalCostCents: string;
   freshInputTokens: number;
   cachedInputTokens: number;
   cacheWriteTokens: number;

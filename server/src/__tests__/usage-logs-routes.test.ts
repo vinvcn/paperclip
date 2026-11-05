@@ -16,6 +16,7 @@ const summaryPath = `/api/companies/${companyId}/usage/summary`;
 const summaryFixture = {
   companyId,
   totalRequests: 12,
+  totalCostCents: "0",
   freshInputTokens: 1500,
   cachedInputTokens: 500,
   cacheWriteTokens: 200,
