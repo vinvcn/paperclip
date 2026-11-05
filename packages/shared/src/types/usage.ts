@@ -63,6 +63,41 @@ export interface UsageSummary {
   cacheHitRate: number | null;
   unpricedCount: number;
   series: UsageSummarySeriesPoint[];
+  facets: UsageSummaryFacets;
+}
+
+/**
+ * URL-friendly status classes for the usage `status` filter param
+ * (docs/specs/usage-request-logs.md, API). Classes keep the URL readable and
+ * match the log table's Status column; anything outside 2xx/4xx/5xx — a null
+ * upstream status, a 3xx redirect, a 6xx+ transport error — is `other`.
+ */
+export const USAGE_STATUS_FILTERS = ["success", "client_error", "server_error", "other"] as const;
+
+export type UsageStatusFilter = (typeof USAGE_STATUS_FILTERS)[number];
+
+/**
+ * One facet value of the summary's filter dimensions: an app, provider or
+ * model that actually produced requests inside the summary's window, with
+ * its row count. Facets drive the page's filter controls, so values with no
+ * rows in the window never appear as dead filter options.
+ */
+export interface UsageSummaryFacet {
+  /** The value as it appears on the log rows (app name, provider or model id). */
+  value: string;
+  /** Rows carrying this value inside the summary's window. */
+  requests: number;
+}
+
+/**
+ * The filter dimensions of the summary's window. Facets always describe the
+ * *unfiltered* window — they answer "what could I filter by here" — so a
+ * selected value never removes its own chip or option.
+ */
+export interface UsageSummaryFacets {
+  apps: UsageSummaryFacet[];
+  providers: UsageSummaryFacet[];
+  models: UsageSummaryFacet[];
 }
 
 /**

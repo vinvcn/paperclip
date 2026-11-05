@@ -3,6 +3,7 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Usage } from "./Usage";
 import { ApiError } from "../api/client";
@@ -26,6 +27,20 @@ vi.mock("../context/BreadcrumbContext", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+/** Observes the page's shareable filter URL as the router sees it. */
+function LocationProbe() {
+  const location = useLocation();
+  return <div data-testid="location-probe">{location.search}</div>;
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((nextResolve) => {
+    resolve = nextResolve;
+  });
+  return { promise, resolve };
+}
 
 function row(overrides: Partial<UsageRequestLogRow> = {}): UsageRequestLogRow {
   return {
@@ -70,22 +85,38 @@ function summary(overrides: Partial<UsageSummary> = {}): UsageSummary {
     cacheHitRate: 0.25,
     unpricedCount: 12,
     series: [],
+    facets: { apps: [], providers: [], models: [] },
     ...overrides,
   };
+}
+
+function summaryWithFacets(): UsageSummary {
+  return summary({
+    facets: {
+      apps: [{ value: "opencode", requests: 5 }],
+      providers: [{ value: "openrouter", requests: 3 }, { value: "anthropic", requests: 2 }],
+      models: [{ value: "z-ai/glm-4.6", requests: 5 }],
+    },
+  });
 }
 
 describe("Usage page", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot> | null = null;
 
-  function renderPage() {
+  function renderPage(initialUrl = "/") {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     root = createRoot(container);
     act(() => {
       root!.render(
-        <QueryClientProvider client={queryClient}>
-          <Usage />
-        </QueryClientProvider>,
+        <MemoryRouter initialEntries={[initialUrl]}>
+          <QueryClientProvider client={queryClient}>
+            <div>
+              <Usage />
+              <LocationProbe />
+            </div>
+          </QueryClientProvider>
+        </MemoryRouter>,
       );
     });
     return queryClient;
@@ -95,6 +126,16 @@ describe("Usage page", () => {
   function metricValue(label: string): string | null {
     const dt = [...container.querySelectorAll("dt")].find((el) => el.textContent === label);
     return dt?.nextElementSibling?.textContent ?? null;
+  }
+
+  /** The app chip labels ("All" first), counts stripped. */
+  function appChipLabels(): string[] {
+    return [...container.querySelectorAll('div[aria-label="Filter by app"] button')]
+      .map((button) => button.textContent!.replace(/\d+$/, ""));
+  }
+
+  function locationSearch(): string {
+    return container.querySelector('[data-testid="location-probe"]')!.textContent ?? "";
   }
 
   beforeEach(() => {
@@ -117,7 +158,7 @@ describe("Usage page", () => {
   it("fetches the usage logs endpoint for the selected company", async () => {
     renderPage();
     await act(async () => {
-      await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith("company-1"));
+      await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith("company-1", {}));
     });
     expect(setBreadcrumbsMock).toHaveBeenCalledWith([{ label: "Usage" }]);
   });
@@ -185,6 +226,7 @@ describe("Usage page", () => {
       await vi.waitFor(() => expect(usageSummaryMock).toHaveBeenCalledExactlyOnceWith(
         "company-1",
         Intl.DateTimeFormat().resolvedOptions().timeZone,
+        {},
       ));
     });
   });
@@ -307,5 +349,157 @@ describe("Usage page", () => {
     });
     expect(usageLogsMock).not.toHaveBeenCalled();
     expect(container.textContent).toContain("Select an organization to view usage.");
+  });
+
+  describe("filters", () => {
+    it("renders app chips from the summary facets plus an All item", async () => {
+      usageSummaryMock.mockResolvedValue(summaryWithFacets());
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(appChipLabels()).toEqual(["All", "opencode"]));
+      });
+      // Chips carry their window request count.
+      const chip = [...container.querySelectorAll('div[aria-label="Filter by app"] button')][1]!;
+      expect(chip.textContent).toContain("5");
+    });
+
+    it("renders only facet chips even when the URL names an app the window never saw", async () => {
+      usageSummaryMock.mockResolvedValue(summaryWithFacets());
+      renderPage("/?app=ghost");
+      await act(async () => {
+        await vi.waitFor(() => expect(appChipLabels()).toEqual(["All", "opencode"]));
+      });
+      // No dead chip for "ghost" — but the filter still applies to the data.
+      expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { app: "ghost" });
+    });
+
+    it("applies the clicked app chip to both reads and the URL", async () => {
+      usageSummaryMock.mockResolvedValue(summaryWithFacets());
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(appChipLabels()).toContain("opencode"));
+      });
+      const chip = [...container.querySelectorAll('div[aria-label="Filter by app"] button')]
+        .find((button) => button.textContent!.startsWith("opencode"))!;
+      await act(async () => {
+        chip.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { app: "opencode" }));
+      });
+      expect(usageSummaryMock).toHaveBeenLastCalledWith("company-1", expect.any(String), { app: "opencode" });
+      expect(locationSearch()).toBe("?app=opencode");
+    });
+
+    it("initializes filters from the URL and drops them again on All", async () => {
+      usageSummaryMock.mockResolvedValue(summaryWithFacets());
+      renderPage("/?app=opencode&status=client_error");
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith(
+          "company-1",
+          { app: "opencode", status: "client_error" },
+        ));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expect(container.querySelector('div[aria-label="Filter by app"]')).not.toBeNull());
+      });
+      const allChip = container.querySelector('div[aria-label="Filter by app"] button')!;
+      await act(async () => {
+        allChip.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { status: "client_error" }));
+      });
+      expect(locationSearch()).toBe("?status=client_error");
+    });
+
+    it("applies the provider, model and status selects to both reads and the URL", async () => {
+      usageSummaryMock.mockResolvedValue(summaryWithFacets());
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(container.querySelector('select[aria-label="Filter by provider"]')).not.toBeNull());
+      });
+      const providerSelect = container.querySelector('select[aria-label="Filter by provider"]') as HTMLSelectElement;
+      await act(async () => {
+        providerSelect.value = "openrouter";
+        providerSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { provider: "openrouter" }));
+      });
+
+      const modelSelect = container.querySelector('select[aria-label="Filter by model"]') as HTMLSelectElement;
+      // The model options come from the summary facets; wait for them before
+      // selecting a value the select does not carry yet.
+      await act(async () => {
+        await vi.waitFor(() => expect(
+          container.querySelector('select[aria-label="Filter by model"] option[value="z-ai/glm-4.6"]'),
+        ).not.toBeNull());
+      });
+      await act(async () => {
+        modelSelect.value = "z-ai/glm-4.6";
+        modelSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      const statusSelect = container.querySelector('select[aria-label="Filter by status"]') as HTMLSelectElement;
+      await act(async () => {
+        statusSelect.value = "server_error";
+        statusSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith(
+          "company-1",
+          { provider: "openrouter", model: "z-ai/glm-4.6", status: "server_error" },
+        ));
+      });
+      expect(usageSummaryMock).toHaveBeenLastCalledWith(
+        "company-1",
+        expect.any(String),
+        { provider: "openrouter", model: "z-ai/glm-4.6", status: "server_error" },
+      );
+      expect(locationSearch()).toBe("?provider=openrouter&model=z-ai%2Fglm-4.6&status=server_error");
+    });
+
+    it("shows the filtered empty state naming the current filters", async () => {
+      renderPage("/?app=opencode&status=client_error");
+      await act(async () => {
+        await vi.waitFor(() => expect(container.textContent).toContain("No requests match the current filters"));
+      });
+      // The empty state names every active filter, not a bare empty table.
+      expect(container.textContent).toContain('app "opencode"');
+      expect(container.textContent).toContain("status 4xx client error");
+      expect(container.textContent).not.toContain("No requests observed yet");
+    });
+
+    it("marks the data regions busy while a filter change refetches behind the bridge", async () => {
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(metricValue("Total requests")).toBe("12"));
+      });
+      // The summary read for the narrowed window hangs: the placeholder
+      // bridge keeps the previous data on screen, now marked busy so the
+      // stale figures are not mistaken for the filtered answer.
+      const deferred = createDeferred<UsageSummary>();
+      usageSummaryMock.mockImplementation(() => deferred.promise);
+      const statusSelect = container.querySelector('select[aria-label="Filter by status"]') as HTMLSelectElement;
+      await act(async () => {
+        statusSelect.value = "server_error";
+        statusSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      // The logs read settles into the filtered empty state while the summary
+      // is still in flight — content, not skeleton.
+      await act(async () => {
+        await vi.waitFor(() => expect(container.textContent).toContain("No requests match the current filters"));
+      });
+      expect(container.querySelector('[aria-busy="true"]')).not.toBeNull();
+      expect(metricValue("Total requests")).toBe("12");
+      await act(async () => {
+        deferred.resolve(summary({ totalRequests: 3 }));
+        await deferred.promise;
+      });
+      await act(async () => {
+        await vi.waitFor(() => expect(container.querySelector('[aria-busy="true"]')).toBeNull());
+      });
+      expect(metricValue("Total requests")).toBe("3");
+    });
   });
 });

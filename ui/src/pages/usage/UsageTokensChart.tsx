@@ -1,6 +1,6 @@
 import type { UsageSummarySeriesPoint } from "@paperclipai/shared";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { formatDateTime, formatTokens } from "@/lib/utils";
+import { cn, formatDateTime, formatTokens } from "@/lib/utils";
 
 /**
  * The Usage page's Tokens bar chart (docs/specs/usage-request-logs.md, UI):
@@ -47,8 +47,9 @@ function bucketTitle(point: UsageSummarySeriesPoint): string {
 /**
  * Renders the whole chart card. `undefined` series means the summary has not
  * arrived yet; an empty series means the window held no requests at all.
+ * `busy` marks the card while a bridged refetch redraws the previous window.
  */
-export function UsageTokensChart({ series }: { series: UsageSummarySeriesPoint[] | undefined }) {
+export function UsageTokensChart({ series, busy = false }: { series: UsageSummarySeriesPoint[] | undefined; busy?: boolean }) {
   const plotWidth = WIDTH - GUTTER - RIGHT;
   const plotHeight = HEIGHT - TOP - BOTTOM;
   const baseline = TOP + plotHeight;
@@ -60,7 +61,7 @@ export function UsageTokensChart({ series }: { series: UsageSummarySeriesPoint[]
   const xLabelStep = series && series.length > 0 ? Math.ceil(series.length / MAX_X_LABELS) : 1;
 
   return (
-    <Card className="gap-3 py-4">
+    <Card aria-busy={busy} className={cn("gap-3 py-4", busy && "opacity-60 transition-opacity")}>
       <CardHeader className="gap-0 px-5">
         <CardTitle className="text-base">Tokens</CardTitle>
         <CardDescription>Tokens processed per bucket, bucketed in your local timezone.</CardDescription>

@@ -1256,7 +1256,10 @@ export type {
   CostWindowSpendRow,
   CostByProject,
   UsageRequestLogRow,
+  UsageStatusFilter,
   UsageSummary,
+  UsageSummaryFacet,
+  UsageSummaryFacets,
   UsageSummarySeriesPoint,
   FinanceEvent,
   FinanceSummary,
@@ -1634,6 +1637,7 @@ export type {
 } from "./types/index.js";
 export { WORKSPACE_READINESS_STATES, WORKSPACE_SOURCE_VERIFICATION_REASONS,
   type WorkspaceSourceVerificationFailure, type WorkspaceSourceInspection } from "./types/index.js";
+export { USAGE_STATUS_FILTERS } from "./types/index.js";
 export {
   COMPANY_SEARCH_EXTRACT_KINDS,
   COMPANY_SEARCH_EXTRACT_SCOPES,

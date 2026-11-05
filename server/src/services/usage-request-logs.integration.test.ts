@@ -19,7 +19,12 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
 import { PROVIDER_REQUEST_USAGE_KIND, usageProviderAndBillerFromModel } from "../vendor/paperclip-runner/index.js";
-import { allocateRunCosts, sweepRunUsageRequestLogEvents, usageRequestLogService } from "./usage-request-logs.js";
+import {
+  allocateRunCosts,
+  sweepRunUsageRequestLogEvents,
+  usageRequestLogService,
+  type UsageRequestFilters,
+} from "./usage-request-logs.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -417,6 +422,7 @@ describeEmbeddedPostgres("usage request log persistence", () => {
         cacheHitRate: null,
         unpricedCount: 0,
         series: [],
+        facets: { apps: [], providers: [], models: [] },
       });
     });
 
@@ -603,6 +609,170 @@ describeEmbeddedPostgres("usage request log persistence", () => {
     it("returns an empty series when there is neither a window nor rows", async () => {
       const summary = await usageRequestLogService(db).summary(randomUUID());
       expect(summary.series).toEqual([]);
+    });
+  });
+
+  describe("request filters and facets", () => {
+    let filterCompanyId: string;
+    const createdCompanyIds: string[] = [];
+
+    beforeAll(async () => {
+      filterCompanyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(companies).values({
+        id: filterCompanyId,
+        name: "Usage Filters",
+        issuePrefix: filterCompanyId.replaceAll("-", "").slice(0, 4).toUpperCase(),
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId: filterCompanyId,
+        name: "UsageFilters",
+        role: "engineer",
+        status: "active",
+        adapterType: "paperclip_runner",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: filterCompanyId,
+        agentId,
+        invocationSource: "on_demand",
+        status: "running",
+        contextSnapshot: {},
+      });
+      createdCompanyIds.push(filterCompanyId);
+
+      // Seven rows spanning every filter dimension. The last one sits 3h in
+      // the past so a 1h window can prove facets drop values without rows.
+      // The 302 and 600 rows stand in for the statuses the proxy still
+      // records outside 2xx/4xx/5xx: a redirect and a transport error —
+      // both belong to the "other" class, neither to success/4xx/5xx.
+      const rows = [
+        { app: "opencode", provider: "openrouter", model: "openai/gpt-5.2", httpStatus: 200, inputTokens: 120, outputTokens: 80, ageMinutes: 10 },
+        { app: "opencode", provider: "anthropic", model: "anthropic/claude-sonnet-4-5", httpStatus: 429, inputTokens: null, outputTokens: null, ageMinutes: 20 },
+        { app: "codex", provider: "openrouter", model: "openai/gpt-5.2", httpStatus: 503, inputTokens: null, outputTokens: null, ageMinutes: 30 },
+        { app: "opencode", provider: "anthropic", model: "anthropic/claude-haiku-4-5", httpStatus: null, inputTokens: null, outputTokens: null, ageMinutes: 40 },
+        { app: "legacy-cli", provider: "openrouter", model: "openai/gpt-5.2-mini", httpStatus: 200, inputTokens: null, outputTokens: null, ageMinutes: 180 },
+        { app: "opencode", provider: "anthropic", model: "anthropic/claude-sonnet-4-5", httpStatus: 302, inputTokens: null, outputTokens: null, ageMinutes: 5 },
+        { app: "codex", provider: "openrouter", model: "openai/gpt-5.2", httpStatus: 600, inputTokens: null, outputTokens: null, ageMinutes: 6 },
+      ] as const;
+      for (const row of rows) {
+        await db.insert(usageRequestLogs).values({
+          companyId: filterCompanyId,
+          runId,
+          app: row.app,
+          provider: row.provider,
+          biller: row.provider,
+          model: row.model,
+          inputTokens: row.inputTokens,
+          cachedInputTokens: null,
+          cacheWriteTokens: null,
+          outputTokens: row.outputTokens,
+          httpStatus: row.httpStatus,
+          requestId: randomUUID(),
+          occurredAt: new Date(Date.now() - row.ageMinutes * 60_000),
+        });
+      }
+    });
+
+    afterAll(async () => {
+      for (const companyId of createdCompanyIds) {
+        await db.delete(usageRequestLogs).where(eq(usageRequestLogs.companyId, companyId));
+        await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+        await db.delete(agents).where(eq(agents.companyId, companyId));
+        await db.delete(companies).where(eq(companies.id, companyId));
+      }
+    });
+
+    it("lists the window's apps, providers and models with request counts", async () => {
+      const summary = await usageRequestLogService(db).summary(filterCompanyId, { from: new Date(Date.now() - 60 * 60_000) });
+      // Facets are ordered by request volume, then by value.
+      expect(summary.facets.apps).toEqual([
+        { value: "opencode", requests: 4 },
+        { value: "codex", requests: 2 },
+      ]);
+      expect(summary.facets.providers).toEqual([
+        { value: "anthropic", requests: 3 },
+        { value: "openrouter", requests: 3 },
+      ]);
+      expect(summary.facets.models).toEqual([
+        { value: "openai/gpt-5.2", requests: 3 },
+        { value: "anthropic/claude-sonnet-4-5", requests: 2 },
+        { value: "anthropic/claude-haiku-4-5", requests: 1 },
+      ]);
+    });
+
+    it("excludes values without rows in the window from the facets", async () => {
+      const windowed = await usageRequestLogService(db).summary(filterCompanyId, { from: new Date(Date.now() - 60 * 60_000) });
+      // The legacy-cli row is three hours old: no row in this window, no facet.
+      expect(windowed.facets.apps.some((facet) => facet.value === "legacy-cli")).toBe(false);
+      // Without the window bound the full history does have the value.
+      const all = await usageRequestLogService(db).summary(filterCompanyId);
+      expect(all.facets.apps).toContainEqual({ value: "legacy-cli", requests: 1 });
+    });
+
+    it("keeps facets describing the unfiltered window while filters narrow the totals", async () => {
+      const filtered = await usageRequestLogService(db).summary(filterCompanyId, undefined, "UTC", { app: "opencode" });
+      expect(filtered.totalRequests).toBe(4);
+      // Chips must not disappear once selected: facets still show every app
+      // with rows, including the ones the filter excludes.
+      expect(filtered.facets.apps).toEqual([
+        { value: "opencode", requests: 4 },
+        { value: "codex", requests: 2 },
+        { value: "legacy-cli", requests: 1 },
+      ]);
+      expect(filtered.facets.providers).toHaveLength(2);
+    });
+
+    it.each<[UsageRequestFilters, number]>([
+      [{ app: "opencode" }, 4],
+      [{ provider: "openrouter" }, 4],
+      [{ model: "openai/gpt-5.2" }, 3],
+      [{ status: "success" }, 2],
+      [{ status: "client_error" }, 1],
+      [{ status: "server_error" }, 1],
+      [{ status: "other" }, 3],
+      [{ app: "opencode", status: "success" }, 1],
+      [{ app: "codex", status: "success" }, 0],
+    ])("narrows the summary totals, series and log list with the same filters %j", async (filters, expected) => {
+      const service = usageRequestLogService(db);
+      const summary = await service.summary(filterCompanyId, undefined, "UTC", filters);
+      expect(summary.totalRequests).toBe(expected);
+      // The series answers to the same WHERE as the cards.
+      expect(summary.series.reduce((n, point) => n + point.requests, 0)).toBe(expected);
+      // And so does the log list.
+      const rows = await service.latest(filterCompanyId, 20, filters);
+      expect(rows).toHaveLength(expected);
+      if (filters.app) expect(rows.every((row) => row.app === filters.app)).toBe(true);
+      if (filters.provider) expect(rows.every((row) => row.provider === filters.provider)).toBe(true);
+      if (filters.model) expect(rows.every((row) => row.model === filters.model)).toBe(true);
+    });
+
+    it("narrows the token figures with the filters", async () => {
+      const summary = await usageRequestLogService(db).summary(filterCompanyId, undefined, "UTC", { status: "success" });
+      // Two 2xx rows, but only one carries usage: 120 input + 80 output.
+      expect(summary.totalRequests).toBe(2);
+      expect(summary.tokensProcessed).toBe(200);
+    });
+
+    it("sorts null, redirect and transport-error statuses into other, never success", async () => {
+      const other = await usageRequestLogService(db).summary(filterCompanyId, undefined, "UTC", { status: "other" });
+      expect(other.totalRequests).toBe(3);
+      const rows = await usageRequestLogService(db).latest(filterCompanyId, 20, { status: "other" });
+      // The proxy also records redirects (302) and transport errors (600);
+      // with the null-status row they form "other", never success/4xx/5xx.
+      expect([...rows.map((row) => row.httpStatus)].sort((a, b) => (a ?? -1) - (b ?? -1))).toEqual([null, 302, 600]);
+    });
+
+    it("accepts a from/to window on the log list", async () => {
+      const windowed = await usageRequestLogService(db).latest(filterCompanyId, 20, { range: { from: new Date(Date.now() - 60 * 60_000) } });
+      expect(windowed).toHaveLength(6); // the 3h-old legacy row is out
     });
   });
 

@@ -1,10 +1,29 @@
 import { and, desc, eq, gte, isNotNull, isNull, lte, sql, type SQL } from "drizzle-orm";
 import { centsToUnits, unitsToCents } from "@paperclipai/shared";
 import { costEvents, heartbeatRunEvents, issues, usageRequestLogs, type Db } from "@paperclipai/db";
-import type { UsageSummary, UsageSummarySeriesPoint } from "@paperclipai/shared";
+import type {
+  UsageStatusFilter,
+  UsageSummary,
+  UsageSummaryFacet,
+  UsageSummaryFacets,
+  UsageSummarySeriesPoint,
+} from "@paperclipai/shared";
 import { parseProviderRequestUsageRecord } from "../vendor/paperclip-runner/index.js";
 
 export type UsageRequestLogRow = typeof usageRequestLogs.$inferSelect;
+
+/** The app/provider/model/status filter dimensions of a usage read (docs/specs/usage-request-logs.md, API). */
+export interface UsageRequestFilters {
+  app?: string;
+  provider?: string;
+  model?: string;
+  status?: UsageStatusFilter;
+}
+
+/** The logs read's filters: the same dimensions plus the summary's from/to window. */
+export interface UsageRequestLogQuery extends UsageRequestFilters {
+  range?: { from?: Date; to?: Date };
+}
 
 export type UsageRequestRunBinding = {
   companyId: string;
@@ -15,6 +34,36 @@ export type UsageRequestRunBinding = {
 
 /** Spec: hour buckets for windows up to 48 hours, day buckets beyond. */
 const HOUR_BUCKET_WINDOW_MS = 48 * 60 * 60 * 1000;
+
+/**
+ * SQL predicate for one status filter class (docs/specs/
+ * usage-request-logs.md, API): `success` is 2xx, `client_error` 4xx,
+ * `server_error` 5xx, and `other` is everything else — a null upstream
+ * status, a 3xx redirect, a 6xx+ transport error.
+ */
+function statusCondition(status: UsageStatusFilter): SQL {
+  const status_ = usageRequestLogs.httpStatus;
+  switch (status) {
+    case "success":
+      return sql`${status_} between 200 and 299`;
+    case "client_error":
+      return sql`${status_} between 400 and 499`;
+    case "server_error":
+      return sql`${status_} between 500 and 599`;
+    case "other":
+      return sql`(${status_} is null or ${status_} < 200 or ${status_} between 300 and 399 or ${status_} >= 600)`;
+  }
+}
+
+/** WHERE fragments for the shared filter dimensions; absent filters add nothing. */
+function usageFilterConditions(filters: UsageRequestFilters): SQL[] {
+  const conditions: SQL[] = [];
+  if (filters.app) conditions.push(eq(usageRequestLogs.app, filters.app));
+  if (filters.provider) conditions.push(eq(usageRequestLogs.provider, filters.provider));
+  if (filters.model) conditions.push(eq(usageRequestLogs.model, filters.model));
+  if (filters.status) conditions.push(statusCondition(filters.status));
+  return conditions;
+}
 
 /**
  * Split a run's receipt across its request rows in the numeric(24,7)
@@ -207,10 +256,18 @@ export function usageRequestLogService(db: Db) {
       return inserted.length > 0;
     },
 
-    async latest(companyId: string, limit: number): Promise<UsageRequestLogRow[]> {
+    /**
+     * Newest rows for the log list, narrowed by the shared filters and an
+     * optional from/to window. Absent filters change nothing.
+     */
+    async latest(companyId: string, limit: number, query: UsageRequestLogQuery = {}): Promise<UsageRequestLogRow[]> {
+      const conditions: SQL[] = [eq(usageRequestLogs.companyId, companyId)];
+      if (query.range?.from) conditions.push(gte(usageRequestLogs.occurredAt, query.range.from));
+      if (query.range?.to) conditions.push(lte(usageRequestLogs.occurredAt, query.range.to));
+      conditions.push(...usageFilterConditions(query));
       return db.select()
         .from(usageRequestLogs)
-        .where(eq(usageRequestLogs.companyId, companyId))
+        .where(and(...conditions))
         .orderBy(desc(usageRequestLogs.occurredAt), desc(usageRequestLogs.id))
         .limit(limit);
     },
@@ -230,15 +287,20 @@ export function usageRequestLogService(db: Db) {
      * `timeZone` (an IANA name, validated by the route) buckets the returned
      * series in the viewer's local time; the window matches this summary's
      * from/to bounds, falling back to the extent of the matching rows.
+     * `filters` (app/provider/model/status) narrow the totals and series —
+     * the same WHERE the log list applies — but never the facets, which
+     * describe the unfiltered window so a selected value keeps its chip.
      */
     async summary(
       companyId: string,
       range?: { from?: Date; to?: Date },
       timeZone: string = "UTC",
+      filters: UsageRequestFilters = {},
     ): Promise<UsageSummary> {
-      const conditions: SQL[] = [eq(usageRequestLogs.companyId, companyId)];
-      if (range?.from) conditions.push(gte(usageRequestLogs.occurredAt, range.from));
-      if (range?.to) conditions.push(lte(usageRequestLogs.occurredAt, range.to));
+      const scopeConditions: SQL[] = [eq(usageRequestLogs.companyId, companyId)];
+      if (range?.from) scopeConditions.push(gte(usageRequestLogs.occurredAt, range.from));
+      if (range?.to) scopeConditions.push(lte(usageRequestLogs.occurredAt, range.to));
+      const conditions = [...scopeConditions, ...usageFilterConditions(filters)];
       const [row] = await db
         .select({
           totalRequests: sql<number>`count(*)::int`,
@@ -269,6 +331,40 @@ export function usageRequestLogService(db: Db) {
         cacheHitRate: hitDenominator > 0 ? cached / hitDenominator : null,
         unpricedCount: row?.unpricedCount ?? 0,
         series: await this.series(conditions, range, timeZone),
+        facets: await this.facets(scopeConditions),
+      };
+    },
+
+    /**
+     * The window's filter dimensions (docs/specs/usage-request-logs.md,
+     * API): every app, provider and model that produced at least one request
+     * in scope, with its count. One grouping-sets scan answers all three
+     * dimensions; the scope is deliberately the *unfiltered* window, so a
+     * selected app never removes its own chip (or another chip a user could
+     * still switch to). Since the columns are NOT NULL, a NULL marks the
+     * grouping sets the row does not belong to.
+     */
+    async facets(scopeConditions: SQL[]): Promise<UsageSummaryFacets> {
+      const rows = await db.execute(sql`
+        select app, provider, model, count(*)::int as requests
+        from ${usageRequestLogs}
+        where ${and(...scopeConditions)}
+        group by grouping sets ((app), (provider), (model))
+      `) as unknown as Array<{ app: string | null; provider: string | null; model: string | null; requests: number }>;
+      const apps: UsageSummaryFacet[] = [];
+      const providers: UsageSummaryFacet[] = [];
+      const models: UsageSummaryFacet[] = [];
+      for (const row of rows) {
+        if (row.app != null) apps.push({ value: row.app, requests: row.requests });
+        else if (row.provider != null) providers.push({ value: row.provider, requests: row.requests });
+        else if (row.model != null) models.push({ value: row.model, requests: row.requests });
+      }
+      const byVolume = (a: UsageSummaryFacet, b: UsageSummaryFacet) =>
+        b.requests - a.requests || a.value.localeCompare(b.value);
+      return {
+        apps: apps.sort(byVolume),
+        providers: providers.sort(byVolume),
+        models: models.sort(byVolume),
       };
     },
 
