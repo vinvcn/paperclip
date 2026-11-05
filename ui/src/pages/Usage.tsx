@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ScrollText } from "lucide-react";
 import { USAGE_STATUS_FILTERS, type UsageStatusFilter, type UsageSummaryFacets } from "@paperclipai/shared";
@@ -16,9 +16,12 @@ import { queryKeys } from "../lib/queryKeys";
 import { keepPreviousDataForSameCompany } from "../lib/query-placeholder-data";
 import { cn, formatCents, formatDateTime, formatDurationMs, formatTokens, providerDisplayName } from "../lib/utils";
 import { UsageTokensChart } from "./usage/UsageTokensChart";
-import type { UsageRequestLogRow, UsageSummary } from "@paperclipai/shared";
+import type { UsageRequestLogPage, UsageRequestLogRow, UsageSummary } from "@paperclipai/shared";
 
 const NO_COMPANY = "__none__";
+
+/** Rows per log page (docs/specs/usage-request-logs.md, UI: 20 / 50 / 100). */
+const LOGS_PAGE_SIZE = 20;
 
 /** URL-friendly status classes with the labels the log table's Status column speaks. */
 const STATUS_FILTER_OPTIONS: { value: UsageStatusFilter; label: string }[] = [
@@ -243,6 +246,26 @@ export function Usage() {
     );
   };
 
+  /**
+   * Keyset page turns (docs/specs/usage-request-logs.md, API). Next anchors
+   * the next read at this page's `nextCursor`; Previous replays the stored
+   * cursor of the page before. Both stamp the current epoch, so the state
+   * they write can only ever be read by the view they were clicked in.
+   */
+  const onNextPage = () => {
+    const next = logsQuery.data?.nextCursor;
+    if (!next) return;
+    setPagination({ epoch: paginationEpoch, cursor: next, history: [...activeHistory, activeCursor] });
+  };
+  const onPrevPage = () => {
+    if (activeHistory.length === 0) return;
+    setPagination({
+      epoch: paginationEpoch,
+      cursor: activeHistory[activeHistory.length - 1]!,
+      history: activeHistory.slice(0, -1),
+    });
+  };
+
   useEffect(() => {
     setBreadcrumbs([{ label: "Usage" }]);
   }, [setBreadcrumbs]);
@@ -251,11 +274,28 @@ export function Usage() {
   // Filter switches keep the previous rows/cards on screen while the narrowed
   // read loads — a full-page skeleton per chip click reads as breakage. The
   // placeholder only ever bridges within one company.
+  //
+  // Pagination is keyset (docs/specs/usage-request-logs.md, API): the current
+  // page's `after` cursor anchors the read, so it must live in the query key
+  // or page one and page two would share a cache entry. The epoch folds every
+  // input the cursor is meaningless against — company, filters, page size —
+  // so a changed epoch simply reads as "page one" without a reset effect, and
+  // a stale history can never be applied to a new read.
+  const [pagination, setPagination] = useState<{ epoch: string; cursor: string | null; history: (string | null)[] }>({
+    epoch: "",
+    cursor: null,
+    history: [],
+  });
+  const paginationEpoch = `${companyId}|${JSON.stringify(filters)}|${LOGS_PAGE_SIZE}`;
+  const onFirstPage = pagination.epoch !== paginationEpoch;
+  const activeCursor = onFirstPage ? null : pagination.cursor;
+  const activeHistory = onFirstPage ? [] : pagination.history;
+  const page = activeHistory.length + 1;
   const logsQuery = useQuery({
-    queryKey: queryKeys.usageRequestLogs(companyId, filters),
-    queryFn: () => usageApi.logs(companyId, filters),
+    queryKey: queryKeys.usageRequestLogs(companyId, filters, LOGS_PAGE_SIZE, activeCursor),
+    queryFn: () => usageApi.logs(companyId, filters, LOGS_PAGE_SIZE, activeCursor),
     enabled: !!selectedCompanyId,
-    placeholderData: keepPreviousDataForSameCompany<UsageRequestLogRow[]>(companyId),
+    placeholderData: keepPreviousDataForSameCompany<UsageRequestLogPage>(companyId),
   });
   const summaryQuery = useQuery({
     queryKey: queryKeys.usageSummary(companyId, filters),
@@ -319,7 +359,7 @@ export function Usage() {
               <CardDescription>Newest provider requests, newest first.</CardDescription>
             </CardHeader>
             <CardContent className="px-5">
-              {(logsQuery.data?.length ?? 0) === 0 ? (
+              {(logsQuery.data?.rows.length ?? 0) === 0 ? (
                 activeFilterNames.length > 0 ? (
                   <EmptyState
                     icon={ScrollText}
@@ -348,7 +388,7 @@ export function Usage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {logsQuery.data!.map((row) => (
+                      {logsQuery.data!.rows.map((row) => (
                         <tr key={row.id} className="border-b border-border last:border-0">
                           <td className="whitespace-nowrap py-3 pr-4 tabular-nums text-muted-foreground">
                             {formatDateTime(row.occurredAt, { includeSeconds: true })}
@@ -372,6 +412,22 @@ export function Usage() {
                   </table>
                 </div>
               )}
+              {logsQuery.data && logsQuery.data.rows.length > 0 ? (
+                <div className="mt-3 flex items-center justify-between border-t border-border pt-3">
+                  <p aria-live="polite" className="text-xs tabular-nums text-muted-foreground">
+                    {logsQuery.data.total} matching {logsQuery.data.total === 1 ? "request" : "requests"}
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <Button variant="outline" size="sm" disabled={page === 1} onClick={onPrevPage}>
+                      Previous
+                    </Button>
+                    <span className="text-xs tabular-nums text-muted-foreground">Page {page}</span>
+                    <Button variant="outline" size="sm" disabled={!logsQuery.data.nextCursor} onClick={onNextPage}>
+                      Next
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
             </CardContent>
           </Card>
         </>

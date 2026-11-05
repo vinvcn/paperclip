@@ -1,12 +1,13 @@
-import type { UsageRequestLogRow, UsageStatusFilter, UsageSummary } from "@paperclipai/shared";
+import type { UsageRequestLogPage, UsageRequestLogRow, UsageStatusFilter, UsageSummary } from "@paperclipai/shared";
 import { api } from "./client";
 
 /**
  * The Usage page's filter dimensions, carried to both usage reads
  * (docs/specs/usage-request-logs.md, API). Absent keys mean "no filter".
- * `from`/`to` pass the shareable URL's time window through to the server
- * (a range picker is a later ticket); model ids contain slashes, so every
- * value goes through URLSearchParams encoding.
+ * `from`/`to` carry the time window to the server — a preset selection is
+ * computed client-side into absolute bounds (an open-ended preset sends only
+ * `from` so polling keeps admitting new rows); "all" sends neither. Model ids
+ * contain slashes, so every value goes through URLSearchParams encoding.
  */
 export interface UsageLogFilters {
   app?: string;
@@ -30,15 +31,17 @@ function usageFilterParams(filters: UsageLogFilters): URLSearchParams {
 
 /**
  * Usage request log reads (docs/specs/usage-request-logs.md). The logs
- * endpoint returns the newest rows matching the filters; keyset pagination
- * arrives with a later ticket. Authorization mirrors the costs read
- * endpoints.
+ * endpoint returns one keyset page: the newest rows matching the filters,
+ * the total matching count, and the cursor (`<occurred-at ISO>,<row id>`) to
+ * pass back as `after` for the next-older page — null on the last page.
+ * Authorization mirrors the costs read endpoints.
  */
 export const usageApi = {
-  logs: (companyId: string, filters: UsageLogFilters = {}, limit: number = 20) => {
+  logs: (companyId: string, filters: UsageLogFilters = {}, limit: number = 20, after?: string | null) => {
     const params = usageFilterParams(filters);
     params.set("limit", String(limit));
-    return api.get<UsageRequestLogRow[]>(
+    if (after) params.set("after", after);
+    return api.get<UsageRequestLogPage>(
       `/companies/${companyId}/usage/logs?${params.toString()}`,
     );
   },
@@ -58,3 +61,5 @@ export const usageApi = {
     );
   },
 };
+
+export type { UsageRequestLogRow };

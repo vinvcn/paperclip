@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Usage } from "./Usage";
 import { ApiError } from "../api/client";
 import { formatDateTime } from "../lib/utils";
-import type { UsageRequestLogRow, UsageSummary } from "@paperclipai/shared";
+import type { UsageRequestLogPage, UsageRequestLogRow, UsageSummary } from "@paperclipai/shared";
 
 const usageLogsMock = vi.hoisted(() => vi.fn());
 const usageSummaryMock = vi.hoisted(() => vi.fn());
@@ -40,6 +40,19 @@ function createDeferred<T>() {
     resolve = nextResolve;
   });
   return { promise, resolve };
+}
+
+/** One keyset page as the logs endpoint now answers (docs/specs/usage-request-logs.md, API). */
+function pageOf(rows: UsageRequestLogRow[], total: number = rows.length, nextCursor: string | null = null): UsageRequestLogPage {
+  return { rows, total, nextCursor };
+}
+
+/**
+ * Every logs read carries the page size and the keyset cursor (null on page
+ * one) on top of the filters, per the paginated endpoint contract.
+ */
+function expectLastLogsCall(filters: Record<string, unknown>, limit: number = 20, after: string | null = null) {
+  expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", filters, limit, after);
 }
 
 function row(overrides: Partial<UsageRequestLogRow> = {}): UsageRequestLogRow {
@@ -85,7 +98,7 @@ function summary(overrides: Partial<UsageSummary> = {}): UsageSummary {
     cacheHitRate: 0.25,
     unpricedCount: 12,
     series: [],
-    facets: { apps: [], providers: [], models: [] },
+    facets: { apps: [], providers: [], models: [], modelsTruncated: false },
     ...overrides,
   };
 }
@@ -96,6 +109,7 @@ function summaryWithFacets(): UsageSummary {
       apps: [{ value: "opencode", requests: 5 }],
       providers: [{ value: "openrouter", requests: 3 }, { value: "anthropic", requests: 2 }],
       models: [{ value: "z-ai/glm-4.6", requests: 5 }],
+      modelsTruncated: false,
     },
   });
 }
@@ -143,7 +157,7 @@ describe("Usage page", () => {
     document.body.appendChild(container);
     companyState.selectedCompanyId = "company-1";
     usageLogsMock.mockReset();
-    usageLogsMock.mockResolvedValue([]);
+    usageLogsMock.mockResolvedValue(pageOf([]));
     usageSummaryMock.mockReset();
     usageSummaryMock.mockResolvedValue(summary());
   });
@@ -158,13 +172,13 @@ describe("Usage page", () => {
   it("fetches the usage logs endpoint for the selected company", async () => {
     renderPage();
     await act(async () => {
-      await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith("company-1", {}));
+      await vi.waitFor(() => expect(usageLogsMock).toHaveBeenCalledExactlyOnceWith("company-1", {}, 20, null));
     });
     expect(setBreadcrumbsMock).toHaveBeenCalledWith([{ label: "Usage" }]);
   });
 
   it("renders request rows with the P1 skeleton columns", async () => {
-    usageLogsMock.mockResolvedValue([
+    usageLogsMock.mockResolvedValue(pageOf([
       row(),
       row({
         id: "33333333-3333-4333-8333-333333333333",
@@ -175,7 +189,7 @@ describe("Usage page", () => {
         durationMs: 12_400,
         occurredAt: "2026-11-04T13:30:00Z",
       }),
-    ]);
+    ]));
     renderPage();
     await act(async () => {
       await vi.waitFor(() => expect(container.querySelector("tbody tr")).not.toBeNull());
@@ -200,10 +214,10 @@ describe("Usage page", () => {
   });
 
   it("renders per-row cost as the allocated amount, or Unpriced in a warning tone", async () => {
-    usageLogsMock.mockResolvedValue([
+    usageLogsMock.mockResolvedValue(pageOf([
       row({ costCents: "150.0000000", costStatus: "priced" }),
       row({ id: "44444444-4444-4444-8444-444444444444", requestId: "req-unpriced", costCents: null, costStatus: "unpriced" }),
-    ]);
+    ]));
     renderPage();
     await act(async () => {
       await vi.waitFor(() => expect(container.querySelectorAll("tbody tr")).toHaveLength(2));
@@ -248,7 +262,7 @@ describe("Usage page", () => {
   });
 
   it("renders the summary cards with formatted totals inside one bordered block", async () => {
-    usageLogsMock.mockResolvedValue([row()]);
+    usageLogsMock.mockResolvedValue(pageOf([row()]));
     usageSummaryMock.mockResolvedValue(summary({ totalCostCents: "1250.0000000" }));
     renderPage();
     await act(async () => {
@@ -292,9 +306,9 @@ describe("Usage page", () => {
   });
 
   it("renders missing status and duration as em dashes", async () => {
-    usageLogsMock.mockResolvedValue([
+    usageLogsMock.mockResolvedValue(pageOf([
       row({ httpStatus: null, durationMs: null }),
-    ]);
+    ]));
     renderPage();
     await act(async () => {
       await vi.waitFor(() => expect(container.querySelector("tbody tr")).not.toBeNull());
@@ -370,7 +384,7 @@ describe("Usage page", () => {
         await vi.waitFor(() => expect(appChipLabels()).toEqual(["All", "opencode"]));
       });
       // No dead chip for "ghost" — but the filter still applies to the data.
-      expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { app: "ghost" });
+      expectLastLogsCall({ app: "ghost" });
     });
 
     it("applies the clicked app chip to both reads and the URL", async () => {
@@ -385,7 +399,7 @@ describe("Usage page", () => {
         chip.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });
       await act(async () => {
-        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { app: "opencode" }));
+        await vi.waitFor(() => expectLastLogsCall({ app: "opencode" }));
       });
       expect(usageSummaryMock).toHaveBeenLastCalledWith("company-1", expect.any(String), { app: "opencode" });
       expect(locationSearch()).toBe("?app=opencode");
@@ -395,10 +409,7 @@ describe("Usage page", () => {
       usageSummaryMock.mockResolvedValue(summaryWithFacets());
       renderPage("/?app=opencode&status=client_error");
       await act(async () => {
-        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith(
-          "company-1",
-          { app: "opencode", status: "client_error" },
-        ));
+        await vi.waitFor(() => expectLastLogsCall({ app: "opencode", status: "client_error" }));
       });
       await act(async () => {
         await vi.waitFor(() => expect(container.querySelector('div[aria-label="Filter by app"]')).not.toBeNull());
@@ -408,7 +419,7 @@ describe("Usage page", () => {
         allChip.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });
       await act(async () => {
-        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { status: "client_error" }));
+        await vi.waitFor(() => expectLastLogsCall({ status: "client_error" }));
       });
       expect(locationSearch()).toBe("?status=client_error");
     });
@@ -425,7 +436,7 @@ describe("Usage page", () => {
         providerSelect.dispatchEvent(new Event("change", { bubbles: true }));
       });
       await act(async () => {
-        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", { provider: "openrouter" }));
+        await vi.waitFor(() => expectLastLogsCall({ provider: "openrouter" }));
       });
 
       const modelSelect = container.querySelector('select[aria-label="Filter by model"]') as HTMLSelectElement;
@@ -446,10 +457,7 @@ describe("Usage page", () => {
         statusSelect.dispatchEvent(new Event("change", { bubbles: true }));
       });
       await act(async () => {
-        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith(
-          "company-1",
-          { provider: "openrouter", model: "z-ai/glm-4.6", status: "server_error" },
-        ));
+        await vi.waitFor(() => expectLastLogsCall({ provider: "openrouter", model: "z-ai/glm-4.6", status: "server_error" }));
       });
       expect(usageSummaryMock).toHaveBeenLastCalledWith(
         "company-1",
@@ -500,6 +508,116 @@ describe("Usage page", () => {
         await vi.waitFor(() => expect(container.querySelector('[aria-busy="true"]')).toBeNull());
       });
       expect(metricValue("Total requests")).toBe("3");
+    });
+  });
+
+  describe("pagination", () => {
+    /** Rows for the walk test: seven distinct requests across three pages. */
+    const walkRows: UsageRequestLogRow[] = Array.from({ length: 7 }, (_, index) =>
+      row({
+        id: `55555555-5555-4555-8555-${String(index).padStart(12, "0")}`,
+        requestId: `req-${index}`,
+        occurredAt: new Date(Date.UTC(2026, 10, 4, 12, index)).toISOString(),
+      }),
+    );
+    /** The Time-cell text each walk row renders (the table's row identity). */
+    const times = (rows: UsageRequestLogRow[]) =>
+      rows.map((r) => formatDateTime(r.occurredAt, { includeSeconds: true }));
+
+    /** Three keyset pages keyed by the `after` cursor, as the server would serve them. */
+    function mockThreePages() {
+      usageLogsMock.mockImplementation((_companyId: string, _filters: unknown, _limit: number, after: string | null) => {
+        if (after == null) return Promise.resolve(pageOf(walkRows.slice(0, 3), 7, "cursor-1"));
+        if (after === "cursor-1") return Promise.resolve(pageOf(walkRows.slice(3, 6), 7, "cursor-2"));
+        if (after === "cursor-2") return Promise.resolve(pageOf(walkRows.slice(6, 7), 7, null));
+        return Promise.reject(new Error(`unexpected cursor ${after}`));
+      });
+    }
+
+    function renderedRowTimes(): string[] {
+      return [...container.querySelectorAll("tbody tr td:first-child")].map((td) => td.textContent!);
+    }
+
+    async function waitForRendered(expected: string[]) {
+      await act(async () => {
+        await vi.waitFor(() => expect(renderedRowTimes()).toEqual(expected));
+      });
+    }
+
+    async function clickButton(label: "Next" | "Previous") {
+      const button = [...container.querySelectorAll("button")].find((el) => el.textContent === label)!;
+      await act(async () => {
+        button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await Promise.resolve();
+      });
+    }
+
+    it("walks every row exactly once across pages: no duplicates, no gaps", async () => {
+      mockThreePages();
+      renderPage();
+      const seen: string[] = [];
+      await waitForRendered(times(walkRows.slice(0, 3)));
+      seen.push(...renderedRowTimes());
+      await clickButton("Next");
+      await waitForRendered(times(walkRows.slice(3, 6)));
+      seen.push(...renderedRowTimes());
+      await clickButton("Next");
+      await waitForRendered(times(walkRows.slice(6, 7)));
+      seen.push(...renderedRowTimes());
+      // Every row, in order, exactly once.
+      expect(seen).toEqual(times(walkRows));
+      expect(new Set(seen).size).toBe(seen.length);
+      expect(usageLogsMock).toHaveBeenNthCalledWith(2, "company-1", {}, 20, "cursor-1");
+      expect(usageLogsMock).toHaveBeenNthCalledWith(3, "company-1", {}, 20, "cursor-2");
+    });
+
+    it("renders the total matching count and disables turning past the last page", async () => {
+      mockThreePages();
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(container.textContent).toContain("7 matching requests"));
+      });
+      await clickButton("Next");
+      await waitForRendered(times(walkRows.slice(3, 6)));
+      await clickButton("Next");
+      await waitForRendered(times(walkRows.slice(6, 7)));
+      expect(container.textContent).toContain("Page 3");
+      const next = [...container.querySelectorAll("button")].find((button) => button.textContent === "Next")!;
+      expect(next.hasAttribute("disabled")).toBe(true);
+    });
+
+    it("returns to the previous page's anchored read with Previous", async () => {
+      mockThreePages();
+      renderPage();
+      await waitForRendered(times(walkRows.slice(0, 3)));
+      await clickButton("Next");
+      await waitForRendered(times(walkRows.slice(3, 6)));
+      await clickButton("Previous");
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", {}, 20, null));
+      });
+      await waitForRendered(times(walkRows.slice(0, 3)));
+      expect(container.textContent).toContain("Page 1");
+    });
+
+    it("starts over at page one when a filter changes", async () => {
+      mockThreePages();
+      renderPage();
+      await waitForRendered(times(walkRows.slice(0, 3)));
+      await clickButton("Next");
+      await act(async () => {
+        await vi.waitFor(() => expect(usageLogsMock).toHaveBeenLastCalledWith("company-1", {}, 20, "cursor-1"));
+      });
+      const statusSelect = container.querySelector('select[aria-label="Filter by status"]') as HTMLSelectElement;
+      await act(async () => {
+        statusSelect.value = "success";
+        statusSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      // The narrowed read is a fresh walk: page one, no cursor, no stale history.
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({ status: "success" }));
+      });
+      expect(container.textContent).toContain("Page 1");
     });
   });
 });
