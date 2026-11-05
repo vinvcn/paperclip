@@ -17,6 +17,27 @@ export function parseUsageLimit(query: Record<string, unknown>) {
 }
 
 /**
+ * The summary's series is bucketed in the viewer's timezone (an IANA name the
+ * browser reports via `Intl.DateTimeFormat().resolvedOptions().timeZone`).
+ * The value is validated with Intl and replaced by its canonical IANA name
+ * before it reaches the bucketing SQL — Intl accepts case-variant input that
+ * PostgreSQL would reject, and canonicalization keeps what we pass to
+ * `date_trunc(... AT TIME ZONE ...)` a zone PostgreSQL knows. The name itself
+ * is always a bound parameter, never part of the SQL text. Defaults to UTC
+ * when absent; anything unparseable is a 400, never a silent fallback.
+ */
+export function parseUsageTimezone(query: Record<string, unknown>): string {
+  const raw = query.tz;
+  if (raw == null || raw === "") return "UTC";
+  if (typeof raw !== "string") throw badRequest("invalid 'tz' value");
+  try {
+    return new Intl.DateTimeFormat("en", { timeZone: raw }).resolvedOptions().timeZone;
+  } catch {
+    throw badRequest("invalid 'tz' value");
+  }
+}
+
+/**
  * Usage request log reads (docs/specs/usage-request-logs.md). P1 exposes the
  * newest rows plus the aggregated summary; filters and keyset pagination
  * follow with the UI ticket. Authorization mirrors the costs read endpoints:
@@ -54,7 +75,8 @@ export function usageRoutes(db: Db) {
     const companyId = req.params.companyId as string;
     if (!(await requireUsageRead(req, res, companyId))) return;
     const range = parseCostDateRange(req.query);
-    res.json(await logs.summary(companyId, range));
+    const timeZone = parseUsageTimezone(req.query);
+    res.json(await logs.summary(companyId, range, timeZone));
   });
 
   return router;

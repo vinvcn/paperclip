@@ -1,6 +1,6 @@
-import { and, desc, eq, gte, lte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, lte, sql, type SQL } from "drizzle-orm";
 import { heartbeatRunEvents, issues, usageRequestLogs, type Db } from "@paperclipai/db";
-import type { UsageSummary } from "@paperclipai/shared";
+import type { UsageSummary, UsageSummarySeriesPoint } from "@paperclipai/shared";
 import { parseProviderRequestUsageRecord } from "../vendor/paperclip-runner/index.js";
 
 export type UsageRequestLogRow = typeof usageRequestLogs.$inferSelect;
@@ -11,6 +11,9 @@ export type UsageRequestRunBinding = {
   agentId: string | null;
   issueId: string | null;
 };
+
+/** Spec: hour buckets for windows up to 48 hours, day buckets beyond. */
+const HOUR_BUCKET_WINDOW_MS = 48 * 60 * 60 * 1000;
 
 function recordObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -93,9 +96,17 @@ export function usageRequestLogService(db: Db) {
      * applied to the aggregates: fresh input = input − cached input, tokens
      * processed = fresh + output + cached input, and the cache hit rate is
      * null when its denominator is zero.
+     *
+     * `timeZone` (an IANA name, validated by the route) buckets the returned
+     * series in the viewer's local time; the window matches this summary's
+     * from/to bounds, falling back to the extent of the matching rows.
      */
-    async summary(companyId: string, range?: { from?: Date; to?: Date }): Promise<UsageSummary> {
-      const conditions = [eq(usageRequestLogs.companyId, companyId)];
+    async summary(
+      companyId: string,
+      range?: { from?: Date; to?: Date },
+      timeZone: string = "UTC",
+    ): Promise<UsageSummary> {
+      const conditions: SQL[] = [eq(usageRequestLogs.companyId, companyId)];
       if (range?.from) conditions.push(gte(usageRequestLogs.occurredAt, range.from));
       if (range?.to) conditions.push(lte(usageRequestLogs.occurredAt, range.to));
       const [row] = await db
@@ -125,7 +136,78 @@ export function usageRequestLogService(db: Db) {
         tokensProcessed: freshInput + cached + output,
         cacheHitRate: hitDenominator > 0 ? cached / hitDenominator : null,
         unpricedCount: row?.unpricedCount ?? 0,
+        series: await this.series(conditions, range, timeZone),
       };
+    },
+
+    /**
+     * The token series for the summary's window (docs/specs/usage-request-logs.md,
+     * API), bucketed entirely in SQL with `date_trunc(... AT TIME ZONE :tz)` so
+     * buckets sit on local-time boundaries and DST transitions are PostgreSQL's
+     * problem, not ours. The timezone is always a bound parameter; buckets are
+     * generated over local wall-clock time and converted back with the same
+     * expression the rows group by — `distinct` collapses the wall hours a DST
+     * transition repeats (fall-back) or skips (spring-forward), so every bucket
+     * start is unique and every row joins exactly one bucket. `tokens` follows
+     * the spec's Tokens Processed formula, whose cached term cancels against
+     * fresh input: input + output. Missing window bounds fall back to the
+     * extent of the matching rows; with neither bounds nor rows there is
+     * nothing to fill, and the series is empty. Empty buckets are kept
+     * (zero-filled) so the axis is continuous.
+     */
+    async series(
+      conditions: SQL[],
+      range?: { from?: Date; to?: Date },
+      timeZone: string = "UTC",
+    ): Promise<UsageSummarySeriesPoint[]> {
+      let from = range?.from ?? null;
+      let to = range?.to ?? null;
+      if (!from || !to) {
+        const [extent] = await db
+          .select({
+            minMs: sql<number | null>`extract(epoch from min(${usageRequestLogs.occurredAt}))::double precision * 1000`,
+            maxMs: sql<number | null>`extract(epoch from max(${usageRequestLogs.occurredAt}))::double precision * 1000`,
+          })
+          .from(usageRequestLogs)
+          .where(and(...conditions));
+        // Raw execute returns timestamp columns as text (drizzle installs
+        // transparent parsers), so the extent is read as epoch milliseconds.
+        from = from ?? (extent?.minMs != null ? new Date(extent.minMs) : null);
+        to = to ?? (extent?.maxMs != null ? new Date(extent.maxMs) : null);
+      }
+      if (!from || !to) return [];
+      const unit = to.getTime() - from.getTime() <= HOUR_BUCKET_WINDOW_MS ? "hour" : "day";
+      // postgres.js cannot bind Date objects in raw statements, but the same
+      // ISO strings the query builder uses for range bounds serialize fine;
+      // the explicit cast keeps the parameter type unambiguous.
+      const fromIso = from.toISOString();
+      const toIso = to.toISOString();
+      const rows = await db.execute(sql`
+        with buckets as (
+          select distinct (generate_series(
+            date_trunc(${unit}, ${fromIso}::timestamptz at time zone ${timeZone}),
+            date_trunc(${unit}, ${toIso}::timestamptz at time zone ${timeZone}),
+            ${unit === "hour" ? "1 hour" : "1 day"}::interval
+          ) at time zone ${timeZone}) as bucket_start
+        )
+        select extract(epoch from b.bucket_start)::double precision * 1000 as bucket_start_ms,
+          coalesce(sum(coalesce(${usageRequestLogs.inputTokens}, 0) + coalesce(${usageRequestLogs.outputTokens}, 0)), 0)::double precision as tokens,
+          count(${usageRequestLogs.id})::int as requests
+        from buckets b
+        left join ${usageRequestLogs}
+          on date_trunc(${unit}, ${usageRequestLogs.occurredAt} at time zone ${timeZone}) at time zone ${timeZone} = b.bucket_start
+          and ${and(...conditions)}
+        group by b.bucket_start
+        order by b.bucket_start
+      `) as unknown as Array<{ bucket_start_ms: number; tokens: number; requests: number }>;
+      // Drizzle installs transparent parsers for timestamp OIDs on the
+      // postgres.js client, so raw execute returns session-timezone text for
+      // timestamptz columns; epoch milliseconds sidestep that entirely.
+      return rows.map((row) => ({
+        bucketStart: new Date(row.bucket_start_ms).toISOString(),
+        tokens: row.tokens,
+        requests: row.requests,
+      }));
     },
   };
 }

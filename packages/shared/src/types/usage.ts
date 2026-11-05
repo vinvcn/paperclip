@@ -58,4 +58,21 @@ export interface UsageSummary {
   tokensProcessed: number;
   cacheHitRate: number | null;
   unpricedCount: number;
+  series: UsageSummarySeriesPoint[];
+}
+
+/**
+ * One bucket of the Usage summary series (docs/specs/usage-request-logs.md,
+ * API). `tokens` follows the spec's Tokens Processed formula (fresh input +
+ * output + cached input); `requests` counts every observed call in the bucket
+ * including ones without token data, so bucket sums always match the card
+ * totals. `bucketStart` is ISO UTC aligned to an hour or midnight boundary in
+ * the requested timezone — hour buckets for windows up to 48 hours, day
+ * buckets beyond that. Buckets with no rows are present with zero values so
+ * the axis is continuous.
+ */
+export interface UsageSummarySeriesPoint {
+  bucketStart: string;
+  tokens: number;
+  requests: number;
 }
