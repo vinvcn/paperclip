@@ -1,0 +1,53 @@
+import type { Db } from "@paperclipai/db";
+import { usageRequestRetentionService } from "./usage-request-retention.js";
+import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
+import { registerDeadlineWork } from "./deadline-work.js";
+import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
+import { registerIdleLocalWorkProbe } from "./idle-local-work.js";
+
+/**
+ * The Usage request log's retention worker (docs/specs/usage-request-logs.md,
+ * Data model), wired like the provider-trace retention worker: a deadline
+ * task on the delivery coordinator whose `run` sweeps expired request rows
+ * and whose `next` re-probes the oldest surviving row's expiry. Producers
+ * signal the queue on insert so the worker re-probes after a table that was
+ * empty (no deadline) receives its first row; the 30s notification coalesce
+ * keeps a burst of inserts from driving a full deadline probe per row. An
+ * idle-work probe reports the tracked deadline state so idle-sleep-safety
+ * keeps the evidence that a sweep is still pending.
+ */
+export function registerUsageRequestRetentionWork(
+  db: Db,
+  coordinator: ReturnType<typeof createDeliveryWorkCoordinator>,
+  canRun: () => boolean,
+) {
+  const retention = usageRequestRetentionService(db);
+  let deadline: number | null | undefined;
+
+  const unregister = registerIdleLocalWorkProbe(() =>
+    deadline === undefined ? "unknown" : deadline === null ? "none" : "present",
+  );
+  const worker = registerDeadlineWork(coordinator, DELIVERY_QUEUES.usageRequestRetention, {
+    canRun,
+    retryMs: 30_000,
+    notificationCoalesceMs: 30_000,
+    onSettled: () => {
+      deadline = undefined;
+    },
+    run: (signal) =>
+      signal.aborted
+        ? Promise.resolve()
+        : retention.cleanupExpired(new Date(), signal).then(() => undefined),
+    next: async () => {
+      deadline = await retention.nextRetentionDeadline();
+      return deadline;
+    },
+  });
+  return {
+    ...worker,
+    stop: async () => {
+      unregister();
+      await worker.stop();
+    },
+  };
+}

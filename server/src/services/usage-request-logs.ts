@@ -9,6 +9,7 @@ import type {
   UsageSummarySeriesPoint,
 } from "@paperclipai/shared";
 import { parseProviderRequestUsageRecord } from "../vendor/paperclip-runner/index.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 
 export type UsageRequestLogRow = typeof usageRequestLogs.$inferSelect;
 
@@ -251,28 +252,34 @@ export function usageRequestLogService(db: Db) {
       const parsed = parseProviderRequestUsageRecord(payload, observedAtMs);
       if (!parsed) return false;
       const projectId = await this.projectForIssue(binding.companyId, binding.issueId);
-      const inserted = await db.insert(usageRequestLogs).values({
-        companyId: binding.companyId,
-        runId: binding.runId,
-        agentId: binding.agentId,
-        issueId: binding.issueId,
-        projectId,
-        app: parsed.app,
-        provider: parsed.provider,
-        biller: parsed.biller,
-        model: parsed.model,
-        inputTokens: parsed.usage?.inputTokens ?? null,
-        cachedInputTokens: parsed.usage?.cachedInputTokens ?? null,
-        cacheWriteTokens: parsed.usage?.cacheWriteTokens ?? null,
-        outputTokens: parsed.usage?.outputTokens ?? null,
-        durationMs: parsed.endedAtMs - parsed.startedAtMs,
-        ttftMs: parsed.ttftMs,
-        httpStatus: parsed.httpStatus,
-        providerRequestId: parsed.providerRequestId,
-        requestId: parsed.requestId,
-        occurredAt: new Date(parsed.startedAtMs),
-        ...(parsed.usageMissing ? { metadata: { usageMissing: true } } : {}),
-      }).onConflictDoNothing().returning({ id: usageRequestLogs.id });
+      // The retention worker re-probes its deadline on this queue's settle:
+      // a first insert into an empty table (or after a full sweep) must be
+      // learned, or its 90-day obligation would wait for a restart.
+      const inserted = await db.transaction(async tx => {
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.usageRequestRetention);
+        return tx.insert(usageRequestLogs).values({
+          companyId: binding.companyId,
+          runId: binding.runId,
+          agentId: binding.agentId,
+          issueId: binding.issueId,
+          projectId,
+          app: parsed.app,
+          provider: parsed.provider,
+          biller: parsed.biller,
+          model: parsed.model,
+          inputTokens: parsed.usage?.inputTokens ?? null,
+          cachedInputTokens: parsed.usage?.cachedInputTokens ?? null,
+          cacheWriteTokens: parsed.usage?.cacheWriteTokens ?? null,
+          outputTokens: parsed.usage?.outputTokens ?? null,
+          durationMs: parsed.endedAtMs - parsed.startedAtMs,
+          ttftMs: parsed.ttftMs,
+          httpStatus: parsed.httpStatus,
+          providerRequestId: parsed.providerRequestId,
+          requestId: parsed.requestId,
+          occurredAt: new Date(parsed.startedAtMs),
+          ...(parsed.usageMissing ? { metadata: { usageMissing: true } } : {}),
+        }).onConflictDoNothing().returning({ id: usageRequestLogs.id });
+      });
       return inserted.length > 0;
     },
 

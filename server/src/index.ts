@@ -7,6 +7,7 @@ import { registerMergeConfirmationWork } from "./services/merged-pr-confirmation
 import { registerNativeHarnessBackupExpirationWork } from "./services/native-runtime/native-harness-backup-expiration-work.js";
 import { registerGitHubConnectionEventWork, registerGitHubConnectionContinuityWork } from "./services/github-connection-work.js";
 import { registerProviderTraceRetentionWork } from "./services/provider-trace-retention-work.js";
+import { registerUsageRequestRetentionWork } from "./services/usage-request-retention-work.js";
 import { registerRunEvidenceMigrationWork } from "./services/run-evidence-migration-work.js";
 import { registerSkillVersionRetentionWork } from "./services/skill-version-retention-work.js";
 import { registerDatabaseBackupWork } from "./services/database-backup-work.js";
@@ -1351,6 +1352,10 @@ async function startServerWithDatabaseTeardown(
     () => !heartbeatSchedulerStopped && !isIdleTaskDrainActive() && !isWarmStandby());
   trackHeartbeatSchedulerWork(providerTraceRetentionWork.ready);
   server.on("close", providerTraceRetentionWork.stop);
+  const usageRequestRetentionWork = registerUsageRequestRetentionWork(db, deliveryWork,
+    () => !heartbeatSchedulerStopped && !isIdleTaskDrainActive() && !isWarmStandby());
+  trackHeartbeatSchedulerWork(usageRequestRetentionWork.ready);
+  server.on("close", usageRequestRetentionWork.stop);
   const executionSchedule = executionControlSchedule(db);
   const workspaceRecoveryRuntime = environmentRuntimeService(db, { pluginWorkerManager });
   const nativeRunnerEvidenceRetentionWorker = config.nativeHarnessBackupExpirationEnabled
