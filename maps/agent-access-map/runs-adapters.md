@@ -502,6 +502,42 @@ Evidence: `verified` — [route](../../server/src/routes/ai-connections.ts); rev
 Verification: `passed` — deterministic provider fixtures / local assembled server; no live provider qualification.
 Gaps: Provider fixtures do not qualify live provider setup or availability.
 
+### `get-companies-ai-connections-keys`
+
+API: `present` — `GET /api/companies/{companyId}/ai-connections/{connectionId}/keys`; JSON REST.
+Agent access: `available` — agent REST and default native `search_api` / `call_api` for connection managers.
+Policy: `connections:read` under the connection-management guard plus manager status (viewers denied); company-scoped. Slot rows expose label, state, occupancy and cooldown only — key values are never returned.
+Evidence: `verified` — [route](../../server/src/routes/ai-connections.ts); [AI credential pool tests](../../server/src/__tests__/ai-credential-pool.test.ts) exercise real REST requests.
+Verification: `passed` — manager list, viewer denial, and cross-company denial covered by authenticated fixtures.
+Gaps: Fixture keys only; live provider qualification belongs to deployment acceptance.
+
+### `post-companies-ai-connections-keys`
+
+API: `present` — `POST /api/companies/{companyId}/ai-connections/{connectionId}/keys`; JSON REST.
+Agent access: `available` — agent REST and default native `search_api` / `call_api` for connection managers.
+Policy: `connections:configure` under the connection-management guard plus manager status (viewers denied); company-scoped. Key values are stored as encrypted company secrets and only their secret reference is kept on the slot; every mutation writes an activity log entry.
+Evidence: `verified` — [route](../../server/src/routes/ai-connections.ts); [AI credential pool tests](../../server/src/__tests__/ai-credential-pool.test.ts) exercise real REST requests and assert encrypted-at-rest storage.
+Verification: `passed` — create, duplicate-slot conflict, viewer denial, and cross-company denial covered by authenticated fixtures.
+Gaps: Fixture keys only; live provider qualification belongs to deployment acceptance.
+
+### `patch-companies-ai-connections-keys`
+
+API: `present` — `PATCH /api/companies/{companyId}/ai-connections/{connectionId}/keys`; JSON REST.
+Agent access: `available` — agent REST and default native `search_api` / `call_api` for connection managers.
+Policy: `connections:configure` under the connection-management guard plus manager status (viewers denied); company-scoped. Replacing a key writes a fresh company secret and repoints the slot; label, enable and key changes each log activity.
+Evidence: `verified` — [route](../../server/src/routes/ai-connections.ts); [AI credential pool tests](../../server/src/__tests__/ai-credential-pool.test.ts) exercise real REST requests including secret rotation.
+Verification: `passed` — label/enable/key rotation, unknown slot 404, viewer denial, and cross-company denial covered by authenticated fixtures.
+Gaps: Fixture keys only; live provider qualification belongs to deployment acceptance.
+
+### `delete-companies-ai-connections-keys`
+
+API: `present` — `DELETE /api/companies/{companyId}/ai-connections/{connectionId}/keys`; JSON REST.
+Agent access: `available` — agent REST and default native `search_api` / `call_api` for connection managers.
+Policy: `connections:configure` under the connection-management guard plus manager status (viewers denied); company-scoped. Removal is refused while a run occupies the slot; the slot's secret is removed with it and the change logs activity.
+Evidence: `verified` — [route](../../server/src/routes/ai-connections.ts); [AI credential pool tests](../../server/src/__tests__/ai-credential-pool.test.ts) exercise real REST requests.
+Verification: `passed` — removal, malformed body 400, viewer denial, and cross-company denial covered by authenticated fixtures.
+Gaps: Fixture keys only; live provider qualification belongs to deployment acceptance.
+
 ### `post-companies-ai-connections-local-attempts`
 
 API: `present` — `POST /api/companies/{companyId}/ai-connections/local/attempts`; JSON REST.
