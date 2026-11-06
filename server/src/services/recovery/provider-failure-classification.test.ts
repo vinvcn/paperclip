@@ -200,4 +200,13 @@ describe("classifyAdapterFailureForRecovery", () => {
     expect(classifyAdapterFailureForRecovery(run)).toEqual({ kind: "configuration_incomplete" });
     expect(classifyContinuationFailure(run as never)).toMatchObject({ kind: "non_retryable", maxAttempts: 0 });
   });
+
+  // Ticket 05: pooled-key failures are never infrastructure auto-retries. The
+  // pool switches slots at the next assignment; a 429 backoff loop would just
+  // hammer the same (key, model) wall.
+  it.each(["provider_rate_limited", "provider_key_pool_exhausted"])("does not auto-retry pooled-key failure %s as transient infrastructure or provider quota", (errorCode) => {
+    const run = { errorCode, error: "Rate limit exceeded", resultJson: { keyPoolFailure: { reason: "rate_limited" } } };
+    expect(classifyContinuationFailure(run as never)).toMatchObject({ kind: "non_retryable", maxAttempts: 0, errorCode });
+    expect(classifyAdapterFailureForRecovery(run)).toBeNull();
+  });
 });
