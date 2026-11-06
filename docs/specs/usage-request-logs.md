@@ -67,7 +67,7 @@ The data is captured at the **provider proxy** the OpenCode runner already runs 
 - Indexes: `(company_id, occurred_at desc, id)` for the log list, `(company_id, app, occurred_at)`, `(company_id, provider, model, occurred_at)`, and `(run_id)` for cost allocation.
 - Agent/issue/project are resolved **server-side from the run id** at insert time; the runner never sends them.
 - Token columns are nullable: a request whose usage could not be observed keeps nulls and is excluded from token sums, rather than being recorded as zero.
-- `metadata` carries optional pool attribution: `keySlot` (number) and `connectionId` (string), written only for traffic that ran on a credential-pool key (see Capture). Rows without it are per-connection credentials, pre-pool records, or legacy runners. The write path guarantees the pair: a `keySlot` is never stored without its `connectionId`, because a bare slot number is ambiguous when two pools exist.
+- `metadata` carries optional pool attribution: `keySlot` (number) and `connectionId` (string), written only for traffic that ran on a credential-pool key (see Capture). Rows without it are per-connection credentials, pre-pool records, or legacy runners. The projection and capture path guarantee the pair: a `keySlot` is never produced without its `connectionId`, because a bare slot number is ambiguous when two pools exist.
 - Detail rows are retained for 90 days by a retention sweep modelled on the existing provider-trace retention service.
 
 ### Capture
