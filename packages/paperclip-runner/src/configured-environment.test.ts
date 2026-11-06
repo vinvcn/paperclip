@@ -1,4 +1,4 @@
-import { CONFIGURED_ENVIRONMENT_KEYS, configuredEnvironment, configuredEnvironmentProjection } from './configured-environment.js';
+import { CONFIGURED_ENVIRONMENT_KEYS, configuredEnvironment, configuredEnvironmentProjection, GENERATED_RUNTIME_ENVIRONMENT_KEYS } from './configured-environment.js';
 import { describe, expect, it, vi } from 'vitest';
 import { createSanitizedCodexEnvironment } from './drivers/codex/app-server-transport.js';
 import { createIsolatedCodexAppServerArgs } from './drivers/codex/codex-security-config.js';
@@ -53,6 +53,19 @@ describe('controller-configured environment across native runner boundaries', ()
       expect(sanitized.NODE_OPTIONS).toBeUndefined();
       expect(sanitized.PAPERCLIP_API_KEY).toBeUndefined();
     } finally { vi.unstubAllEnvs(); }
+  });
+  it('admits the key-pool slot marker at every runner environment boundary', async () => {
+    const readFileSync = (await import('node:fs')).readFileSync;
+    // The slot marker must survive each of the three whitelists it crosses:
+    // the runnerd OpenCode provider sanitizer, the generated runtime key set,
+    // and the Rust-side configured environment. A missing entry silently
+    // drops the slot from usage attribution, so assert all three directly.
+    const slotEnv = { PAPERCLIP_AI_PROVIDER_KEY_SLOT: '3' };
+    expect(createSanitizedCodexEnvironment({ ...source, ...slotEnv }).PAPERCLIP_AI_PROVIDER_KEY_SLOT).toBe('3');
+    expect(createCapabilityRunnerdProviderEnvironment({ provider: 'opencode', options: { environment: { ...source, ...slotEnv } }, identity, codexHome: '/isolated/codex-home', runtimeContextPath: '/isolated/runtime-context.json', hasRuntimeContext: false }).PAPERCLIP_AI_PROVIDER_KEY_SLOT).toBe('3');
+    expect(GENERATED_RUNTIME_ENVIRONMENT_KEYS.has('PAPERCLIP_AI_PROVIDER_KEY_SLOT')).toBe(true);
+    const rustAllowlist = readFileSync(new URL('../runner/crates/runner-core/src/configured_environment.rs', import.meta.url), 'utf8');
+    expect(rustAllowlist).toContain('"PAPERCLIP_AI_PROVIDER_KEY_SLOT"');
   });
 });
 
