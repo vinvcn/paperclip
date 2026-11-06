@@ -104,7 +104,7 @@ function summary(overrides: Partial<UsageSummary> = {}): UsageSummary {
     cacheHitRate: 0.25,
     unpricedCount: 12,
     series: [],
-    facets: { apps: [], providers: [], models: [], modelsTruncated: false },
+    facets: { apps: [], providers: [], models: [], keys: [], modelsTruncated: false },
     ...overrides,
   };
 }
@@ -115,6 +115,7 @@ function summaryWithFacets(): UsageSummary {
       apps: [{ value: "opencode", requests: 5 }],
       providers: [{ value: "openrouter", requests: 3 }, { value: "anthropic", requests: 2 }],
       models: [{ value: "z-ai/glm-4.6", requests: 5 }],
+      keys: [],
       modelsTruncated: false,
     },
   });

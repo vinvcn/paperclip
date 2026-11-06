@@ -69,7 +69,7 @@ export function parseUsageTimezone(query: Record<string, unknown>): string {
  */
 export function parseUsageFilters(query: Record<string, unknown>): UsageRequestFilters {
   const filters: UsageRequestFilters = {};
-  for (const key of ["app", "provider", "model"] as const) {
+  for (const key of ["app", "provider", "model", "key"] as const) {
     const raw = query[key];
     if (raw == null || raw === "") continue;
     if (typeof raw !== "string") throw badRequest(`invalid '${key}' value`);

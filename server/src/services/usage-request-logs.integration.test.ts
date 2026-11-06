@@ -422,7 +422,7 @@ describeEmbeddedPostgres("usage request log persistence", () => {
         cacheHitRate: null,
         unpricedCount: 0,
         series: [],
-        facets: { apps: [], providers: [], models: [], modelsTruncated: false },
+        facets: { apps: [], providers: [], models: [], keys: [], modelsTruncated: false },
       });
     });
 
@@ -774,6 +774,125 @@ describeEmbeddedPostgres("usage request log persistence", () => {
     it("accepts a from/to window on the log list", async () => {
       const windowed = await usageRequestLogService(db).latest(filterCompanyId, 20, { range: { from: new Date(Date.now() - 60 * 60_000) } });
       expect(windowed.rows).toHaveLength(6); // the 3h-old legacy row is out
+    });
+  });
+
+  describe("key attribution facets and filter (ticket 04)", () => {
+    let keyCompanyId: string;
+    const createdCompanyIds: string[] = [];
+
+    beforeAll(async () => {
+      keyCompanyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(companies).values({
+        id: keyCompanyId,
+        name: "Usage Keys",
+        issuePrefix: keyCompanyId.replaceAll("-", "").slice(0, 4).toUpperCase(),
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId: keyCompanyId,
+        name: "UsageKeys",
+        role: "engineer",
+        status: "active",
+        adapterType: "paperclip_runner",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: keyCompanyId,
+        agentId,
+        invocationSource: "on_demand",
+        status: "running",
+        contextSnapshot: {},
+      });
+      createdCompanyIds.push(keyCompanyId);
+
+      // Two pooled keys with traffic, one unpooled row (no attribution), and
+      // one pooled row three hours old (out of the windowed reads below).
+      const rows = [
+        { keySlot: 3, httpStatus: 200, ageMinutes: 10 },
+        { keySlot: 3, httpStatus: 429, ageMinutes: 12 },
+        { keySlot: 1, httpStatus: 200, ageMinutes: 14 },
+        { keySlot: null, httpStatus: 200, ageMinutes: 16 },
+        { keySlot: 7, httpStatus: 200, ageMinutes: 180 },
+      ] as const;
+      for (const row of rows) {
+        await db.insert(usageRequestLogs).values({
+          companyId: keyCompanyId,
+          runId,
+          app: "opencode",
+          provider: "paperclip",
+          biller: "paperclip",
+          model: "paperclip/meta/llama-3.3-70b-instruct",
+          httpStatus: row.httpStatus,
+          requestId: randomUUID(),
+          occurredAt: new Date(Date.now() - row.ageMinutes * 60_000),
+          ...(row.keySlot == null ? {} : { metadata: { keySlot: row.keySlot, connectionId: "conn-uuid-1" } }),
+        });
+      }
+    });
+
+    afterAll(async () => {
+      for (const companyId of createdCompanyIds) {
+        await db.delete(usageRequestLogs).where(eq(usageRequestLogs.companyId, companyId));
+        await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+        await db.delete(agents).where(eq(agents.companyId, companyId));
+        await db.delete(companies).where(eq(companies.id, companyId));
+      }
+    });
+
+    it("aggregates key facets from the pooled attribution, ordered by volume", async () => {
+      const summary = await usageRequestLogService(db).summary(keyCompanyId);
+      // `key-<slot>` labels, unpooled rows belong to no key facet.
+      expect(summary.facets.keys).toEqual([
+        { value: "key-3", requests: 2 },
+        { value: "key-1", requests: 1 },
+        { value: "key-7", requests: 1 },
+      ]);
+      // The key facet never disturbs the existing dimensions.
+      expect(summary.facets.apps).toEqual([{ value: "opencode", requests: 5 }]);
+    });
+
+    it("drops key facets without rows in the window, like the other dimensions", async () => {
+      const windowed = await usageRequestLogService(db).summary(keyCompanyId, { from: new Date(Date.now() - 60 * 60_000) });
+      expect(windowed.facets.keys).toEqual([
+        { value: "key-3", requests: 2 },
+        { value: "key-1", requests: 1 },
+      ]);
+    });
+
+    it("narrows the summary totals, series and log list with the key filter", async () => {
+      const service = usageRequestLogService(db);
+      const summary = await service.summary(keyCompanyId, undefined, "UTC", { key: "key-3" });
+      expect(summary.totalRequests).toBe(2);
+      expect(summary.series.reduce((n, point) => n + point.requests, 0)).toBe(2);
+      const rows = (await service.latest(keyCompanyId, 20, { key: "key-3" })).rows;
+      expect(rows).toHaveLength(2);
+      for (const row of rows) expect(row.metadata?.keySlot).toBe(3);
+    });
+
+    it("combines the key filter with the other dimensions and never matches unpooled rows", async () => {
+      const service = usageRequestLogService(db);
+      const clientErrors = await service.summary(keyCompanyId, undefined, "UTC", { key: "key-3", status: "client_error" });
+      expect(clientErrors.totalRequests).toBe(1);
+      // No key carries the unpooled row: filtering by any key excludes it.
+      for (const key of ["key-1", "key-3", "key-7"]) {
+        const rows = (await service.latest(keyCompanyId, 20, { key })).rows;
+        expect(rows.every((row) => row.metadata?.keySlot != null)).toBe(true);
+      }
+      expect((await service.summary(keyCompanyId, undefined, "UTC", { key: "key-9" })).totalRequests).toBe(0);
+    });
+
+    it("keeps key facets describing the unfiltered window while a key filter narrows the totals", async () => {
+      const filtered = await usageRequestLogService(db).summary(keyCompanyId, undefined, "UTC", { key: "key-1" });
+      expect(filtered.totalRequests).toBe(1);
+      expect(filtered.facets.keys).toHaveLength(3);
     });
   });
 
