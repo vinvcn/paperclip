@@ -49,6 +49,7 @@ import { assertAiCredentialCleanupSettled, reconcileRetainedAiCleanup } from "./
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { secretService } from "./secrets.js";
+import { resolvePoolSlotValue, selectAssignablePoolSlot } from "./ai-credential-pool.js";
 import { probeAiConnectionUsage } from "./ai-connection-usage.js";
 import { probeAiAccountIdentity } from "./ai-account-identity.js";
 
@@ -990,6 +991,17 @@ export function aiConnectionService(db: Db) {
   /** Never hand a consumed token to a new provider while its replacement awaits commit. */
   async function runtimeCredential(row: Parameters<typeof credential>[0], ownership?: { credentialLockHeld: true }) {
     const metadata = aiConnectionMetadataSchema.safeParse(row.connection.config.ai);
+    // Key pool: a connection with pool slots resolves its key from the pool
+    // instead of the single grant credential. Assignment is the ticket-01
+    // minimal rule (lowest healthy slot); ticket 02 replaces it with the full
+    // matrix. Only keyed (api_key) connections pool credentials — subscription
+    // credentials are rotating OAuth token blobs, and no-auth connections need
+    // no key at all. No pool, or no assignable slot, falls through to the
+    // original single-credential path unchanged (backward compatible).
+    if (metadata.success && metadata.data.method === "api_key" && metadata.data.routing?.auth !== "none") {
+      const slot = await selectAssignablePoolSlot(db, row.connection.companyId, row.connection.id);
+      if (slot) return resolvePoolSlotValue(db, row.connection.companyId, row.connection.id, slot);
+    }
     if (!metadata.success || !["openai", "google"].includes(metadata.data.provider) || metadata.data.method !== "subscription") return credential(row);
     // Retirement callbacks acquire this same mutation lock to persist their
     // final generation. Join them before taking the lock they need. A caller

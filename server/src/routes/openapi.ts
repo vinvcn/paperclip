@@ -14,6 +14,8 @@ import {
   gitHubRepositoryPageQuerySchema,
   toggleAllGitHubRepositoriesSchema,
   createAiConnectionSchema,
+  aiConnectionKeySlotCreateSchema,
+  aiConnectionKeySlotUpdateSchema,
   updateDecisionModelSchema,
   updatePromptInjectionPreventionSchema,
   updateAgentObservabilitySchema,
@@ -11409,6 +11411,49 @@ registerCurrentRoute({
   tags: ["ai-connections"],
   summary: "List active runs attributed to an AI connection",
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  "x-paperclip-transport": "rest",
+  "x-paperclip-connection-management": "connections:read",
+  method: "get",
+  path: "/api/companies/{companyId}/ai-connections/{connectionId}/keys",
+  tags: ["ai-connections"],
+  summary: "List the key pool slots of an AI connection (never a key value)",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  "x-paperclip-transport": "rest",
+  "x-paperclip-connection-management": "connections:configure",
+  method: "post",
+  path: "/api/companies/{companyId}/ai-connections/{connectionId}/keys",
+  tags: ["ai-connections"],
+  summary: "Add a key pool slot with an encrypted company secret",
+  body: aiConnectionKeySlotCreateSchema,
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  "x-paperclip-transport": "rest",
+  "x-paperclip-connection-management": "connections:configure",
+  method: "patch",
+  path: "/api/companies/{companyId}/ai-connections/{connectionId}/keys",
+  tags: ["ai-connections"],
+  summary: "Rename, pause or rekey one key pool slot",
+  body: aiConnectionKeySlotUpdateSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  "x-paperclip-transport": "rest",
+  "x-paperclip-connection-management": "connections:configure",
+  method: "delete",
+  path: "/api/companies/{companyId}/ai-connections/{connectionId}/keys",
+  tags: ["ai-connections"],
+  summary: "Remove one key pool slot and its secret",
+  body: z.object({ slot: z.number().int().min(1).max(100) }).strict(),
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
 });
 
 registerCurrentRoute({

@@ -1,4 +1,4 @@
-import type { AiConnectionList, AiConnectionUsage, AiConnectionAccountIdentity, CreateAiConnection, AiConnectionLoginIntent, LocalAiLoginAttempt, LocalAiLoginStatus } from "@paperclipai/shared";
+import type { AiConnectionList, AiConnectionUsage, AiConnectionAccountIdentity, CreateAiConnection, AiConnectionLoginIntent, LocalAiLoginAttempt, LocalAiLoginStatus, AiConnectionKeySlotList, AiConnectionKeySlot, AiConnectionKeySlotCreate, AiConnectionKeySlotUpdate } from "@paperclipai/shared";
 import { api, type RequestOptions } from "./client";
 export const aiConnectionsApi = {
   accountIdentity: (companyId: string, connectionId: string, grantId: string, options?: RequestOptions) => api.get<AiConnectionAccountIdentity>(`/companies/${companyId}/ai-connections/${connectionId}/identity?grantId=${encodeURIComponent(grantId)}`, { timeoutMs: 20_000, ...options }),
@@ -14,4 +14,8 @@ export const aiConnectionsApi = {
   create: (companyId: string, input: CreateAiConnection) => api.post<{ connectionId: string; grantId: string }>(`/companies/${companyId}/ai-connections`, input),
   setDefault: (companyId: string, grantId: string) => api.put(`/companies/${companyId}/ai-connections/default`, { grantId }),
   loginResult: (companyId: string, sessionId: string) => api.get<{ connectionId: string; grantId: string }>(`/companies/${companyId}/ai-connections/login/${encodeURIComponent(sessionId)}`),
+  keySlots: (companyId: string, connectionId: string, options?: RequestOptions) => api.get<AiConnectionKeySlotList>(`/companies/${companyId}/ai-connections/${connectionId}/keys`, { timeoutMs: 15_000, ...options }),
+  addKeySlot: (companyId: string, connectionId: string, input: AiConnectionKeySlotCreate) => api.post<AiConnectionKeySlot>(`/companies/${companyId}/ai-connections/${connectionId}/keys`, input),
+  updateKeySlot: (companyId: string, connectionId: string, input: AiConnectionKeySlotUpdate) => api.patch<AiConnectionKeySlot>(`/companies/${companyId}/ai-connections/${connectionId}/keys`, input),
+  removeKeySlot: (companyId: string, connectionId: string, slot: number) => api.delete<{ ok: true }>(`/companies/${companyId}/ai-connections/${connectionId}/keys`, { slot }),
 };

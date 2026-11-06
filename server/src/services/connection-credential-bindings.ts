@@ -1,8 +1,13 @@
 import { and, eq, inArray } from "drizzle-orm";
-import { type Db, toolConnections, companySecretBindings, connectionGrants, companySecrets, userSecretDefinitions } from "@paperclipai/db";
+import { type Db, credentialPool, toolConnections, companySecretBindings, connectionGrants, companySecrets, userSecretDefinitions } from "@paperclipai/db";
 import type { ToolCredentialSecretRef } from "@paperclipai/shared";
 import { secretService } from "./secrets.js";
 import { connectionCredentialConfigPath as credentialRefConfigPath } from "./connection-credentials.js";
+
+/** Resolution binding path of one credential pool slot on a connection. */
+export function credentialPoolSlotConfigPath(slot: number): string {
+  return `credential_pool.slot.${slot}`;
+}
 export async function syncConnectionCredentialBindings(
     db: Db | Parameters<Parameters<Db["transaction"]>[0]>[0],
     connection: typeof toolConnections.$inferSelect,
@@ -43,6 +48,24 @@ export async function syncConnectionCredentialBindings(
         projectionAllowlistKey: ref.projectionAllowlistKey ?? null,
         required: ref.required ?? true,
         label: ref.label ?? null,
+      })),
+      // Pool slots are connection-owned credentials too; without this entry a
+      // reconnect or metadata edit would wipe their resolution bindings.
+      ...(await dbClient
+        .select({ slot: credentialPool.slot, secretRef: credentialPool.secretRef })
+        .from(credentialPool)
+        .where(
+          and(
+            eq(credentialPool.companyId, connection.companyId),
+            eq(credentialPool.connectionId, connection.id),
+          ),
+        )).map((slot) => ({
+        secretId: slot.secretRef,
+        configPath: credentialPoolSlotConfigPath(slot.slot),
+        projectionClass: "unclassified",
+        projectionAllowlistKey: null,
+        required: true,
+        label: null,
       })),
     ];
     // Organization grants can mirror connection-owned credentials, and more
