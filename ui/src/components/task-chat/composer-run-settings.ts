@@ -9,9 +9,13 @@ export interface ComposerRunSettings {
   model: string | null;
   effort: string | null;
   fast: boolean;
+  /** Task-level key-slot pin (ticket 06): a pooled-connection slot number, or
+   * null for the pool's automatic assignment. Undefined means "unchanged" so
+   * partial drafts keep the current override. */
+  keySlot?: number | null;
 }
 
-export const DEFAULT_COMPOSER_RUN_SETTINGS: ComposerRunSettings = { model: null, effort: null, fast: false };
+export const DEFAULT_COMPOSER_RUN_SETTINGS: ComposerRunSettings = { model: null, effort: null, fast: false, keySlot: null };
 export const EFFORT_LABELS: Record<string, string> = {
   off: "Off", minimal: "Minimal", low: "Low", medium: "Medium", high: "High",
   xhigh: "Extra High", max: "Max", ultra: "Ultra",
@@ -94,6 +98,7 @@ export function readComposerRunSettings(overrides: IssueAssigneeAdapterOverrides
     model: typeof config.model === "string" ? config.model : null,
     effort: typeof effortValue === "string" ? effortValue : null,
     fast: adapterType === "codex_local" && config.fastMode === true,
+    keySlot: typeof overrides?.keySlot === "number" ? overrides.keySlot : null,
   };
 }
 
@@ -125,7 +130,30 @@ export function mergeComposerRunSettings(
   if (settings.effort && effortKey) config[effortKey] = settings.effort;
   if (settings.fast && adapterType === "codex_local") config.fastMode = true;
   const useProjectWorkspace = reassigned ? undefined : previous?.useProjectWorkspace;
-  return Object.keys(config).length || useProjectWorkspace !== undefined
-    ? { ...(Object.keys(config).length ? { adapterConfig: config } : {}), ...(useProjectWorkspace !== undefined ? { useProjectWorkspace } : {}) }
+  // The task-level key pin is top-level on the overrides (ticket 02), so it
+  // rides beside adapterConfig: explicit null clears it, a number pins the
+  // slot, and undefined keeps whatever the task had (drafts that never touch
+  // the key setting stay sticky). A reassignment starts fresh without a pin.
+  const keySlot = reassigned
+    ? null
+    : settings.keySlot !== undefined ? settings.keySlot : typeof previous?.keySlot === "number" ? previous.keySlot : null;
+  return Object.keys(config).length || useProjectWorkspace !== undefined || keySlot !== null
+    ? {
+        ...(Object.keys(config).length ? { adapterConfig: config } : {}),
+        ...(useProjectWorkspace !== undefined ? { useProjectWorkspace } : {}),
+        ...(keySlot !== null ? { keySlot } : {}),
+      }
     : null;
+}
+
+/** Ticket 06: the overrides a switch-model retry persists before the failed
+ * run is re-dispatched: the model is set, the previous effort choice is
+ * invalidated, and the task-level key pin rides along unchanged (an explicit
+ * user decision; the cooldown is per key × model anyway). */
+export function switchModelRetryOverrides(
+  previous: IssueAssigneeAdapterOverrides | null | undefined,
+  adapterType: string | undefined,
+  model: string,
+): IssueAssigneeAdapterOverrides | null {
+  return mergeComposerRunSettings(previous, adapterType, { model, effort: null, fast: false });
 }

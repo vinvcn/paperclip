@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Agent } from "@paperclipai/shared";
 import {
   composerCatalogProvider, composerDefaultModel, composerEfforts, composerFastAvailable, mergeComposerRunSettings,
-  readComposerRunSettings, supportsComposerModel,
+  readComposerRunSettings, supportsComposerModel, switchModelRetryOverrides,
 } from "./composer-run-settings";
 
 const agent = (adapterType: Agent["adapterType"], provider?: string) => ({
@@ -61,17 +61,47 @@ describe("composer run settings", () => {
     const previous = { adapterConfig: { chrome: true, model: "old", effort: "low" }, useProjectWorkspace: true };
     expect(mergeComposerRunSettings(previous, "claude_local", { model: "claude-opus", effort: "high", fast: false }))
       .toEqual({ adapterConfig: { chrome: true, model: "claude-opus", effort: "high" }, useProjectWorkspace: true });
-    const reset = mergeComposerRunSettings(previous, "claude_local", { model: null, effort: null, fast: false });
+    const reset = mergeComposerRunSettings(previous, "claude_local", { model: null, effort: null, fast: false, keySlot: null });
     expect(reset).toEqual({ adapterConfig: { chrome: true }, useProjectWorkspace: true });
-    expect(readComposerRunSettings(reset, "claude_local")).toEqual({ model: null, effort: null, fast: false });
+    expect(readComposerRunSettings(reset, "claude_local")).toEqual({ model: null, effort: null, fast: false, keySlot: null });
     expect(readComposerRunSettings({ adapterConfig: { reasoningEffort: "xhigh" } }, "codex_local").effort).toBe("xhigh");
-    expect(mergeComposerRunSettings(previous, "codex_local", { model: "gpt-6-astra", effort: "ultra", fast: true }, true))
+    expect(mergeComposerRunSettings(previous, "codex_local", { model: "gpt-6-astra", effort: "ultra", fast: true, keySlot: null }, true))
       .toEqual({ adapterConfig: { model: "gpt-6-astra", modelReasoningEffort: "ultra", fastMode: true } });
-    const runner = mergeComposerRunSettings(null, "paperclip_runner", { model: "gpt-6-astra", effort: "ultra", fast: false });
+    const runner = mergeComposerRunSettings(null, "paperclip_runner", { model: "gpt-6-astra", effort: "ultra", fast: false, keySlot: null });
     expect(runner).toEqual({ adapterConfig: { model: "gpt-6-astra", modelReasoningEffort: "ultra" } });
     expect(readComposerRunSettings(runner, "paperclip_runner").effort).toBe("ultra");
-    const grok = mergeComposerRunSettings(null, "grok_local", { model: "grok-4.7", effort: "xhigh", fast: false });
+    const grok = mergeComposerRunSettings(null, "grok_local", { model: "grok-4.7", effort: "xhigh", fast: false, keySlot: null });
     expect(grok).toEqual({ adapterConfig: { model: "grok-4.7", reasoningEffort: "xhigh" } });
     expect(readComposerRunSettings(grok, "grok_local").effort).toBe("xhigh");
+  });
+
+  // Ticket 06: the task-level key pin is top-level on the overrides. It is
+  // cleared by an explicit null (the reset flow), pinned by a slot number,
+  // and kept when a draft never touches it (sticky for older callers).
+  it("carries the task-level key slot pin beside the adapter config", () => {
+    const pinned = { adapterConfig: { model: "old" }, keySlot: 3 };
+    expect(mergeComposerRunSettings(pinned, "claude_local", { model: "new", effort: null, fast: false }))
+      .toEqual({ adapterConfig: { model: "new" }, keySlot: 3 });
+    expect(mergeComposerRunSettings(pinned, "claude_local", { model: "new", effort: null, fast: false, keySlot: 5 }))
+      .toEqual({ adapterConfig: { model: "new" }, keySlot: 5 });
+    expect(mergeComposerRunSettings(pinned, "claude_local", { model: null, effort: null, fast: false, keySlot: null }))
+      .toEqual(null);
+    // A pin alone is a valid override even without adapter config keys.
+    expect(mergeComposerRunSettings(null, "claude_local", { model: null, effort: null, fast: false, keySlot: 2 }))
+      .toEqual({ keySlot: 2 });
+    // Reassignment starts fresh: no pin survives it.
+    expect(mergeComposerRunSettings(pinned, "claude_local", { model: "new", effort: null, fast: false }, true))
+      .toEqual({ adapterConfig: { model: "new" } });
+    expect(readComposerRunSettings(pinned, "claude_local").keySlot).toBe(3);
+    expect(readComposerRunSettings(null, "claude_local").keySlot).toBe(null);
+  });
+
+  // Ticket 06: the switch-model retry's override write — model set, effort
+  // invalidated, the task key pin rides along (an explicit user decision).
+  it("builds the switch-model retry overrides without dropping the key pin", () => {
+    expect(switchModelRetryOverrides({ adapterConfig: { model: "old", effort: "high" }, keySlot: 3 }, "claude_local", "paperclip/meta/llama-3.3-70b-instruct"))
+      .toEqual({ adapterConfig: { model: "paperclip/meta/llama-3.3-70b-instruct" }, keySlot: 3 });
+    expect(switchModelRetryOverrides(null, "claude_local", "paperclip/meta/llama-3.3-70b-instruct"))
+      .toEqual({ adapterConfig: { model: "paperclip/meta/llama-3.3-70b-instruct" } });
   });
 });
