@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import type { AiConnectionKeySlotCreate, AiConnectionKeySlotUpdate } from "@paperclipai/shared";
+import type { AiConnectionKeySlot, AiConnectionKeySlotCreate, AiConnectionKeySlotUpdate } from "@paperclipai/shared";
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { describeError } from "@/api/errors";
 import { Button } from "@/components/ui/button";
