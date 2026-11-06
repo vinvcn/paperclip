@@ -25,6 +25,7 @@ import { startOpenCodePerformanceDiagnostics } from "./performance-diagnostics.j
 import { startOpenCodeProviderProxy } from "./provider-proxy.js";
 import { createUsageCaptureSink, type UsageCaptureSink } from "./usage-capture.js";
 import {
+  connectionIdFromEnvironment, keySlotFromEnvironment,
   PROVIDER_REQUEST_USAGE_KIND, usageCaptureEnabled,
   type ProviderRequestUsageRecord,
 } from "../../contracts/usage-capture.js";
@@ -2390,9 +2391,17 @@ async function startRuntime(input: {
       : null;
   // Usage capture rides the provider proxy. It is on by default; the kill
   // switch (PAPERCLIP_USAGE_CAPTURE=0/off) must leave the proxy path exactly
-  // as it was without capture, so the sink is not even constructed.
+  // as it was without capture, so the sink is not even constructed. The sink's
+  // identity carries the key-pool attribution (ticket 04) read from the same
+  // projected environment the proxy key came from; without a pooled
+  // credential the records stay unattributed.
   const usageCapture = usageCaptureEnabled(providerEnvironment)
-    ? createUsageCaptureSink({ app: "opencode", model: input.options.model })
+    ? createUsageCaptureSink({
+        app: "opencode",
+        model: input.options.model,
+        keySlot: keySlotFromEnvironment(providerEnvironment),
+        connectionId: connectionIdFromEnvironment(providerEnvironment),
+      })
     : null;
   const providerProxy = providerRoute
     ? await startOpenCodeProviderProxy(providerRoute.baseUrl, providerRoute.key, providerModelId, providerEnvironment, usageCapture).catch(async error => {

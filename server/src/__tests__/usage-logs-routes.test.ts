@@ -25,7 +25,7 @@ const summaryFixture = {
   cacheHitRate: 0.25,
   unpricedCount: 12,
   series: [],
-  facets: { apps: [], providers: [], models: [], modelsTruncated: false },
+  facets: { apps: [], providers: [], models: [], keys: [], modelsTruncated: false },
 };
 
 function app(type: "board" | "agent" = "board", role = "member") {
@@ -129,22 +129,23 @@ describe("usage summary route", () => {
 });
 
 describe("usage filter params", () => {
-  it("forwards app, provider, model and status filters to the summary", async () => {
+  it("forwards app, provider, model, key and status filters to the summary", async () => {
     // The model id contains slashes; the URL-encoded form must survive.
     const response = await request(app()).get(
-      `${summaryPath}?app=opencode&provider=openrouter&model=openai%2Fgpt-5.2&status=client_error`,
+      `${summaryPath}?app=opencode&provider=openrouter&model=openai%2Fgpt-5.2&key=key-3&status=client_error`,
     );
     expect(response.status).toBe(200);
     expect(mocks.summary).toHaveBeenCalledExactlyOnceWith(companyId, undefined, "UTC", {
       app: "opencode",
       provider: "openrouter",
       model: "openai/gpt-5.2",
+      key: "key-3",
       status: "client_error",
     });
   });
 
   it("treats empty filter values as absent, not as a filter", async () => {
-    const response = await request(app()).get(`${summaryPath}?app=&provider=&model=&status=`);
+    const response = await request(app()).get(`${summaryPath}?app=&provider=&model=&key=&status=`);
     expect(response.status).toBe(200);
     expect(mocks.summary).toHaveBeenCalledExactlyOnceWith(companyId, undefined, "UTC", {});
   });

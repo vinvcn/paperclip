@@ -17,6 +17,9 @@
 export const USAGE_CAPTURE_ENV = "PAPERCLIP_USAGE_CAPTURE";
 /** `payload.kind` marker on the existing `harness.diagnostic` PRP event. */
 export const PROVIDER_REQUEST_USAGE_KIND = "provider_request";
+/** Projected env keys carrying the pooled key-slot attribution (ticket 04). */
+export const AI_PROVIDER_KEY_SLOT_ENV = "PAPERCLIP_AI_PROVIDER_KEY_SLOT";
+export const AI_PROVIDER_CONNECTION_ID_ENV = "PAPERCLIP_AI_PROVIDER_CONNECTION_ID";
 
 export interface ProviderRequestUsageTokens {
   inputTokens: number | null;
@@ -43,6 +46,10 @@ export interface ProviderRequestUsageRecord {
   usage: ProviderRequestUsageTokens | null;
   /** True when the proxy had to retry without an injected stream_options.include_usage after the upstream refused it, so usage could not be observed. */
   usageMissing: boolean;
+  /** Pooled key slot the proxy's credential was assigned (ticket 04); null when the credential is not pooled. */
+  keySlot: number | null;
+  /** Gateway connection that owns the pool the credential came from; null when not pooled. */
+  connectionId: string | null;
 }
 
 /** What the proxy hands to the sink: timing and status only. */
@@ -66,6 +73,27 @@ export interface ProviderRequestUsageSink {
 export function usageCaptureEnabled(environment: NodeJS.ProcessEnv | undefined): boolean {
   const value = environment?.[USAGE_CAPTURE_ENV];
   return !(value === "0" || value?.toLowerCase() === "off");
+}
+
+/** Slots are small integers; anything beyond this bound is a broken projection. */
+const maxKeySlot = 1_000_000;
+
+/**
+ * The pooled key slot of the proxy's credential, from the environment the
+ * server projected beside the gateway key (ticket 02). Absent or malformed
+ * means "not pooled": records carry no key attribution, which keeps non-pool
+ * credentials, probe traffic and older runners backward compatible.
+ */
+export function keySlotFromEnvironment(environment: NodeJS.ProcessEnv | undefined): number | null {
+  const raw = environment?.[AI_PROVIDER_KEY_SLOT_ENV];
+  if (raw == null || raw === "") return null;
+  const slot = Number(raw);
+  return Number.isInteger(slot) && slot >= 0 && slot <= maxKeySlot ? slot : null;
+}
+
+/** The gateway connection owning that pool; bounded like the record's other text fields. */
+export function connectionIdFromEnvironment(environment: NodeJS.ProcessEnv | undefined): string | null {
+  return boundedText(environment?.[AI_PROVIDER_CONNECTION_ID_ENV], 200);
 }
 
 /** Same provider/biller split as the server's resolveNativeBilling for OpenCode models. */
@@ -155,10 +183,20 @@ export function parseProviderRequestUsageRecord(
   // not send it) but must be boolean when present.
   const usageMissing = value.usageMissing === undefined ? false : value.usageMissing;
   if (typeof usageMissing !== "boolean") return null;
+  // Key attribution (ticket 04) is optional the same way: absent (older
+  // runners, non-pooled credentials) parses as unattributed, while a
+  // present-but-malformed value drops the record so a broken runner cannot
+  // poison the key pool's cooldown state machine.
+  const keySlot = value.keySlot === undefined || value.keySlot === null ? null : nonnegativeInteger(value.keySlot);
+  if (value.keySlot !== undefined && value.keySlot !== null && (keySlot === null || keySlot > maxKeySlot)) return null;
+  const connectionId = value.connectionId === undefined || value.connectionId === null ? null : boundedText(value.connectionId, 200);
+  if (value.connectionId !== undefined && value.connectionId !== null && connectionId === null) return null;
   return {
     requestId, app, provider, biller, model, startedAtMs, endedAtMs,
     ttftMs, httpStatus, providerRequestId,
     usage: value.usage === null ? null : parseUsageTokens(value.usage),
     usageMissing,
+    keySlot,
+    connectionId,
   };
 }

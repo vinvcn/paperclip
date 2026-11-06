@@ -486,9 +486,13 @@ export interface KeySlot429Classification {
  * records (`paperclip/<model>` for managed gateway traffic), while the
  * cooldown row stores the bare upstream id for the probe (review F1).
  *
- * The cooldown row is found through the run's exclusive lease: usage rows do
- * not carry connection identity (ticket 04 adds keySlot only), and a run
- * leases at most one slot of one pool. A 429 whose run no longer matches its
+ * The window is narrowed to the pool's connection (review F2): usage rows
+ * carry `metadata.connectionId` (ticket 04), so two pools in one company
+ * sharing a slot number and model never count each other's traffic. The
+ * cooldown row is found through the run's exclusive lease — `ctx.connectionId`
+ * (the row's own attribution, when present) demands the exact pool, and a row
+ * without it falls back to (run, slot). In both shapes the counted rows must
+ * belong to the lease row's connection. A 429 whose run no longer matches its
  * lease (TTL reclaimed, terminal sweep after release) stays unclassified —
  * the next 429 on the pair reclassifies.
  */
@@ -498,6 +502,8 @@ export async function classifyKeySlot429(
     companyId: string;
     runId: string;
     keySlot: number;
+    /** The usage row's own connection attribution (ticket 04); null on pre-ticket-04 rows. */
+    connectionId?: string | null;
     model: string;
     retryAfterSeconds?: number | null;
     now?: Date;
@@ -515,6 +521,7 @@ export async function classifyKeySlot429(
       eq(credentialPool.companyId, ctx.companyId),
       eq(credentialPool.activeRunId, ctx.runId),
       eq(credentialPool.slot, ctx.keySlot),
+      ...(ctx.connectionId ? [eq(credentialPool.connectionId, ctx.connectionId)] : []),
     ))
     .limit(1);
   if (!leaseRow) return null;
@@ -531,6 +538,10 @@ export async function classifyKeySlot429(
       eq(usageRequestLogs.model, ctx.model),
       gte(usageRequestLogs.occurredAt, new Date(now.getTime() - COOLDOWN_WINDOW_MS)),
       sql`${usageRequestLogs.metadata}->>'keySlot' = ${String(ctx.keySlot)}`,
+      // Review F2: only rows attributable to this pool's connection feed the
+      // window — a same-company pool sharing the slot number and model must
+      // not have its traffic counted here (and vice versa).
+      sql`${usageRequestLogs.metadata}->>'connectionId' = ${leaseRow.connectionId}`,
     ));
   const windowCount = counted?.total ?? 0;
   if (windowCount >= COOLDOWN_WINDOW_THRESHOLD) {

@@ -3439,6 +3439,7 @@ export function createCapabilityRunnerdProviderEnvironment(input: Parameters<typ
 }
 
 const OPEN_CODE_RUNNER_ENVIRONMENT_KEYS = new Set([
+  "PAPERCLIP_AI_PROVIDER_CONNECTION_ID",
   "PAPERCLIP_AI_PROVIDER_KEY",
   "PAPERCLIP_AI_PROVIDER_URL",
   "PAPERCLIP_AI_PROVIDER_KEY_SLOT",

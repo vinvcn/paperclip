@@ -20,8 +20,8 @@ A new **Usage** surface in the sidebar (Org group, directly under Costs) that sh
 
 1. Four headline cards — Total Cost, Total Requests, Tokens Processed, Cache Hit Rate — plus four secondary values: Fresh Input, Output, Cache Write, Cache Hit.
 2. An hourly **Tokens** bar chart, bucketed in the viewer's timezone.
-3. A **Request Logs** table: one row per provider HTTP call, with time, app, provider, model, cost, fresh input, output, cache hit, speed, first-token latency and status.
-4. Filters: time range, app chips (data-driven), provider/model, status code, page size, with the last selection remembered.
+3. A **Request Logs** table: one row per provider HTTP call, with time, app, provider, model, key, cost, fresh input, output, cache hit, speed, first-token latency and status.
+4. Filters: time range, app chips (data-driven), provider/model, key, status code, page size, with the last selection remembered.
 
 The data is captured at the **provider proxy** the OpenCode runner already runs for `paperclip/*` and `openrouter/*` models, so no harness changes are needed and every request through the proxy is observed exactly once. Records are stored in a new `usage_request_logs` table, independent of the financial ledger.
 
@@ -49,6 +49,7 @@ The data is captured at the **provider proxy** the OpenCode runner already runs 
 20. As an operator, I want request detail kept for 90 days and then deleted, so that storage stays bounded.
 21. As a new user, I want an empty state that explains no requests were seen yet, so that I don't think the page is broken.
 22. As a user, I want the page to page through results without losing my filters, so that I can inspect older requests.
+23. As an operator running a credential pool, I want each request row to show and filter by the pooled key that served it, so that I can correlate 429s and spend with a specific slot.
 
 ## Implementation Decisions
 
@@ -66,6 +67,7 @@ The data is captured at the **provider proxy** the OpenCode runner already runs 
 - Indexes: `(company_id, occurred_at desc, id)` for the log list, `(company_id, app, occurred_at)`, `(company_id, provider, model, occurred_at)`, and `(run_id)` for cost allocation.
 - Agent/issue/project are resolved **server-side from the run id** at insert time; the runner never sends them.
 - Token columns are nullable: a request whose usage could not be observed keeps nulls and is excluded from token sums, rather than being recorded as zero.
+- `metadata` carries optional pool attribution: `keySlot` (number) and `connectionId` (string), written only for traffic that ran on a credential-pool key (see Capture). Rows without it are per-connection credentials, pre-pool records, or legacy runners. The projection and capture path guarantee the pair: a `keySlot` is never produced without its `connectionId`, because a bare slot number is ambiguous when two pools exist.
 - Detail rows are retained for 90 days by a retention sweep modelled on the existing provider-trace retention service.
 
 ### Capture
@@ -76,6 +78,8 @@ The data is captured at the **provider proxy** the OpenCode runner already runs 
 - The driver buffers records for the duration of the run and delivers them to the server over the existing runner→server event channel as usage-family events (`kind = "provider_request"`), so no new transport or HTTP endpoint is introduced. Re-delivery is safe because of the request-id uniqueness.
 - Server-side persistence reuses the accounting path's idempotency rules and the same company/run authorization as usage receipts.
 - Failed, cancelled and aborted requests are recorded with their status and no token or cost data.
+- **Key-pool attribution**: when the server routes a model through a credential pool, it projects the selected slot (`PAPERCLIP_AI_PROVIDER_KEY_SLOT`) and the pool's connection id (`PAPERCLIP_AI_PROVIDER_CONNECTION_ID`) into the runner's provider environment — pooled traffic only; non-pooled credentials project neither variable. The driver stamps them onto every usage record alongside the model, and the server persists them into `metadata`, so a row that consumed a pooled key is attributable to the exact slot even when two pools share a slot number. Old runners that never learned the variables keep producing attribution-less rows, which the page treats as unkeyed.
+- The cooldown probe (`app = "key_pool_probe"`, ticket 03's recovery sweep) writes its own usage row directly with the same attribution pair, since a probe is real upstream traffic on a pooled slot.
 
 ### Cost attribution
 
@@ -95,8 +99,9 @@ The data is captured at the **provider proxy** the OpenCode runner already runs 
 
 Two read endpoints under the company scope, reusing the Costs read permission and the existing date-range parser:
 
-- **Summary** (`.../usage/summary`): accepts from/to, timezone (IANA name), app, provider, model. Returns the card totals, the hourly/daily series, the unpriced count, and facets (apps, providers, models with request counts) to drive the filters.
+- **Summary** (`.../usage/summary`): accepts from/to, timezone (IANA name), app, provider, model, key. Returns the card totals, the hourly/daily series, the unpriced count, and facets (apps, providers, models, keys with request counts) to drive the filters.
 - **Logs** (`.../usage/logs`): accepts the same filters plus status and a keyset cursor `(occurred_at, id)`. Returns rows and a next cursor, plus the total matching count.
+- The `key` filter and facet speak the display form `key-<slot>`, derived from `metadata.keySlot` in SQL. Rows without pool attribution carry no key: they match no key filter value and appear in no key facet entry, so the facet only lists keys that actually served traffic.
 - Series bucketing uses PostgreSQL `date_trunc(... AT TIME ZONE :tz)`, so DST is handled correctly; buckets are hourly for windows up to 48 hours and daily beyond that.
 - Both endpoints require the same authorization as `costs`.
 
@@ -106,8 +111,8 @@ Two read endpoints under the company scope, reusing the Costs read permission an
 - Cards: a single bordered block with a 4-up headline row (Total Cost with unpriced badge, Total Requests, Tokens Processed, Cache Hit Rate) and a 4-up secondary row (Fresh Input, Output, Cache Write, Cache Hit), matching the mock.
 - Chart: hand-rolled SVG bar chart (no charting library exists in the UI), hourly buckets with zero-filled gaps, hover tooltip, and a y-axis that scales to the window maximum.
 - Table tabs: **Request Logs** (implemented), **Providers** and **Models** (visible, marked P2, non-functional in P1, showing a short "coming in P2" panel instead of an empty table).
-- Table columns: Time (local), App, Provider, Model, Cost, Fresh Input, Output, Cache Hit, Speed, First token. Cost renders `Unpriced` in a warning tone; Speed and First token render `—` when null. Rows are not clickable in P1.
-- Filters: time range, data-driven app chips with an "All" option, provider/model select, status-code select, page size (20/50/100).
+- Table columns: Time (local), App, Provider, Model, Key, Cost, Fresh Input, Output, Cache Hit, Speed, First token. Key renders `key-<slot>` from the row's pool attribution and `—` for rows without it. Cost renders `Unpriced` in a warning tone; Speed and First token render `—` when null. Rows are not clickable in P1.
+- Filters: time range, data-driven app chips with an "All" option, provider/model select, key select, status-code select, page size (20/50/100). The key select follows the provider/model select's pattern, including keeping a selected value visible when the current window's facets no longer contain it.
 - Refresh: fetch on mount, manual refresh, and 30-second polling; polling pauses when the tab is hidden.
 - Empty state explains that no requests were observed, and points at the known P1 boundary (only proxied traffic is captured).
 - Time range, page size and last-used filters are persisted in local storage per company.
@@ -139,5 +144,7 @@ Three seams, all with existing prior art:
 
 - Known boundary: a request that bypasses the proxy, or a run whose records never reach the server, appears in `cost_events` but not in Usage. The Usage page is therefore a *request* view, not a second ledger; Costs remains the authoritative money view. This is recorded in ADR-0002.
 - The `App` dimension is the harness, not the provider and not the agent. `Provider` is the API vendor and `Model` is the model id; this is fixed in `GLOSSARY.md`.
+- The `Model` facet deliberately mixes two display forms: agent traffic stores the routed `paperclip/<model>` string, while cooldown-probe rows store the bare upstream model id they actually sent. The `App` dimension separates the two populations (`key_pool_probe` vs `opencode`), so no storage-side normalization is applied; a probe row's model answers "what did this probe request ask for", not "what did the agent route".
+- `Key` is a pooled-slot label (`key-<slot>`), not a credential: the page never exposes key material, only which slot of which pool handled the call.
 - Storage growth is roughly one row per model call — small compared to trace capture — but the 90-day sweep is still required because runs accumulate at heartbeat cadence.
 - The page deliberately does not attempt to explain why a cost is unpriced; that remains the Costs page's data-quality notice.

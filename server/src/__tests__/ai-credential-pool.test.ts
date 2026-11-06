@@ -225,6 +225,8 @@ describe("runtimeCredential pool assignment", () => {
       expect(env.PAPERCLIP_AI_PROVIDER_KEY).not.toContain("fixture-connection-projected");
       // The selected slot travels with the credential for usage attribution.
       expect(env.PAPERCLIP_AI_PROVIDER_KEY_SLOT).toBe("1");
+      // The pool's owning connection rides the same channel (ticket 04 review F2).
+      expect(env.PAPERCLIP_AI_PROVIDER_CONNECTION_ID).toBe(account.connectionId);
       expect(runtime.keySlot).toBe(1);
       // The warm-session identity binds the slot: a different slot on a later
       // run invalidates the stored session instead of reusing its captured key.
@@ -621,7 +623,7 @@ describe("key pool cooldown state machine (ticket 03)", () => {
       await db.insert(usageRequestLogs).values({
         companyId, runId, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
         model: `paperclip/${MODEL_A}`, httpStatus: status, requestId: randomUUID(), occurredAt: new Date(now.getTime() - 5_000),
-        metadata: { keySlot: 1 },
+        metadata: { keySlot: 1, connectionId },
       });
     }
     // recordForRun hands the classifier the usage row's stored model string.
@@ -651,7 +653,7 @@ describe("key pool cooldown state machine (ticket 03)", () => {
     await db.insert(usageRequestLogs).values({
       companyId, runId, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
       model: `paperclip/${MODEL_A}`, httpStatus: 429, requestId: randomUUID(), occurredAt: now,
-      metadata: { keySlot: 1 },
+      metadata: { keySlot: 1, connectionId },
     });
     const classification = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: `paperclip/${MODEL_A}`, now });
     expect(classification).toMatchObject({ state: "daily_cooldown", windowCount: 1 });
@@ -680,11 +682,11 @@ describe("key pool cooldown state machine (ticket 03)", () => {
     const now = new Date();
     await db.insert(usageRequestLogs).values({
       companyId, runId: leaseRun, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
-      model: `paperclip/${MODEL_A}`, httpStatus: 429, requestId: randomUUID(), occurredAt: now, metadata: { keySlot: 1 },
+      model: `paperclip/${MODEL_A}`, httpStatus: 429, requestId: randomUUID(), occurredAt: now, metadata: { keySlot: 1, connectionId },
     });
     await db.insert(usageRequestLogs).values({
       companyId, runId: leaseRun, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
-      model: `paperclip/${MODEL_A}`, httpStatus: 429, requestId: randomUUID(), occurredAt: now, metadata: { keySlot: 1 },
+      model: `paperclip/${MODEL_A}`, httpStatus: 429, requestId: randomUUID(), occurredAt: now, metadata: { keySlot: 1, connectionId },
     });
     const classification = await classifyKeySlot429(db, { companyId, runId: leaseRun, keySlot: 1, model: `paperclip/${MODEL_A}`, now });
     expect(classification!.windowCount).toBe(2);
@@ -704,7 +706,7 @@ describe("key pool cooldown state machine (ticket 03)", () => {
       await db.insert(usageRequestLogs).values({
         companyId, runId, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
         model: `paperclip/${MODEL_A}`, httpStatus: status, requestId: randomUUID(), occurredAt: new Date(now.getTime() - 5_000),
-        metadata: { keySlot: 1 },
+        metadata: { keySlot: 1, connectionId },
       });
     }
     const classification = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: `paperclip/${MODEL_A}`, now });
@@ -717,6 +719,67 @@ describe("key pool cooldown state machine (ticket 03)", () => {
       .rejects.toMatchObject({ details: { code: "provider_key_pool_exhausted" } });
     await expect(service.runtimeCredential(await connectionRow(), { pool: { model: MODEL_B } }))
       .resolves.toMatchObject({ keySlot: 1 });
+  });
+
+  it("narrows the 429 window to the row's own connection: same slot and model across two pools never pollutes each other (review F2)", async () => {
+    // A second gateway connection in the same company with the same slot
+    // number and the same model: its window traffic must not feed this pool's
+    // classification (and vice versa).
+    const other = await createGatewayConnectionForUser(userId, "Second NIM gateway", "fixture-connection-second-pool");
+    const otherSecret = await secretService(db).create(companyId, { name: `ai-pool-second-${other.connectionId.slice(0, 8)}-slot-1`, provider: "local_encrypted", value: "fixture-nvapi-second-1" }, { userId });
+    await db.insert(credentialPool).values({ companyId, connectionId: other.connectionId, slot: 1, secretRef: otherSecret.id });
+    try {
+      const runId = await newRunId();
+      await takePoolSlotLease(db, { companyId, connectionId, slotId, runId, agentId: agentA, modelKey: MODEL_A, now: new Date(), respectCooldown: true });
+      const now = new Date();
+      // This pool's window: only the 429 row itself (1 in-window request).
+      await db.insert(usageRequestLogs).values({
+        companyId, runId, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
+        model: `paperclip/${MODEL_A}`, httpStatus: 429, requestId: randomUUID(), occurredAt: now,
+        metadata: { keySlot: 1, connectionId },
+      });
+      // The other pool's window: heavy same-slot, same-model traffic that the
+      // pre-F2 query (company + model + slot only) would have counted here.
+      for (const status of [200, 200, 200]) {
+        await db.insert(usageRequestLogs).values({
+          companyId, runId, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
+          model: `paperclip/${MODEL_A}`, httpStatus: status, requestId: randomUUID(), occurredAt: new Date(now.getTime() - 5_000),
+          metadata: { keySlot: 1, connectionId: other.connectionId },
+        });
+      }
+      // The row's own connection attribution drives the exact lease lookup…
+      const classification = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, connectionId, model: `paperclip/${MODEL_A}`, now });
+      // …so the empty own-window classifies as the daily limit, not an
+      // RPM cooldown borrowed from the other pool's traffic.
+      expect(classification).toMatchObject({ state: "daily_cooldown", windowCount: 1 });
+      expect(await cooldownRow(MODEL_A)).toMatchObject({ state: "daily_cooldown", cooldownReason: "daily" });
+      // A connection id that no lease row matches classifies nothing, even
+      // with (run, slot) still resolving the lease without it.
+      await db.delete(credentialPoolCooldowns).where(and(
+        eq(credentialPoolCooldowns.companyId, companyId), eq(credentialPoolCooldowns.connectionId, connectionId)));
+      await expect(classifyKeySlot429(db, { companyId, runId, keySlot: 1, connectionId: other.connectionId, model: `paperclip/${MODEL_A}`, now }))
+        .resolves.toBeNull();
+      expect(await cooldownRow(MODEL_A)).toBeUndefined();
+      // Without a row-level connection id (pre-ticket-04 payload) the lease
+      // lookup falls back to (run, slot) and the window still narrows to the
+      // lease's connection. A different model keeps this sub-case clear of
+      // the daily cooldown the first classification wrote for MODEL_A, and
+      // the first run's lease is released the way a terminal run would.
+      await releaseRunPoolLease(db, runId);
+      const legacyRunId = await newRunId();
+      await takePoolSlotLease(db, { companyId, connectionId, slotId, runId: legacyRunId, agentId: agentA, modelKey: MODEL_B, now: new Date(), respectCooldown: true });
+      await db.insert(usageRequestLogs).values({
+        companyId, runId: legacyRunId, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
+        model: `paperclip/${MODEL_B}`, httpStatus: 429, requestId: randomUUID(), occurredAt: now,
+        metadata: { keySlot: 1, connectionId },
+      });
+      const legacy = await classifyKeySlot429(db, { companyId, runId: legacyRunId, keySlot: 1, model: `paperclip/${MODEL_B}`, now: new Date(now.getTime() + 1) });
+      expect(legacy).toMatchObject({ state: "daily_cooldown", windowCount: 1 });
+    } finally {
+      await db.delete(credentialPool).where(eq(credentialPool.connectionId, other.connectionId));
+      await db.delete(credentialPoolCooldowns).where(and(
+        eq(credentialPoolCooldowns.companyId, companyId), eq(credentialPoolCooldowns.connectionId, other.connectionId)));
+    }
   });
 
   it("computes the probe deadline from due daily cooldowns only", async () => {
@@ -804,10 +867,12 @@ describe("key pool probe worker (ticket 03)", () => {
     // Review F3: provider/biller derive from the model form the usage log
     // stores — normal rows record `paperclip/<model>` (biller "paperclip"), so the
     // probe's row must not split the same model into a second billing group.
+    // The row carries the pool attribution (ticket 04) with the same
+    // "keySlot implies connectionId" contract as agent-traffic rows.
     expect(usage[0]).toMatchObject({
       runId, httpStatus: 200, model: MODEL_A, inputTokens: 1, outputTokens: 1,
       provider: "paperclip", biller: "paperclip",
-      metadata: { probe: true, keySlot: 1 },
+      metadata: { probe: true, keySlot: 1, connectionId },
     });
     expect(usage[0]!.requestId).toMatch(/^keypool-probe-/);
     expect((await activityActions()).map((entry) => entry.action)).toContain("ai_connection.key_slot_probe_released");

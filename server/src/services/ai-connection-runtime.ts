@@ -419,7 +419,16 @@ export async function prepareManagedAiRuntime(
       }), { mode: 0o600 });
       if (antigravitySubscription) await writeFile(authFile, originalCredential, { mode: 0o600 });
     }
-    const projected = routing ? managedProviderRouting(routing, harness, value, typeof input.config.model === "string" ? input.config.model : "", keySlot) : undefined;
+    const projected = routing
+      ? managedProviderRouting(
+          routing,
+          harness,
+          value,
+          typeof input.config.model === "string" ? input.config.model : "",
+          keySlot,
+          selection.connection.id,
+        )
+      : undefined;
     if (projected) {
       const customHeaders = env.ANTHROPIC_CUSTOM_HEADERS ?? process.env.ANTHROPIC_CUSTOM_HEADERS;
       Object.assign(env, projected.env);

@@ -41,6 +41,25 @@ describe("usage capture sink", () => {
     expect(record.endedAtMs - record.startedAtMs).toBe(500);
   });
 
+  it("stamps pooled key attribution onto every record (ticket 04)", () => {
+    const sink = createUsageCaptureSink({
+      app: "opencode",
+      model: "paperclip/meta/llama-3.3-70b-instruct",
+      keySlot: 3,
+      connectionId: "conn-uuid-1",
+    });
+    sink.record({ ...observation, requestId: "req-slot" });
+    expect(sink.take()[0]).toMatchObject({ keySlot: 3, connectionId: "conn-uuid-1" });
+  });
+
+  it("leaves key attribution null when the credential is not pooled (backward compatibility)", () => {
+    const sink = createUsageCaptureSink({ app: "opencode", model: "paperclip/gpt-5.2" });
+    sink.record({ ...observation, requestId: "req-plain" });
+    const record = sink.take()[0]!;
+    expect(record.keySlot).toBeNull();
+    expect(record.connectionId).toBeNull();
+  });
+
   it("bounds the buffer when nothing drains it", () => {
     const sink = createUsageCaptureSink({ app: "opencode", model: "paperclip/gpt-5.2", capacity: 3 });
     for (let index = 0; index < 10; index += 1) sink.record({ ...observation, requestId: `req-${index}` });

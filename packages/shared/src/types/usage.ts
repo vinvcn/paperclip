@@ -109,12 +109,16 @@ export interface UsageSummaryFacet {
  * *unfiltered* window — they answer "what could I filter by here" — so a
  * selected value never removes its own chip or option. The models list is
  * capped so a high-cardinality model namespace cannot flood the response;
- * `modelsTruncated` says whether the cap hid values.
+ * `modelsTruncated` says whether the cap hid values. The keys list aggregates
+ * the window's pooled key attribution (`metadata.keySlot`): values appear as
+ * `key-<slot>` labels, and rows without attribution (non-pool credentials,
+ * probes, older runners) belong to no key facet.
  */
 export interface UsageSummaryFacets {
   apps: UsageSummaryFacet[];
   providers: UsageSummaryFacet[];
   models: UsageSummaryFacet[];
+  keys: UsageSummaryFacet[];
   modelsTruncated: boolean;
 }
 

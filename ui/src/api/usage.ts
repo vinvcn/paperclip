@@ -13,6 +13,8 @@ export interface UsageLogFilters {
   app?: string;
   provider?: string;
   model?: string;
+  /** Pooled key attribution, in the facets' display form (`key-<slot>`). */
+  key?: string;
   status?: UsageStatusFilter;
   from?: string;
   to?: string;
@@ -23,6 +25,7 @@ function usageFilterParams(filters: UsageLogFilters): URLSearchParams {
   if (filters.app) params.set("app", filters.app);
   if (filters.provider) params.set("provider", filters.provider);
   if (filters.model) params.set("model", filters.model);
+  if (filters.key) params.set("key", filters.key);
   if (filters.status) params.set("status", filters.status);
   if (filters.from) params.set("from", filters.from);
   if (filters.to) params.set("to", filters.to);

@@ -41,6 +41,7 @@ export interface UsagePreferenceFilters {
   app?: string;
   provider?: string;
   model?: string;
+  key?: string;
   status?: UsageStatusFilter;
 }
 
@@ -64,7 +65,7 @@ function normalizeFilters(value: unknown): UsagePreferenceFilters {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const record = value as Record<string, unknown>;
   const filters: UsagePreferenceFilters = {};
-  for (const key of ["app", "provider", "model"] as const) {
+  for (const key of ["app", "provider", "model", "key"] as const) {
     if (typeof record[key] === "string" && record[key] !== "") filters[key] = record[key];
   }
   if (

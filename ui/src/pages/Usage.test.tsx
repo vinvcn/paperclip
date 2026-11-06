@@ -104,7 +104,7 @@ function summary(overrides: Partial<UsageSummary> = {}): UsageSummary {
     cacheHitRate: 0.25,
     unpricedCount: 12,
     series: [],
-    facets: { apps: [], providers: [], models: [], modelsTruncated: false },
+    facets: { apps: [], providers: [], models: [], keys: [], modelsTruncated: false },
     ...overrides,
   };
 }
@@ -115,6 +115,7 @@ function summaryWithFacets(): UsageSummary {
       apps: [{ value: "opencode", requests: 5 }],
       providers: [{ value: "openrouter", requests: 3 }, { value: "anthropic", requests: 2 }],
       models: [{ value: "z-ai/glm-4.6", requests: 5 }],
+      keys: [{ value: "key-3", requests: 5 }],
       modelsTruncated: false,
     },
   });
@@ -232,7 +233,7 @@ function expectLocationParams(pairs: Record<string, string>) {
 
   it("renders request rows with the P1 skeleton columns", async () => {
     usageLogsMock.mockResolvedValue(pageOf([
-      row(),
+      row({ metadata: { keySlot: 3, connectionId: "conn-uuid-1" } }),
       row({
         id: "33333333-3333-4333-8333-333333333333",
         requestId: "req-2",
@@ -241,6 +242,7 @@ function expectLocationParams(pairs: Record<string, string>) {
         httpStatus: 502,
         durationMs: 12_400,
         occurredAt: "2026-11-04T13:30:00Z",
+        metadata: null,
       }),
     ]));
     renderPage();
@@ -249,7 +251,7 @@ function expectLocationParams(pairs: Record<string, string>) {
     });
 
     const headers = [...container.querySelectorAll("th[scope=col]")].map((th) => th.textContent);
-    expect(headers).toEqual(["Time", "App", "Provider", "Model", "Cost", "Status", "Duration"]);
+    expect(headers).toEqual(["Time", "App", "Provider", "Model", "Key", "Cost", "Status", "Duration"]);
 
     const [first, second] = [...container.querySelectorAll("tbody tr")];
     // Times render in the browser's local timezone via the shared date formatter.
@@ -266,6 +268,21 @@ function expectLocationParams(pairs: Record<string, string>) {
     expect(second.textContent).toContain("12.4s");
   });
 
+  it("renders the pooled key column as key-<slot>, with an em dash for unattributed rows", async () => {
+    usageLogsMock.mockResolvedValue(pageOf([
+      row({ metadata: { keySlot: 3, connectionId: "conn-uuid-1" } }),
+      row({ id: "33333333-3333-4333-8333-333333333333", requestId: "req-plain", metadata: null }),
+    ]));
+    renderPage();
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelectorAll("tbody tr")).toHaveLength(2));
+    });
+    const keyCell = (tr: Element) => tr.querySelectorAll("td")[4]!;
+    expect(keyCell(container.querySelectorAll("tbody tr")[0]!).textContent).toBe("key-3");
+    // Non-pool credentials, probes and older runners carry no attribution.
+    expect(keyCell(container.querySelectorAll("tbody tr")[1]!).textContent).toBe("—");
+  });
+
   it("renders per-row cost as the allocated amount, or Unpriced in a warning tone", async () => {
     usageLogsMock.mockResolvedValue(pageOf([
       row({ costCents: "150.0000000", costStatus: "priced" }),
@@ -277,7 +294,7 @@ function expectLocationParams(pairs: Record<string, string>) {
     });
 
     const rows = [...container.querySelectorAll("tbody tr")];
-    const costCell = (tr: Element) => tr.querySelectorAll("td")[4]!;
+    const costCell = (tr: Element) => tr.querySelectorAll("td")[5]!;
     // Priced rows show their allocated share; unpriced rows show the
     // data-quality notice in a warning tone, never a $0.00 price.
     expect(costCell(rows[0]!).textContent).toBe("$1.50");
@@ -367,9 +384,9 @@ function expectLocationParams(pairs: Record<string, string>) {
       await vi.waitFor(() => expect(container.querySelector("tbody tr")).not.toBeNull());
     });
     const cells = [...container.querySelectorAll("tbody tr td")].map((td) => td.textContent);
-    expect(cells[4]).toBe("Unpriced");
-    expect(cells[5]).toBe("—");
+    expect(cells[5]).toBe("Unpriced");
     expect(cells[6]).toBe("—");
+    expect(cells[7]).toBe("—");
   });
 
   it("shows the explanatory empty state when no requests were observed", async () => {
@@ -537,6 +554,53 @@ function expectLocationParams(pairs: Record<string, string>) {
       });
       const option = modelSelect.querySelector('option[value="openai/gpt-5.2"]')!;
       expect(option.textContent).toBe("openai/gpt-5.2");
+    });
+
+    it("renders key options from the summary facets and applies the key select to both reads and the URL", async () => {
+      usageSummaryMock.mockResolvedValue(summaryWithFacets());
+      renderPage();
+      await act(async () => {
+        await vi.waitFor(() => expect(container.querySelector('select[aria-label="Filter by key"]')).not.toBeNull());
+      });
+      // Options come from the key facets; "All keys" is the unfiltered state.
+      const keySelect = container.querySelector('select[aria-label="Filter by key"]') as HTMLSelectElement;
+      expect([...keySelect.querySelectorAll("option")].map((option) => option.textContent)).toEqual(["All keys", "key-3"]);
+      await act(async () => {
+        keySelect.value = "key-3";
+        keySelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({ key: "key-3", from: DEFAULT_FROM }));
+      });
+      expect(usageSummaryMock).toHaveBeenLastCalledWith("company-1", expect.any(String), { key: "key-3", from: DEFAULT_FROM });
+      expectLocationParams({ key: "key-3", from: DEFAULT_FROM });
+      // Selecting All clears the filter again.
+      await act(async () => {
+        keySelect.value = "all";
+        keySelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({ from: DEFAULT_FROM }));
+      });
+      expectLocationParams({ from: DEFAULT_FROM });
+    });
+
+    it("keeps showing a selected key the window's facets no longer list", async () => {
+      usageSummaryMock.mockResolvedValue(summaryWithFacets());
+      // A shared/remembered URL can name a key with no rows in the current
+      // window — the select must still display the applied value.
+      renderPage("/?key=key-9");
+      await act(async () => {
+        await vi.waitFor(() => expectLastLogsCall({ key: "key-9", from: DEFAULT_FROM }));
+      });
+      await act(async () => {
+        await vi.waitFor(() => expect(container.querySelector('select[aria-label="Filter by key"]')).not.toBeNull());
+      });
+      const keySelect = container.querySelector('select[aria-label="Filter by key"]') as HTMLSelectElement;
+      await act(async () => {
+        await vi.waitFor(() => expect(keySelect.value).toBe("key-9"));
+      });
+      expect(keySelect.querySelector('option[value="key-9"]')!.textContent).toBe("key-9");
     });
 
     it("shows the filtered empty state naming the current filters", async () => {

@@ -15,11 +15,13 @@ import { logger } from "../middleware/logger.js";
 
 export type UsageRequestLogRow = typeof usageRequestLogs.$inferSelect;
 
-/** The app/provider/model/status filter dimensions of a usage read (docs/specs/usage-request-logs.md, API). */
+/** The app/provider/model/key/status filter dimensions of a usage read (docs/specs/usage-request-logs.md, API). */
 export interface UsageRequestFilters {
   app?: string;
   provider?: string;
   model?: string;
+  /** Pooled key attribution in its display form (`key-<slot>`); rows without attribution match no key. */
+  key?: string;
   status?: UsageStatusFilter;
 }
 
@@ -78,12 +80,27 @@ function statusCondition(status: UsageStatusFilter): SQL {
   }
 }
 
+/**
+ * The pooled key's display label (`key-<slot>`), shared verbatim by the key
+ * filter and the facets' grouping set so the two can never drift. Null for
+ * rows without pooled attribution — a plain `concat` would render those as
+ * the dead label `key-` (concat eats nulls), and they must match no key.
+ */
+function keyLabelSql(): SQL {
+  const slot = sql`${usageRequestLogs.metadata}->>'keySlot'`;
+  return sql`(case when ${slot} is null then null else concat('key-', ${slot}) end)`;
+}
+
 /** WHERE fragments for the shared filter dimensions; absent filters add nothing. */
 function usageFilterConditions(filters: UsageRequestFilters): SQL[] {
   const conditions: SQL[] = [];
   if (filters.app) conditions.push(eq(usageRequestLogs.app, filters.app));
   if (filters.provider) conditions.push(eq(usageRequestLogs.provider, filters.provider));
   if (filters.model) conditions.push(eq(usageRequestLogs.model, filters.model));
+  if (filters.key) {
+    // The key filter speaks the display form the facets emit (`key-<slot>`).
+    conditions.push(sql`${keyLabelSql()} = ${filters.key}`);
+  }
   if (filters.status) conditions.push(statusCondition(filters.status));
   return conditions;
 }
@@ -295,19 +312,34 @@ export function usageRequestLogService(db: Db) {
           providerRequestId: parsed.providerRequestId,
           requestId: parsed.requestId,
           occurredAt: new Date(parsed.startedAtMs),
-          ...(parsed.usageMissing ? { metadata: { usageMissing: true } } : {}),
+          ...((parsed.usageMissing || parsed.keySlot != null || parsed.connectionId != null)
+            ? {
+                metadata: {
+                  ...(parsed.usageMissing ? { usageMissing: true } : {}),
+                  // Key-pool attribution (ticket 04): the pooled slot and its
+                  // owning connection as the runner's capture sink saw them.
+                  ...(parsed.keySlot != null ? { keySlot: parsed.keySlot } : {}),
+                  ...(parsed.connectionId != null ? { connectionId: parsed.connectionId } : {}),
+                },
+              }
+            : {}),
         }).onConflictDoNothing().returning({ id: usageRequestLogs.id, metadata: usageRequestLogs.metadata });
       });
       const stored = inserted[0];
       // Key-pool 429 classification hook (ticket 03): a 429 row attributed to
-      // a pooled key slot (metadata.keySlot — ticket 04 populates it) updates
-      // that (slot, model) cooldown. Must never affect the usage insert.
+      // a pooled key slot (metadata.keySlot + metadata.connectionId — ticket
+      // 04 populates both) updates that (slot, model) cooldown. Reading the
+      // stored metadata (not the payload) keeps re-delivery from ever
+      // re-classifying: only a first insert carries a row here. Must never
+      // affect the usage insert.
       const keySlot = typeof stored?.metadata?.keySlot === "number" ? stored.metadata.keySlot : null;
+      const connectionId = typeof stored?.metadata?.connectionId === "string" ? stored.metadata.connectionId : null;
       if (parsed.httpStatus === 429 && keySlot !== null) {
         await classifyKeySlot429(db, {
           companyId: binding.companyId,
           runId: binding.runId,
           keySlot,
+          connectionId,
           model: parsed.model,
           retryAfterSeconds: retryAfterSecondsFromPayload(payload),
         }).catch((error) => {
@@ -428,30 +460,33 @@ export function usageRequestLogService(db: Db) {
 
     /**
      * The window's filter dimensions (docs/specs/usage-request-logs.md,
-     * API): every app, provider and model that produced at least one request
-     * in scope, with its count. One grouping-sets scan answers all three
-     * dimensions; the scope is deliberately the *unfiltered* window, so a
-     * selected app never removes its own chip (or another chip a user could
-     * still switch to). Since the columns are NOT NULL, a NULL marks the
-     * grouping sets the row does not belong to. The models list is capped at
-     * 50 sorted-by-volume values — a company's model namespace can be
+     * API): every app, provider, model and pooled key that produced at least
+     * one request in scope, with its count. One grouping-sets scan answers
+     * all four dimensions; the scope is deliberately the *unfiltered*
+     * window, so a selected value keeps its chip. Since the app/provider/
+     * model columns are NOT NULL, a NULL marks the grouping sets the row
+     * does not belong to (the key label is NULL for rows without pooled
+     * attribution, which belong to no key facet). The models list is capped
+     * at 50 sorted-by-volume values — a company's model namespace can be
      * high-cardinality — and `modelsTruncated` reports whether the cap cut
      * anything, so the response stays bounded without silently lying.
      */
     async facets(scopeConditions: SQL[]): Promise<UsageSummaryFacets> {
       const rows = await db.execute(sql`
-        select app, provider, model, count(*)::int as requests
+        select app, provider, model, ${keyLabelSql()} as key, count(*)::int as requests
         from ${usageRequestLogs}
         where ${and(...scopeConditions)}
-        group by grouping sets ((app), (provider), (model))
-      `) as unknown as Array<{ app: string | null; provider: string | null; model: string | null; requests: number }>;
+        group by grouping sets ((app), (provider), (model), (${keyLabelSql()}))
+      `) as unknown as Array<{ app: string | null; provider: string | null; model: string | null; key: string | null; requests: number }>;
       const apps: UsageSummaryFacet[] = [];
       const providers: UsageSummaryFacet[] = [];
       const models: UsageSummaryFacet[] = [];
+      const keys: UsageSummaryFacet[] = [];
       for (const row of rows) {
         if (row.app != null) apps.push({ value: row.app, requests: row.requests });
         else if (row.provider != null) providers.push({ value: row.provider, requests: row.requests });
         else if (row.model != null) models.push({ value: row.model, requests: row.requests });
+        else if (row.key != null) keys.push({ value: row.key, requests: row.requests });
       }
       const byVolume = (a: UsageSummaryFacet, b: UsageSummaryFacet) =>
         b.requests - a.requests || a.value.localeCompare(b.value);
@@ -459,6 +494,7 @@ export function usageRequestLogService(db: Db) {
         apps: apps.sort(byVolume),
         providers: providers.sort(byVolume),
         models: models.sort(byVolume).slice(0, MODEL_FACET_LIMIT),
+        keys: keys.sort(byVolume),
         modelsTruncated: models.length > MODEL_FACET_LIMIT,
       };
     },
