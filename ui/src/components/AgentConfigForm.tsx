@@ -6,6 +6,7 @@ import { canQualifyRunnerEnvironment, qualifyRunnerEnvironment } from "../lib/qu
 import { AgentRunnerSelect } from "./AgentRunnerSelect";
 import { aiRoutingHarness } from "@paperclipai/shared";
 import { AiConnectionField } from "./ai-connections/AiConnectionField";
+import { AgentKeySlotPin } from "./ai-connections/AgentKeySlotPin";
 import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema } from "@paperclipai/shared";
 import { testAgentSetup } from "@/lib/test-agent-setup";
 import { setupEfforts } from "../lib/agent-setup-fields";
@@ -1890,6 +1891,14 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
               mark("runtime", "runtimeConfig", { ...runtimeConfig, aiConnection: binding });
               if (accountBoundCatalog && hashKey([modelAiBinding ?? null]) === hashKey([binding ?? null])) void refreshConnectionModels();
             }} />}
+          {/* Ticket 06: the default key pin targets a pooled shared/delegated
+           * connection only; router and responsible-user bindings rotate
+           * accounts elsewhere. The pin rides adapterConfig (ticket 02). */}
+          {!isExternalRunner && !isCreate && selectedCompanyId
+            && modelAiBinding && (modelAiBinding.mode === "shared" || modelAiBinding.mode === "delegated")
+            && <AgentKeySlotPin companyId={selectedCompanyId} connectionId={modelAiBinding.connectionId}
+              value={typeof eff("adapterConfig", "keySlot", config.keySlot) === "number" ? eff("adapterConfig", "keySlot", config.keySlot) as number : null}
+              onChange={(slot) => mark("adapterConfig", "keySlot", slot)} />}
 
           {showInlineAdapterTestEnvironmentFeedback && !props.compactTestFeedback && (testActionError || testEnvironment.error) && (
             <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
