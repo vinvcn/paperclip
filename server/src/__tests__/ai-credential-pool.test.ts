@@ -14,15 +14,22 @@ import {
   connectionGrants,
   createDb,
   credentialPool,
+  credentialPoolCooldowns,
   companySecrets,
   companySecretVersions,
   heartbeatRuns,
   toolConnections,
+  usageRequestLogs,
   type Db,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { aiConnectionService } from "../services/ai-connections.js";
-import { releaseRunPoolLease } from "../services/ai-credential-pool.js";
+import {
+  classifyKeySlot429,
+  nextCooldownProbeDeadline,
+  releaseRunPoolLease,
+  takePoolSlotLease,
+} from "../services/ai-credential-pool.js";
 import { secretService } from "../services/secrets.js";
 import { prepareManagedAiRuntime } from "../services/ai-connection-runtime.js";
 import { credentialPoolSlotConfigPath, syncConnectionCredentialBindings } from "../services/connection-credential-bindings.js";
@@ -58,6 +65,28 @@ async function createGatewayConnectionForUser(owner: string, name: string, key: 
     routing: { kind: "gateway", protocol: "chat", baseUrl: "https://integrate.api.nvidia.example/v1", auth: "bearer", models: [] },
   } as never, key);
 }
+
+/** NIM-style model ids: the upstream body form usage rows record (the
+ * managed `paperclip/` prefix is stripped by the projection). */
+const MODEL_A = "meta/llama-3.3-70b-instruct";
+const MODEL_B = "meta/qwen3-coder-480b";
+
+/** Insert one (slot, model) cooldown row — the ticket-03 cooldown store. */
+const coolSlot = async (
+  connectionId: string,
+  slot: number,
+  model: string,
+  state: "rpm_cooldown" | "daily_cooldown",
+  cooldownUntil: Date | null,
+  reason = state === "rpm_cooldown" ? "rpm" : "daily",
+) => {
+  await db.insert(credentialPoolCooldowns).values({
+    companyId, connectionId, slot, model, state, cooldownUntil, cooldownReason: reason,
+  }).onConflictDoUpdate({
+    target: [credentialPoolCooldowns.companyId, credentialPoolCooldowns.connectionId, credentialPoolCooldowns.slot, credentialPoolCooldowns.model],
+    set: { state, cooldownUntil, cooldownReason: reason, updatedAt: new Date() },
+  });
+};
 
 describe("credential_pool schema", () => {
   it("stores pool slots for an AI connection and enforces the unique slot constraint", async () => {
@@ -144,11 +173,12 @@ describe("runtimeCredential pool assignment", () => {
     const slotSecret = await secretService(db).create(companyId, { name: `ai-pool-exhausted-${account.connectionId.slice(0, 8)}-slot-1`, provider: "local_encrypted", value: "fixture-nvapi-key-exhausted" }, { userId });
     await db.insert(credentialPool).values({ companyId, connectionId: account.connectionId, slot: 1, secretRef: slotSecret.id });
     const poolScope = and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, account.connectionId));
-    // The only enabled slot is in cooldown: the matrix fails fast instead of
-    // silently falling back to the single credential (ticket-01 contract change).
-    await db.update(credentialPool).set({ state: "daily_cooldown", cooldownUntil: new Date(Date.now() + 3_600_000), cooldownReason: "daily" }).where(poolScope);
-    await expect(service.runtimeCredential(row)).rejects.toMatchObject({ details: { code: "provider_key_pool_exhausted" } });
-    await expect(service.runtimeCredential(row)).rejects.toThrow(/slot 1: daily_cooldown, cooldown until/);
+    // The only enabled slot is in cooldown for the target model: the matrix
+    // fails fast instead of silently falling back to the single credential
+    // (ticket-01 contract change, re-judged per model since ticket 03).
+    await coolSlot(account.connectionId, 1, MODEL_A, "daily_cooldown", new Date(Date.now() + 3_600_000));
+    await expect(service.runtimeCredential(row, { pool: { model: MODEL_A } })).rejects.toMatchObject({ details: { code: "provider_key_pool_exhausted" } });
+    await expect(service.runtimeCredential(row, { pool: { model: MODEL_A } })).rejects.toThrow(/slot 1: daily_cooldown, cooldown until/);
     // Re-enabled but leased by another run's exclusive lease: a run-scoped
     // resolution fast-fails with the occupancy snapshot. (A resolution without
     // a run selects read-only and ignores occupancy by design.)
@@ -157,9 +187,10 @@ describe("runtimeCredential pool assignment", () => {
     const [callerAgent] = await db.insert(agents).values({ companyId, name: "Exhausted caller" }).returning({ id: agents.id });
     const [callerRun] = await db.insert(heartbeatRuns).values({ companyId, agentId: callerAgent!.id }).returning({ id: heartbeatRuns.id });
     await db.update(credentialPool).set({ state: "healthy", cooldownUntil: null, cooldownReason: null }).where(poolScope);
+    await db.delete(credentialPoolCooldowns).where(and(eq(credentialPoolCooldowns.companyId, companyId), eq(credentialPoolCooldowns.connectionId, account.connectionId)));
     await db.update(credentialPool).set({ activeRunId: holderRun!.id, leaseExpiresAt: new Date(Date.now() + 600_000), leaseAgentId: holderAgent!.id }).where(poolScope);
-    await expect(service.runtimeCredential(row, { pool: { heartbeatRunId: callerRun!.id, agentId: callerAgent!.id } })).rejects.toThrow(new RegExp(`slot 1: healthy, leased by run ${holderRun!.id} \\(agent ${holderAgent!.id}\\) until`));
-    await expect(service.runtimeCredential(row, { pool: { heartbeatRunId: callerRun!.id, agentId: callerAgent!.id } })).rejects.toMatchObject({ details: { code: "provider_key_pool_exhausted" } });
+    await expect(service.runtimeCredential(row, { pool: { heartbeatRunId: callerRun!.id, agentId: callerAgent!.id, model: MODEL_A } })).rejects.toThrow(new RegExp(`slot 1: healthy, leased by run ${holderRun!.id} \\(agent ${holderAgent!.id}\\) until`));
+    await expect(service.runtimeCredential(row, { pool: { heartbeatRunId: callerRun!.id, agentId: callerAgent!.id, model: MODEL_A } })).rejects.toMatchObject({ details: { code: "provider_key_pool_exhausted" } });
   });
 
   it("projects the pool-resolved key into the existing managed routing projection", async () => {
@@ -271,15 +302,20 @@ describe("key pool assignment matrix (ticket 02)", () => {
   };
   const newRun = async (agentId: string) => (await db.insert(heartbeatRuns).values({ companyId, agentId }).returning({ id: heartbeatRuns.id }))[0]!.id;
   /** Assignment inside a run: pin → sticky → exclusive lease → fast-fail. */
-  const lease = async (runId: string, agentId: string, pinnedSlot?: number) =>
-    service.runtimeCredential(await connectionRow(), { pool: { heartbeatRunId: runId, agentId, pinnedSlot } });
+  const lease = async (runId: string, agentId: string, pinnedSlot?: number, model: string = MODEL_A) =>
+    service.runtimeCredential(await connectionRow(), { pool: { heartbeatRunId: runId, agentId, pinnedSlot, model } });
+  /** Selection outside a run (no lease context, cooldowns still judged). */
+  const select = async (model: string = MODEL_A) =>
+    service.runtimeCredential(await connectionRow(), { pool: { model } });
   const poolRows = async () => (await db.select().from(credentialPool).where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId)))).sort((a, b) => a.slot - b.slot);
+  const cooldownRows = async () => (await db.select().from(credentialPoolCooldowns).where(and(eq(credentialPoolCooldowns.companyId, companyId), eq(credentialPoolCooldowns.connectionId, connectionId)))).sort((a, b) => a.slot - b.slot || a.model.localeCompare(b.model));
   const resetPool = async () => {
     await db.update(credentialPool).set({
       state: "healthy", cooldownUntil: null, cooldownReason: null, enabled: true,
       activeRunId: null, leaseExpiresAt: null, leaseAgentId: null,
       lastAssignedAgentId: null, lastAssignedAt: null, updatedAt: new Date(),
     }).where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId)));
+    await db.delete(credentialPoolCooldowns).where(and(eq(credentialPoolCooldowns.companyId, companyId), eq(credentialPoolCooldowns.connectionId, connectionId)));
   };
 
   afterEach(resetPool);
@@ -294,13 +330,20 @@ describe("key pool assignment matrix (ticket 02)", () => {
     expect(rows.find((row) => row.slot === 1)).toMatchObject({ activeRunId: null });
 
     await resetPool();
-    await db.update(credentialPool).set({ state: "daily_cooldown", cooldownUntil: new Date(Date.now() + 3_600_000), cooldownReason: "daily" })
-      .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, 2)));
+    await coolSlot(connectionId, 2, MODEL_A, "daily_cooldown", new Date(Date.now() + 3_600_000));
     await expect(lease(runId, agentA, 2)).resolves.toMatchObject({ keySlot: 2 });
     const after = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, connectionId)));
     const warns = after.slice(before.length).filter((entry) => entry.action === "ai_connection.key_slot_pin_cooldown");
     expect(warns).toHaveLength(1);
-    expect(warns[0]!.details).toMatchObject({ slot: 2, state: "daily_cooldown" });
+    expect(warns[0]!.details).toMatchObject({ slot: 2, model: MODEL_A, state: "daily_cooldown" });
+    // A different model's cooldown on the pinned slot does not shame this pin:
+    // the warn judges the target model only (plan §10 granularity).
+    await resetPool();
+    await coolSlot(connectionId, 2, MODEL_B, "daily_cooldown", new Date(Date.now() + 3_600_000));
+    const mid = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, connectionId)));
+    await expect(lease(runId, agentA, 2, MODEL_A)).resolves.toMatchObject({ keySlot: 2 });
+    const afterB = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, connectionId)));
+    expect(afterB.slice(mid.length).filter((entry) => entry.action === "ai_connection.key_slot_pin_cooldown")).toHaveLength(0);
 
     // A pin the pool cannot honor fails the run instead of silently serving
     // another account: missing slot and operator-disabled slot alike.
@@ -330,27 +373,37 @@ describe("key pool assignment matrix (ticket 02)", () => {
     await releaseRunPoolLease(db, secondRun);
 
     // Sticky slot in cooldown → the agent moves to the next assignable slot.
-    await db.update(credentialPool).set({ state: "rpm_cooldown", cooldownUntil: new Date(Date.now() + 120_000), cooldownReason: "rpm" })
-      .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, 1)));
+    await coolSlot(connectionId, 1, MODEL_A, "rpm_cooldown", new Date(Date.now() + 120_000));
     const thirdRun = await newRun(agentA);
     await expect(lease(thirdRun, agentA)).resolves.toMatchObject({ keySlot: 2 });
     await releaseRunPoolLease(db, thirdRun);
 
     // Sticky slot leased by another run's exclusive lease → move instead.
     const foreignRun = await newRun(agentB);
-    await db.update(credentialPool).set({ state: "healthy", cooldownUntil: null, cooldownReason: null })
-      .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, 1)));
+    await db.delete(credentialPoolCooldowns).where(and(
+      eq(credentialPoolCooldowns.companyId, companyId),
+      eq(credentialPoolCooldowns.connectionId, connectionId),
+      eq(credentialPoolCooldowns.slot, 1),
+    ));
     await expect(lease(foreignRun, agentB, 1)).resolves.toMatchObject({ keySlot: 1 });
     const fourthRun = await newRun(agentA);
     await expect(lease(fourthRun, agentA)).resolves.toMatchObject({ keySlot: 2 });
   });
 
-  it("re-resolving within one run lands on the same slot (self-lease is sticky)", async () => {
+  it("re-resolving within one run lands on the same slot and renews the lease (self-lease is sticky)", async () => {
     const runId = await newRun(agentA);
     const first = await lease(runId, agentA);
+    // Review F9: every in-run re-resolution re-takes the lease through the
+    // conditional UPDATE, which rewrites leaseExpiresAt = now + TTL. Per-turn
+    // credential resolution therefore keeps a long conversation's lease alive
+    // without a separate renewal worker (a crashed run is reclaimed by TTL).
+    const firstExpiry = (await poolRows()).find((row) => row.slot === first.keySlot)!.leaseExpiresAt!;
+    await new Promise((resolve) => setTimeout(resolve, 15));
     const second = await lease(runId, agentA);
     expect(second.keySlot).toBe(first.keySlot);
     expect((await poolRows()).filter((row) => row.activeRunId)).toHaveLength(1);
+    const secondExpiry = (await poolRows()).find((row) => row.slot === first.keySlot)!.leaseExpiresAt!;
+    expect(secondExpiry.getTime()).toBeGreaterThan(firstExpiry.getTime());
   });
 
   it("hands exclusive leases out least-recently-used first and never double-books a slot under concurrency", async () => {
@@ -382,10 +435,8 @@ describe("key pool assignment matrix (ticket 02)", () => {
     // down, so the expired lease is the only candidate left.
     await db.update(credentialPool).set({ leaseExpiresAt: new Date(Date.now() - 1_000) })
       .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, 1)));
-    await db.update(credentialPool).set({ state: "daily_cooldown", cooldownUntil: new Date(Date.now() + 3_600_000), cooldownReason: "daily" })
-      .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, 2)));
-    await db.update(credentialPool).set({ state: "daily_cooldown", cooldownUntil: new Date(Date.now() + 3_600_000), cooldownReason: "daily" })
-      .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, 3)));
+    await coolSlot(connectionId, 2, MODEL_A, "daily_cooldown", new Date(Date.now() + 3_600_000));
+    await coolSlot(connectionId, 3, MODEL_A, "daily_cooldown", new Date(Date.now() + 3_600_000));
     const nextRun = await newRun(agentB);
     await expect(lease(nextRun, agentB)).resolves.toMatchObject({ keySlot: 1 });
     expect((await poolRows()).find((row) => row.slot === 1)).toMatchObject({ activeRunId: nextRun });
@@ -407,6 +458,243 @@ describe("key pool assignment matrix (ticket 02)", () => {
     // The freed slot is immediately assignable to a different agent.
     const nextRun = await newRun(agentB);
     await expect(lease(nextRun, agentB, 2)).resolves.toMatchObject({ keySlot: 2 });
+  });
+
+  it("quarantines cooldowns per (slot, model): a cooled model never shames another model of the same key", async () => {
+    // The plan §10 core regression: NIM quota is counted per key × model, so
+    // model A's 429 cooldown on slot 1 must leave model B fully assignable.
+    await coolSlot(connectionId, 1, MODEL_A, "daily_cooldown", new Date(Date.now() + 3_600_000));
+    await coolSlot(connectionId, 2, MODEL_A, "rpm_cooldown", new Date(Date.now() + 120_000));
+    // Sticky + lease lanes for model B: slots 1 and 2 stay eligible.
+    const runB = await newRun(agentA);
+    await expect(lease(runB, agentA, undefined, MODEL_B)).resolves.toMatchObject({ keySlot: 1 });
+    await releaseRunPoolLease(db, runB);
+    // Selection without a run judges the same way: model B still resolves to a
+    // healthy slot (LRU, no agent context → sticky cannot apply).
+    await expect(select(MODEL_B)).resolves.toMatchObject({ keySlot: expect.any(Number) });
+    // And model A still fast-fails with the per-model snapshot: its only
+    // healthy slot (3) is held by another run's exclusive lease.
+    const holderRun = await newRun(agentB);
+    await expect(lease(holderRun, agentB, 3, MODEL_B)).resolves.toMatchObject({ keySlot: 3 });
+    const runA = await newRun(agentB);
+    await expect(lease(runA, agentB, undefined, MODEL_A)).rejects.toThrow(/slot 1: daily_cooldown, cooldown until.*slot 2: rpm_cooldown, cooldown until.*slot 3: healthy, leased/);
+  });
+
+  it("expires an rpm_cooldown back to eligibility without a probe, but keeps a due daily_cooldown cooling", async () => {
+    // rpm_cooldown past its deadline: the window has closed, eligibility
+    // returns without any probe or state write (query-time transition).
+    await coolSlot(connectionId, 1, MODEL_A, "rpm_cooldown", new Date(Date.now() - 1_000), "rpm");
+    await expect(select(MODEL_A)).resolves.toMatchObject({ keySlot: 1 });
+    const runId = await newRun(agentA);
+    await expect(lease(runId, agentA)).resolves.toMatchObject({ keySlot: 1 });
+    // A daily_cooldown past its deadline is NOT eligible: only the probe
+    // worker's 200 releases it (its deadline merely schedules the probe).
+    await resetPool();
+    await coolSlot(connectionId, 1, MODEL_A, "daily_cooldown", new Date(Date.now() - 1_000));
+    await coolSlot(connectionId, 2, MODEL_A, "daily_cooldown", new Date(Date.now() - 1_000));
+    await coolSlot(connectionId, 3, MODEL_A, "daily_cooldown", new Date(Date.now() - 1_000));
+    // A daily_cooldown past its deadline is NOT eligible: only the probe
+    // worker's 200 releases it (its deadline merely schedules the probe).
+    await expect(select(MODEL_A)).rejects.toMatchObject({ details: { code: "provider_key_pool_exhausted" } });
+  });
+
+  it("rotating a slot's key discards its cooldown rows; removing the slot does too", async () => {
+    await coolSlot(connectionId, 1, MODEL_A, "daily_cooldown", new Date(Date.now() + 3_600_000));
+    await coolSlot(connectionId, 1, MODEL_B, "rpm_cooldown", new Date(Date.now() + 120_000));
+    const { errorHandler } = await import("../middleware/index.js");
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "board", source: "local_implicit", userId: owner, companyIds: [companyId] } as never;
+      next();
+    });
+    app.use("/api", aiConnectionRoutes(db));
+    app.use(errorHandler);
+    // New key = new account with fresh quota: both cooldown rows are gone.
+    const patched = await request(app).patch(`/api/companies/${companyId}/ai-connections/${connectionId}/keys`)
+      .send({ slot: 1, keyValue: "fixture-nvapi-matrix-1-rotated" });
+    expect(patched.status).toBe(200);
+    expect(await cooldownRows()).toHaveLength(0);
+    // Removal clears whatever cooldowns remained.
+    await coolSlot(connectionId, 3, MODEL_A, "daily_cooldown", new Date(Date.now() + 3_600_000));
+    const removed = await request(app).delete(`/api/companies/${companyId}/ai-connections/${connectionId}/keys`)
+      .send({ slot: 3 });
+    expect(removed.status).toBe(200);
+    expect(await cooldownRows()).toHaveLength(0);
+  });
+});
+
+describe("key pool cooldown state machine (ticket 03)", () => {
+  let service: ReturnType<typeof aiConnectionService>;
+  let connectionId: string;
+  let grantId: string;
+  let agentA: string;
+  let slotId: string;
+  const owner = "keypool-cooldown-user";
+
+  beforeAll(async () => {
+    service = aiConnectionService(db);
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const account = await createGatewayConnectionForUser(owner, "Cooldown NIM gateway", "fixture-connection-cooldown-key");
+    connectionId = account.connectionId;
+    grantId = account.grantId;
+    const secret = await secretService(db).create(companyId, { name: `ai-pool-cooldown-${connectionId.slice(0, 8)}-slot-1`, provider: "local_encrypted", value: "fixture-nvapi-cooldown-1" }, { userId: owner });
+    const [row] = await db.insert(credentialPool).values({ companyId, connectionId, slot: 1, secretRef: secret.id }).returning({ id: credentialPool.id });
+    slotId = row!.id;
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connectionId));
+    await syncConnectionCredentialBindings(db, connection);
+    const [inserted] = await db.insert(agents).values({ companyId, name: "Cooldown agent" }).returning({ id: agents.id });
+    agentA = inserted!.id;
+  }, 60000);
+
+  const connectionRow = async () => {
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connectionId));
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, grantId));
+    return { connection, grant };
+  };
+  const newRunId = async () => (await db.insert(heartbeatRuns).values({ companyId, agentId: agentA }).returning({ id: heartbeatRuns.id }))[0]!.id;
+  const nextRunId = newRunId;
+  const leaseRow = async () => (await db.select().from(credentialPool).where(eq(credentialPool.id, slotId)))[0]!;
+  const cooldownRow = async (model: string) => (await db.select().from(credentialPoolCooldowns)
+    .where(and(
+      eq(credentialPoolCooldowns.companyId, companyId),
+      eq(credentialPoolCooldowns.connectionId, connectionId),
+      eq(credentialPoolCooldowns.slot, 1),
+      eq(credentialPoolCooldowns.model, model),
+    )))[0];
+
+  afterEach(async () => {
+    await db.update(credentialPool).set({
+      state: "healthy", cooldownUntil: null, cooldownReason: null, enabled: true,
+      activeRunId: null, leaseExpiresAt: null, leaseAgentId: null,
+      lastAssignedAgentId: null, lastAssignedAt: null, updatedAt: new Date(),
+    }).where(eq(credentialPool.id, slotId));
+    await db.delete(credentialPoolCooldowns).where(and(eq(credentialPoolCooldowns.companyId, companyId), eq(credentialPoolCooldowns.connectionId, connectionId)));
+    await db.delete(usageRequestLogs).where(and(eq(usageRequestLogs.companyId, companyId)));
+  });
+
+  it("re-checks eligibility inside the lease UPDATE (review F8): disabled, cooled or already-leased slots match nothing", async () => {
+    const now = new Date();
+    const base = { companyId, connectionId, slotId, runId: await nextRunId(), agentId: agentA, modelKey: MODEL_A, now };
+    // Free + enabled + healthy for the model: the lease is taken.
+    expect(await takePoolSlotLease(db, { ...base, respectCooldown: true })).toMatchObject({ activeRunId: base.runId });
+    await db.update(credentialPool).set({ activeRunId: null, leaseExpiresAt: null, leaseAgentId: null }).where(eq(credentialPool.id, slotId));
+    // Operator-disabled slot: the WHERE refuses even though the matrix's
+    // pre-screen may have seen it enabled a moment ago.
+    await db.update(credentialPool).set({ enabled: false }).where(eq(credentialPool.id, slotId));
+    expect(await takePoolSlotLease(db, { ...base, runId: await nextRunId(), respectCooldown: true })).toBeNull();
+    await db.update(credentialPool).set({ enabled: true }).where(eq(credentialPool.id, slotId));
+    // Active cooldown for the target model: refused.
+    await db.insert(credentialPoolCooldowns).values({
+      companyId, connectionId, slot: 1, model: MODEL_A, state: "daily_cooldown",
+      cooldownUntil: new Date(Date.now() + 3_600_000), cooldownReason: "daily",
+    });
+    expect(await takePoolSlotLease(db, { ...base, runId: await nextRunId(), respectCooldown: true })).toBeNull();
+    // The same cooldown row does not block the pin lane (respectCooldown: false).
+    const pinned = await takePoolSlotLease(db, { ...base, runId: await nextRunId(), respectCooldown: false });
+    expect(pinned).toMatchObject({ activeRunId: expect.any(String) });
+    await db.update(credentialPool).set({ activeRunId: null, leaseExpiresAt: null, leaseAgentId: null }).where(eq(credentialPool.id, slotId));
+    // Expired rpm_cooldown: eligible (query-time transition), the lease lands.
+    await db.update(credentialPoolCooldowns).set({ state: "rpm_cooldown", cooldownUntil: new Date(Date.now() - 1_000), cooldownReason: "rpm" })
+      .where(and(eq(credentialPoolCooldowns.companyId, companyId), eq(credentialPoolCooldowns.model, MODEL_A)));
+    expect(await takePoolSlotLease(db, { ...base, runId: await nextRunId(), respectCooldown: true })).not.toBeNull();
+    await db.update(credentialPool).set({ activeRunId: null, leaseExpiresAt: null, leaseAgentId: null }).where(eq(credentialPool.id, slotId));
+    // Another model's cooldown never blocks this model's lease.
+    await db.update(credentialPoolCooldowns).set({ state: "daily_cooldown", cooldownUntil: new Date(Date.now() + 3_600_000), cooldownReason: "daily" })
+      .where(and(eq(credentialPoolCooldowns.companyId, companyId), eq(credentialPoolCooldowns.model, MODEL_A)));
+    expect(await takePoolSlotLease(db, { ...base, runId: await nextRunId(), modelKey: MODEL_B, respectCooldown: true })).not.toBeNull();
+  });
+
+  it("classifies a 429 with window traffic as rpm_cooldown using max(90s, retry-after)", async () => {
+    const runId = await newRunId();
+    await takePoolSlotLease(db, { companyId, connectionId, slotId, runId, agentId: agentA, modelKey: MODEL_A, now: new Date(), respectCooldown: true });
+    const now = new Date();
+    // Two window requests for the pair (the 429 row itself counts as traffic).
+    for (const status of [200, 429]) {
+      await db.insert(usageRequestLogs).values({
+        companyId, runId, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
+        model: MODEL_A, httpStatus: status, requestId: randomUUID(), occurredAt: new Date(now.getTime() - 5_000),
+        metadata: { keySlot: 1 },
+      });
+    }
+    const classification = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: MODEL_A, retryAfterSeconds: 120, now });
+    expect(classification).toMatchObject({ state: "rpm_cooldown", windowCount: 2, retryAfterSeconds: 120 });
+    // retry-after 120s > the 90s floor wins.
+    expect(classification!.cooldownUntil.getTime()).toBe(now.getTime() + 120_000);
+    expect(await cooldownRow(MODEL_A)).toMatchObject({ state: "rpm_cooldown", cooldownReason: "rpm", lastRunId: runId });
+    // A short retry-after falls back to the 90s floor.
+    const short = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: MODEL_A, retryAfterSeconds: 5, now: new Date(now.getTime() + 1) });
+    expect(short!.cooldownUntil.getTime()).toBe(now.getTime() + 1 + 90_000);
+    // No header: the 90s fallback.
+    const none = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: MODEL_A, retryAfterSeconds: null, now: new Date(now.getTime() + 2) });
+    expect(none!.cooldownUntil.getTime()).toBe(now.getTime() + 2 + 90_000);
+    // Evidence lands in the activity log.
+    const [logged] = await db.select().from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, connectionId), eq(activityLog.action, "ai_connection.key_slot_cooldown")))
+      .orderBy(desc(activityLog.createdAt)).limit(1);
+    expect(logged!.details).toMatchObject({ slot: 1, model: MODEL_A, state: "rpm_cooldown", windowCount: 2, retryAfterSeconds: null });
+  });
+
+  it("classifies a 429 with an empty window as the daily limit and quarantines the pair for 24h", async () => {
+    const runId = await newRunId();
+    await takePoolSlotLease(db, { companyId, connectionId, slotId, runId, agentId: agentA, modelKey: MODEL_A, now: new Date(), respectCooldown: true });
+    // Only the 429 row itself in the window: RPM is not the limiter.
+    const now = new Date();
+    await db.insert(usageRequestLogs).values({
+      companyId, runId, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
+      model: MODEL_A, httpStatus: 429, requestId: randomUUID(), occurredAt: now,
+      metadata: { keySlot: 1 },
+    });
+    const classification = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: MODEL_A, now });
+    expect(classification).toMatchObject({ state: "daily_cooldown", windowCount: 1 });
+    expect(classification!.cooldownUntil.getTime()).toBe(now.getTime() + 24 * 60 * 60 * 1000);
+    expect(await cooldownRow(MODEL_A)).toMatchObject({ state: "daily_cooldown", cooldownReason: "daily" });
+    // The pair is now ineligible for the target model…
+    await expect(service.runtimeCredential(await connectionRow(), { pool: { model: MODEL_A } }))
+      .rejects.toMatchObject({ details: { code: "provider_key_pool_exhausted" } });
+    // …while another model of the same key stays assignable (plan §10 core).
+    await expect(service.runtimeCredential(await connectionRow(), { pool: { model: MODEL_B } }))
+      .resolves.toMatchObject({ keySlot: 1 });
+  });
+
+  it("skips classification when the 429 cannot be attributed to a leased pooled slot", async () => {
+    // No lease for this run: the hook is a no-op.
+    const runId = await newRunId();
+    await expect(classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: MODEL_A, now: new Date() })).resolves.toBeNull();
+    expect(await cooldownRow(MODEL_A)).toBeUndefined();
+    // A lease on another slot (or another keySlot number) does not match.
+    const leaseRun = await newRunId();
+    await takePoolSlotLease(db, { companyId, connectionId, slotId, runId: leaseRun, agentId: agentA, modelKey: MODEL_A, now: new Date(), respectCooldown: true });
+    await expect(classifyKeySlot429(db, { companyId, runId: leaseRun, keySlot: 7, model: MODEL_A, now: new Date() })).resolves.toBeNull();
+    // The managed paperclip/ prefix resolves to the same cooldown key as the
+    // bare upstream model id the usage rows record.
+    const now = new Date();
+    await db.insert(usageRequestLogs).values({
+      companyId, runId: leaseRun, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
+      model: MODEL_A, httpStatus: 429, requestId: randomUUID(), occurredAt: now, metadata: { keySlot: 1 },
+    });
+    await db.insert(usageRequestLogs).values({
+      companyId, runId: leaseRun, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
+      model: MODEL_A, httpStatus: 429, requestId: randomUUID(), occurredAt: now, metadata: { keySlot: 1 },
+    });
+    const classification = await classifyKeySlot429(db, { companyId, runId: leaseRun, keySlot: 1, model: `paperclip/${MODEL_A}`, now });
+    expect(classification!.windowCount).toBe(2);
+    expect(await cooldownRow(MODEL_A)).toMatchObject({ state: "rpm_cooldown" });
+  });
+
+  it("computes the probe deadline from due daily cooldowns only", async () => {
+    expect(await nextCooldownProbeDeadline(db)).toBeNull();
+    const far = new Date(Date.now() + 20 * 60 * 60 * 1000);
+    const near = new Date(Date.now() + 3 * 60 * 1000);
+    await db.insert(credentialPoolCooldowns).values([
+      { companyId, connectionId, slot: 1, model: MODEL_A, state: "daily_cooldown", cooldownUntil: far, cooldownReason: "daily" },
+      { companyId, connectionId, slot: 1, model: MODEL_B, state: "daily_cooldown", cooldownUntil: near, cooldownReason: "daily" },
+      { companyId, connectionId, slot: 1, model: "meta/rpm-model", state: "rpm_cooldown", cooldownUntil: new Date(Date.now() + 30_000), cooldownReason: "rpm" },
+    ]);
+    // Only daily rows within the 5-minute lead window qualify; rpm rows never do.
+    expect(await nextCooldownProbeDeadline(db)).toBe(near.getTime());
+    // Outside the lead window: no obligation yet.
+    expect(await nextCooldownProbeDeadline(db, new Date(Date.now() - 10 * 60 * 1000))).toBeNull();
   });
 });
 

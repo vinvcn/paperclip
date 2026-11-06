@@ -992,10 +992,11 @@ export function aiConnectionService(db: Db) {
   async function runtimeCredential(row: Parameters<typeof credential>[0], options?: {
     credentialLockHeld?: true;
     /** Key-pool assignment context: the run taking the exclusive lease, its
-     * agent, and the key-slot pin resolved from agent adapterConfig.keySlot or
-     * the task's assigneeAdapterOverrides.keySlot. Omitted for resolutions
+     * agent, the key-slot pin resolved from agent adapterConfig.keySlot or
+     * the task's assigneeAdapterOverrides.keySlot, and the target model whose
+     * (slot, model) cooldown governs eligibility. Omitted for resolutions
      * outside a run (selection only, no lease). */
-    pool?: { agentId?: string | null; heartbeatRunId?: string | null; pinnedSlot?: number | null };
+    pool?: { agentId?: string | null; heartbeatRunId?: string | null; pinnedSlot?: number | null; model?: string | null };
   }): Promise<{ value: string; keySlot: number | null }> {
     const metadata = aiConnectionMetadataSchema.safeParse(row.connection.config.ai);
     // Key pool: a connection with pool slots resolves its key through the
@@ -1011,6 +1012,7 @@ export function aiConnectionService(db: Db) {
         agentId: options.pool.agentId ?? null,
         heartbeatRunId: options.pool.heartbeatRunId ?? null,
         pinnedSlot: options.pool.pinnedSlot ?? null,
+        model: options.pool.model ?? null,
       });
       if (slot) return {
         value: await resolvePoolSlotValue(db, row.connection.companyId, row.connection.id, slot, {

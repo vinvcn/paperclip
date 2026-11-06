@@ -333,10 +333,12 @@ export async function prepareManagedAiRuntime(
           ...(ownership?.active && ownership.companyId === input.companyId ? { credentialLockHeld: true as const } : {}),
           // The run's exclusive key-pool lease: assignment, stickiness and the
           // projected PAPERCLIP_AI_PROVIDER_KEY_SLOT all key off this context.
+          // The target model drives (slot, model) cooldown eligibility.
           pool: {
             agentId: input.agentId,
             heartbeatRunId: input.heartbeatRunId ?? null,
             pinnedSlot: input.pinnedKeySlot ?? null,
+            model: typeof input.config.model === "string" ? input.config.model : null,
           },
         });
         const value = resolution.value;
