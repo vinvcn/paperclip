@@ -43,6 +43,9 @@ export const credentialPool = pgTable(
     leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
     leaseAgentId: uuid("lease_agent_id").references(() => agents.id, { onDelete: "set null" }),
     lastAssignedAgentId: uuid("last_assigned_agent_id").references(() => agents.id, { onDelete: "set null" }),
+    // Sticky-anchor recency: assignment prefers the slot least recently handed
+    // out, so an idle pool rotates instead of hammering slot 1.
+    lastAssignedAt: timestamp("last_assigned_at", { withTimezone: true }),
     lastFailedSlotProbeAt: timestamp("last_failed_slot_probe_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

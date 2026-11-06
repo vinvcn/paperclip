@@ -466,7 +466,7 @@ describe("managed AI connections", () => {
       expect(cleanup).not.toHaveBeenCalled();
       retired.resolve(); await reconcileRetainedAiCleanup(scope);
       expect(cleanup).toHaveBeenCalledOnce();
-      await expect(service.runtimeCredential(row)).resolves.toBe(auth);
+      await expect(service.runtimeCredential(row)).resolves.toMatchObject({ value: auth });
     } finally { retired.resolve(); await reconcileRetainedAiCleanup(scope).catch(() => {}); }
   });
 
@@ -743,7 +743,7 @@ describe("managed AI connections", () => {
         ownership: "personal", name: owner, loginSessionId: "fixture", agentIds: [], allAgents: true }, signedIn);
       const [current] = await receiver.quotaAccounts(companyId, owner);
       expect(current.grant.status).toBe("active");
-      expect(await receiver.runtimeCredential(current)).toBe(signedIn);
+      expect(await receiver.runtimeCredential(current)).toMatchObject({ value: signedIn });
       expect(request).toHaveBeenCalledTimes(1);
       expect((await db.select().from(companySecretVersions).where(eq(companySecretVersions.secretId, ref.secretId))).map(version => version.version).sort()).toEqual([1, 2]);
     } finally {
@@ -891,7 +891,7 @@ describe("managed AI connections", () => {
     const signedIn = JSON.stringify({ tokens: { access_token: "process-sign-in", refresh_token: "process-new-login" } });
     await receiver.save(companyId, owner, { connectionId: row.connection.id, provider: "openai", method: "subscription", ownership: "personal", name: owner, loginSessionId: "fixture", agentIds: [], allAgents: true }, signedIn);
     const [current] = await receiver.quotaAccounts(companyId, owner);
-    expect(await receiver.runtimeCredential(current)).toBe(signedIn);
+    expect(await receiver.runtimeCredential(current)).toMatchObject({ value: signedIn });
   }, 40_000);
 
   it("does not exchange a token when a required database transaction fails", async () => {
@@ -1160,7 +1160,7 @@ describe("managed AI connections", () => {
     } else if (kind === "recovery") {
       const recovery = quotaCredentialRecovery(companyId, row.grant.id);
       await recovery.write({ companyId, grantId: row.grant.id, connectionId: row.connection.id, secretId: ref.secretId, baseHash: quotaCredentialHash(auth("old", 10)), value: auth("fresh", 11) });
-      expect(await service.runtimeCredential(row)).toBe(auth("fresh", 11));
+      expect(await service.runtimeCredential(row)).toMatchObject({ value: auth("fresh", 11) });
     } else {
       const runtime = await prepareManagedAiRuntime(db, { companyId, agentId, responsibleUserId: owner, adapterType: "codex_local", binding: { provider: "openai", method: "subscription", mode: "responsible_user" }, config: {} });
       await writeFile(path.join(String(runtime.config.env.CODEX_HOME), "auth.json"), auth("fresh", 11));

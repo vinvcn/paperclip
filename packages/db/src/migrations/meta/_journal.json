@@ -2962,6 +2962,13 @@
       "when": 1793954460652,
       "tag": "0424_small_hedge_knight",
       "breakpoints": true
+    },
+    {
+      "idx": 425,
+      "version": "7",
+      "when": 1793962853303,
+      "tag": "0425_brainy_sprite",
+      "breakpoints": true
     }
   ]
 }

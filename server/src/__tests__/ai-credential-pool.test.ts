@@ -1,13 +1,14 @@
 // Key pool foundation (ticket 01): credential_pool table, pool-backed
 // runtimeCredential resolution, slot CRUD API. Real keys never appear here;
 // every credential in this file is a fixture value.
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import {
+  agents,
   companies,
   companyMemberships,
   connectionGrants,
@@ -15,15 +16,17 @@ import {
   credentialPool,
   companySecrets,
   companySecretVersions,
+  heartbeatRuns,
   toolConnections,
   type Db,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { aiConnectionService } from "../services/ai-connections.js";
+import { releaseRunPoolLease } from "../services/ai-credential-pool.js";
 import { secretService } from "../services/secrets.js";
 import { prepareManagedAiRuntime } from "../services/ai-connection-runtime.js";
-import { syncConnectionCredentialBindings } from "../services/connection-credential-bindings.js";
-import { activityLog } from "@paperclipai/db";
+import { credentialPoolSlotConfigPath, syncConnectionCredentialBindings } from "../services/connection-credential-bindings.js";
+import { activityLog, secretAccessEvents } from "@paperclipai/db";
 import express from "express";
 import request from "supertest";
 import { aiConnectionRoutes } from "../routes/ai-connections.js";
@@ -102,9 +105,10 @@ describe("runtimeCredential pool assignment", () => {
     const row = { connection, grant };
 
     // No pool: the original single-credential path is untouched.
-    await expect(service.runtimeCredential(row)).resolves.toBe(connectionKey);
+    await expect(service.runtimeCredential(row)).resolves.toMatchObject({ value: connectionKey, keySlot: null });
 
-    // Pool with slots 2 and 1 (inserted out of order): assignment is slot-ascending.
+    // Pool with slots 2 and 1 (inserted out of order): selection is slot-ascending
+    // for an untouched pool (no lease context → selection only, no lease writes).
     const slotSecrets = new Map<number, string>();
     for (const [slot, value] of [[2, "fixture-nvapi-key-b"], [1, "fixture-nvapi-key-a"]] as const) {
       const secret = await secretService(db).create(companyId, { name: `ai-pool-runtime-${account.connectionId.slice(0, 8)}-slot-${slot}`, provider: "local_encrypted", value }, { userId });
@@ -114,15 +118,48 @@ describe("runtimeCredential pool assignment", () => {
     // Directly inserted rows still resolve after the connection's binding sync
     // (reconnects and metadata edits recreate pool slot bindings from this path).
     await syncConnectionCredentialBindings(db, connection);
-    await expect(service.runtimeCredential(row)).resolves.toBe(slotSecrets.get(1));
+    await expect(service.runtimeCredential(row)).resolves.toMatchObject({ value: slotSecrets.get(1), keySlot: 1 });
 
-    // Disabling the assigned slot moves assignment to the next healthy slot.
+    // Disabling the selected slot moves selection to the next enabled slot.
     await db.update(credentialPool).set({ enabled: false }).where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, account.connectionId), eq(credentialPool.slot, 1)));
-    await expect(service.runtimeCredential(row)).resolves.toBe(slotSecrets.get(2));
+    await expect(service.runtimeCredential(row)).resolves.toMatchObject({ value: slotSecrets.get(2), keySlot: 2 });
 
-    // No assignable slot at all: fall back to the connection's own credential.
+    // Zero enabled slots: the pool is switched off, so the connection's own
+    // credential serves again (ticket-01 fall-through, kept by ticket 02).
     await db.update(credentialPool).set({ enabled: false }).where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, account.connectionId), eq(credentialPool.slot, 2)));
-    await expect(service.runtimeCredential(row)).resolves.toBe(connectionKey);
+    await expect(service.runtimeCredential(row)).resolves.toMatchObject({ value: connectionKey, keySlot: null });
+  });
+
+  it("fast-fails provider_key_pool_exhausted when enabled slots exist but none can serve", async () => {
+    const owner = "keypool-exhausted-user";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const service = aiConnectionService(db);
+    const connectionKey = "fixture-connection-exhausted-key";
+    const account = await createGatewayConnectionForUser(owner, "Exhausted NIM gateway", connectionKey);
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, account.grantId));
+    const row = { connection, grant };
+    const [agent] = await db.insert(agents).values({ companyId, name: "Exhausted holder" }).returning({ id: agents.id });
+    const [runRow] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent!.id }).returning({ id: heartbeatRuns.id });
+    const slotSecret = await secretService(db).create(companyId, { name: `ai-pool-exhausted-${account.connectionId.slice(0, 8)}-slot-1`, provider: "local_encrypted", value: "fixture-nvapi-key-exhausted" }, { userId });
+    await db.insert(credentialPool).values({ companyId, connectionId: account.connectionId, slot: 1, secretRef: slotSecret.id });
+    const poolScope = and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, account.connectionId));
+    // The only enabled slot is in cooldown: the matrix fails fast instead of
+    // silently falling back to the single credential (ticket-01 contract change).
+    await db.update(credentialPool).set({ state: "daily_cooldown", cooldownUntil: new Date(Date.now() + 3_600_000), cooldownReason: "daily" }).where(poolScope);
+    await expect(service.runtimeCredential(row)).rejects.toMatchObject({ details: { code: "provider_key_pool_exhausted" } });
+    await expect(service.runtimeCredential(row)).rejects.toThrow(/slot 1: daily_cooldown, cooldown until/);
+    // Re-enabled but leased by another run's exclusive lease: a run-scoped
+    // resolution fast-fails with the occupancy snapshot. (A resolution without
+    // a run selects read-only and ignores occupancy by design.)
+    const [holderAgent] = await db.insert(agents).values({ companyId, name: "Exhausted lease holder" }).returning({ id: agents.id });
+    const [holderRun] = await db.insert(heartbeatRuns).values({ companyId, agentId: holderAgent!.id }).returning({ id: heartbeatRuns.id });
+    const [callerAgent] = await db.insert(agents).values({ companyId, name: "Exhausted caller" }).returning({ id: agents.id });
+    const [callerRun] = await db.insert(heartbeatRuns).values({ companyId, agentId: callerAgent!.id }).returning({ id: heartbeatRuns.id });
+    await db.update(credentialPool).set({ state: "healthy", cooldownUntil: null, cooldownReason: null }).where(poolScope);
+    await db.update(credentialPool).set({ activeRunId: holderRun!.id, leaseExpiresAt: new Date(Date.now() + 600_000), leaseAgentId: holderAgent!.id }).where(poolScope);
+    await expect(service.runtimeCredential(row, { pool: { heartbeatRunId: callerRun!.id, agentId: callerAgent!.id } })).rejects.toThrow(new RegExp(`slot 1: healthy, leased by run ${holderRun!.id} \\(agent ${holderAgent!.id}\\) until`));
+    await expect(service.runtimeCredential(row, { pool: { heartbeatRunId: callerRun!.id, agentId: callerAgent!.id } })).rejects.toMatchObject({ details: { code: "provider_key_pool_exhausted" } });
   });
 
   it("projects the pool-resolved key into the existing managed routing projection", async () => {
@@ -149,7 +186,227 @@ describe("runtimeCredential pool assignment", () => {
       expect(env.PAPERCLIP_AI_PROVIDER_KEY).toBe(pooledKey);
       expect(env.PAPERCLIP_AI_PROVIDER_URL).toBe("https://integrate.api.nvidia.example/v1");
       expect(env.PAPERCLIP_AI_PROVIDER_KEY).not.toContain("fixture-connection-projected");
+      // The selected slot travels with the credential for usage attribution.
+      expect(env.PAPERCLIP_AI_PROVIDER_KEY_SLOT).toBe("1");
+      expect(runtime.keySlot).toBe(1);
+      // The warm-session identity binds the slot: a different slot on a later
+      // run invalidates the stored session instead of reusing its captured key.
+      expect(runtime.sessionIdentity).toContain("pool-slot-1");
     } finally { await runtime.cleanup(); }
+  });
+
+  it("attributes pooled key access to the grant's responsible user and the consuming run (ticket-01 review F3)", async () => {
+    const owner = "keypool-attributed-user";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const service = aiConnectionService(db);
+    // A personal grant carries the responsible user — the same attribution
+    // source the grant credential() path passes as audit context.
+    const account = await service.save(companyId, owner, {
+      provider: "openai", method: "api_key", ownership: "personal", name: "Attributed NIM gateway",
+      apiKey: "fixture-connection-attributed", agentIds: [], allAgents: true,
+      routing: { kind: "gateway", protocol: "chat", baseUrl: "https://integrate.api.nvidia.example/v1", auth: "bearer", models: [] },
+    } as never, "fixture-connection-attributed");
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, account.grantId));
+    expect(grant).toMatchObject({ kind: "user", subjectUserId: owner });
+    const [agent] = await db.insert(agents).values({ companyId, name: "Attributed runner" }).returning({ id: agents.id });
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent!.id }).returning({ id: heartbeatRuns.id });
+    const pooledKey = "fixture-nvapi-key-attributed";
+    const secret = await secretService(db).create(companyId, { name: "ai-pool-attributed-slot-1", provider: "local_encrypted", value: pooledKey }, { userId: owner });
+    await db.insert(credentialPool).values({ companyId, connectionId: account.connectionId, slot: 1, secretRef: secret.id });
+    await syncConnectionCredentialBindings(db, connection);
+    await expect(service.runtimeCredential({ connection, grant }, { pool: { heartbeatRunId: run!.id, agentId: agent!.id } }))
+      .resolves.toMatchObject({ value: pooledKey, keySlot: 1 });
+    const [event] = await db.select().from(secretAccessEvents)
+      .where(eq(secretAccessEvents.secretId, secret!.id))
+      .orderBy(desc(secretAccessEvents.createdAt))
+      .limit(1);
+    expect(event).toMatchObject({
+      responsibleUserId: owner,
+      heartbeatRunId: run!.id,
+      consumerType: "tool_connection",
+      consumerId: account.connectionId,
+      configPath: credentialPoolSlotConfigPath(1),
+      outcome: "success",
+    });
+  });
+});
+
+describe("key pool assignment matrix (ticket 02)", () => {
+  let service: ReturnType<typeof aiConnectionService>;
+  let connectionId: string;
+  let grantId: string;
+  let agentA: string;
+  let agentB: string;
+  const owner = "keypool-matrix-user";
+  const slotKeys = new Map<number, string>([[1, "fixture-nvapi-matrix-1"], [2, "fixture-nvapi-matrix-2"], [3, "fixture-nvapi-matrix-3"]]);
+
+  beforeAll(async () => {
+    service = aiConnectionService(db);
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const account = await createGatewayConnectionForUser(owner, "Matrix NIM gateway", "fixture-connection-matrix-key");
+    connectionId = account.connectionId;
+    grantId = account.grantId;
+    for (const [slot, value] of slotKeys) {
+      const secret = await secretService(db).create(companyId, { name: `ai-pool-matrix-${connectionId.slice(0, 8)}-slot-${slot}`, provider: "local_encrypted", value }, { userId: owner });
+      await db.insert(credentialPool).values({ companyId, connectionId, slot, secretRef: secret.id });
+    }
+    // Directly inserted slot rows resolve only once their company-secret
+    // bindings exist (reconnects and metadata edits recreate them).
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connectionId));
+    await syncConnectionCredentialBindings(db, connection);
+    const [inserted] = await db.insert(agents).values([
+      { companyId, name: "Matrix agent A" },
+      { companyId, name: "Matrix agent B" },
+    ]).returning({ id: agents.id });
+    const [second] = await db.select({ id: agents.id }).from(agents).where(and(eq(agents.companyId, companyId), eq(agents.name, "Matrix agent B")));
+    agentA = inserted!.id;
+    agentB = second!.id;
+  }, 60000);
+
+  const connectionRow = async () => {
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connectionId));
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, grantId));
+    return { connection, grant };
+  };
+  const newRun = async (agentId: string) => (await db.insert(heartbeatRuns).values({ companyId, agentId }).returning({ id: heartbeatRuns.id }))[0]!.id;
+  /** Assignment inside a run: pin → sticky → exclusive lease → fast-fail. */
+  const lease = async (runId: string, agentId: string, pinnedSlot?: number) =>
+    service.runtimeCredential(await connectionRow(), { pool: { heartbeatRunId: runId, agentId, pinnedSlot } });
+  const poolRows = async () => (await db.select().from(credentialPool).where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId)))).sort((a, b) => a.slot - b.slot);
+  const resetPool = async () => {
+    await db.update(credentialPool).set({
+      state: "healthy", cooldownUntil: null, cooldownReason: null, enabled: true,
+      activeRunId: null, leaseExpiresAt: null, leaseAgentId: null,
+      lastAssignedAgentId: null, lastAssignedAt: null, updatedAt: new Date(),
+    }).where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId)));
+  };
+
+  afterEach(resetPool);
+
+  it("pins the requested slot unconditionally, warning in the activity log while it cools down", async () => {
+    const before = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, connectionId)));
+    const runId = await newRun(agentA);
+    // Pin bypasses least-recently-used rotation and cooldown state alike.
+    await expect(lease(runId, agentA, 2)).resolves.toMatchObject({ keySlot: 2, value: slotKeys.get(2) });
+    let rows = await poolRows();
+    expect(rows.find((row) => row.slot === 2)).toMatchObject({ activeRunId: runId, leaseAgentId: agentA });
+    expect(rows.find((row) => row.slot === 1)).toMatchObject({ activeRunId: null });
+
+    await resetPool();
+    await db.update(credentialPool).set({ state: "daily_cooldown", cooldownUntil: new Date(Date.now() + 3_600_000), cooldownReason: "daily" })
+      .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, 2)));
+    await expect(lease(runId, agentA, 2)).resolves.toMatchObject({ keySlot: 2 });
+    const after = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, connectionId)));
+    const warns = after.slice(before.length).filter((entry) => entry.action === "ai_connection.key_slot_pin_cooldown");
+    expect(warns).toHaveLength(1);
+    expect(warns[0]!.details).toMatchObject({ slot: 2, state: "daily_cooldown" });
+
+    // A pin the pool cannot honor fails the run instead of silently serving
+    // another account: missing slot and operator-disabled slot alike.
+    await resetPool();
+    await expect(lease(runId, agentA, 9)).rejects.toMatchObject({ details: { code: "ai_connection_pinned_slot_unavailable" } });
+    await db.update(credentialPool).set({ enabled: false }).where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, 1)));
+    await expect(lease(runId, agentA, 1)).rejects.toMatchObject({ details: { code: "ai_connection_pinned_slot_unavailable" } });
+  });
+
+  it("keeps the exclusive lease for the pinned slot and fast-fails when another run holds it", async () => {
+    const holderRun = await newRun(agentA);
+    await expect(lease(holderRun, agentA, 3)).resolves.toMatchObject({ keySlot: 3 });
+    const otherRun = await newRun(agentB);
+    // The concurrency cap (1 active run per slot) is not waived by the pin.
+    await expect(lease(otherRun, agentB, 3)).rejects.toMatchObject({ details: { code: "provider_key_pool_exhausted" } });
+    await expect(lease(otherRun, agentB, 3)).rejects.toThrow(new RegExp(`slot 3: healthy, leased by run ${holderRun} \\(agent ${agentA}\\) until`));
+  });
+
+  it("prefers the sticky slot for the same agent and only switches when it is leased or cooling down", async () => {
+    const firstRun = await newRun(agentA);
+    await expect(lease(firstRun, agentA)).resolves.toMatchObject({ keySlot: 1 });
+    await releaseRunPoolLease(db, firstRun);
+    // Least-recently-used would rotate to slot 2; stickiness keeps the cache
+    // (key = account) on slot 1.
+    const secondRun = await newRun(agentA);
+    await expect(lease(secondRun, agentA)).resolves.toMatchObject({ keySlot: 1 });
+    await releaseRunPoolLease(db, secondRun);
+
+    // Sticky slot in cooldown → the agent moves to the next assignable slot.
+    await db.update(credentialPool).set({ state: "rpm_cooldown", cooldownUntil: new Date(Date.now() + 120_000), cooldownReason: "rpm" })
+      .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, 1)));
+    const thirdRun = await newRun(agentA);
+    await expect(lease(thirdRun, agentA)).resolves.toMatchObject({ keySlot: 2 });
+    await releaseRunPoolLease(db, thirdRun);
+
+    // Sticky slot leased by another run's exclusive lease → move instead.
+    const foreignRun = await newRun(agentB);
+    await db.update(credentialPool).set({ state: "healthy", cooldownUntil: null, cooldownReason: null })
+      .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, 1)));
+    await expect(lease(foreignRun, agentB, 1)).resolves.toMatchObject({ keySlot: 1 });
+    const fourthRun = await newRun(agentA);
+    await expect(lease(fourthRun, agentA)).resolves.toMatchObject({ keySlot: 2 });
+  });
+
+  it("re-resolving within one run lands on the same slot (self-lease is sticky)", async () => {
+    const runId = await newRun(agentA);
+    const first = await lease(runId, agentA);
+    const second = await lease(runId, agentA);
+    expect(second.keySlot).toBe(first.keySlot);
+    expect((await poolRows()).filter((row) => row.activeRunId)).toHaveLength(1);
+  });
+
+  it("hands exclusive leases out least-recently-used first and never double-books a slot under concurrency", async () => {
+    // NULL lastAssignedAt is the most stale; then oldest timestamp first.
+    const now = Date.now();
+    await db.update(credentialPool).set({ lastAssignedAt: new Date(now - 3 * 3_600_000) })
+      .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, 1)));
+    await db.update(credentialPool).set({ lastAssignedAt: new Date(now - 1 * 3_600_000) })
+      .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, 2)));
+    const runIds = [await newRun(agentA), await newRun(agentB), await newRun(agentA)];
+    const agentIds = [agentA, agentB, agentA];
+    // Concurrent claims: the conditional UPDATE re-checks every eligibility
+    // criterion atomically, so each run holds a different slot.
+    const leased = await Promise.all(runIds.map((runId, index) => lease(runId, agentIds[index])));
+    expect(leased.map((resolution) => resolution.keySlot).sort()).toEqual([1, 2, 3]);
+    const rows = await poolRows();
+    expect(rows.map((row) => row.activeRunId).filter(Boolean).sort()).toEqual([...runIds].sort());
+    expect(rows.every((row) => row.leaseExpiresAt && row.leaseExpiresAt > new Date())).toBe(true);
+    // A fourth run finds no free slot: fast-fail with the occupancy snapshot.
+    const lateRun = await newRun(agentB);
+    await expect(lease(lateRun, agentB)).rejects.toMatchObject({ details: { code: "provider_key_pool_exhausted" } });
+  });
+
+  it("reclaims a slot whose lease TTL has expired", async () => {
+    const crashedRun = await newRun(agentA);
+    await expect(lease(crashedRun, agentA, 1)).resolves.toMatchObject({ keySlot: 1 });
+    // The run crashed without reaching its terminal release: the lapsed TTL
+    // makes the slot assignable again even though every other slot is cooling
+    // down, so the expired lease is the only candidate left.
+    await db.update(credentialPool).set({ leaseExpiresAt: new Date(Date.now() - 1_000) })
+      .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, 1)));
+    await db.update(credentialPool).set({ state: "daily_cooldown", cooldownUntil: new Date(Date.now() + 3_600_000), cooldownReason: "daily" })
+      .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, 2)));
+    await db.update(credentialPool).set({ state: "daily_cooldown", cooldownUntil: new Date(Date.now() + 3_600_000), cooldownReason: "daily" })
+      .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, 3)));
+    const nextRun = await newRun(agentB);
+    await expect(lease(nextRun, agentB)).resolves.toMatchObject({ keySlot: 1 });
+    expect((await poolRows()).find((row) => row.slot === 1)).toMatchObject({ activeRunId: nextRun });
+  });
+
+  it("releases the exclusive lease at the run terminal, once per run", async () => {
+    const runId = await newRun(agentA);
+    await expect(lease(runId, agentA, 2)).resolves.toMatchObject({ keySlot: 2 });
+    const before = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, connectionId)));
+    expect(await releaseRunPoolLease(db, runId)).toBe(1);
+    expect(await releaseRunPoolLease(db, runId)).toBe(0); // idempotent by run
+    expect((await poolRows()).find((row) => row.slot === 2)).toMatchObject({ activeRunId: null, leaseExpiresAt: null, leaseAgentId: null });
+    const after = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, connectionId)));
+    const releases = after.slice(before.length).filter((entry) => entry.action === "ai_connection.key_slot_released");
+    expect(releases).toHaveLength(1);
+    expect(releases[0]!.details).toMatchObject({ slot: 2 });
+    // Sticky anchor survives the release for the next assignment.
+    expect((await poolRows()).find((row) => row.slot === 2)).toMatchObject({ lastAssignedAgentId: agentA });
+    // The freed slot is immediately assignable to a different agent.
+    const nextRun = await newRun(agentB);
+    await expect(lease(nextRun, agentB, 2)).resolves.toMatchObject({ keySlot: 2 });
   });
 });
 

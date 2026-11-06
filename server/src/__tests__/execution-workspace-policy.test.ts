@@ -27,6 +27,14 @@ describe("execution workspace policy helpers", () => {
     expect(parseIssueAssigneeAdapterOverrides({ adapterConfig: { homeMode: "preconfigured", model: "task-model" } }))
       .toEqual({ adapterConfig: { model: "task-model" }, useProjectWorkspace: null });
   });
+  it("surfaces a task key-slot pin only when the task pins a slot", () => {
+    expect(parseIssueAssigneeAdapterOverrides({ keySlot: 3, useProjectWorkspace: true }))
+      .toEqual({ adapterConfig: null, keySlot: 3, useProjectWorkspace: true });
+    // An invalid pin is dropped, not propagated: a pin-only override parses to
+    // no overrides at all.
+    expect(parseIssueAssigneeAdapterOverrides({ keySlot: 0 })).toBeNull();
+    expect(parseIssueAssigneeAdapterOverrides({ keySlot: 1.5 })).toBeNull();
+  });
   it("defaults new issue settings from enabled project policy", () => {
     expect(
       defaultIssueExecutionWorkspaceSettingsForProject({

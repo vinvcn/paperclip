@@ -410,6 +410,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const attribution = { connectionId: randomUUID(), grantId: randomUUID(), provider, method, mode: "responsible_user" as const, responsibleUserId: "task-owner" };
     input.config.managedAiRuntime = {
       sessionIdentity: "fixture-grant:task-owner:epoch-1",
+      keySlot: null,
       config: { env: {}, managedAiConnection: { ...attribution, identity: "fixture-grant:task-owner:generation-1", sessionIdentity: "fixture-grant:task-owner:epoch-1" } },
       attribution,
       accountName: "Saved account",
@@ -438,7 +439,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       effectiveCapabilities: { reusableLeases: true } as never, runnerLifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 } };
     const attribution = { connectionId: randomUUID(), grantId: randomUUID(), provider: "anthropic" as const, method,
       mode: "responsible_user" as const, responsibleUserId: "task-owner" };
-    input.config.managedAiRuntime = { sessionIdentity: "account:epoch-1", identity: "account:generation-1",
+    input.config.managedAiRuntime = { sessionIdentity: "account:epoch-1", keySlot: null, identity: "account:generation-1",
       config: { env: {}, managedAiConnection: { ...attribution, identity: "account:generation-1", sessionIdentity: "account:epoch-1" } },
       attribution, accountName: "Saved account", accountOwnerUserId: "task-owner", home: instructionRoot, cleanup: async () => {} };
     const selected = await selectHeartbeatRuntime(db, input);

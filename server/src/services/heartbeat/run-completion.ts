@@ -1,4 +1,5 @@
 import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
+import { releaseRunPoolLease } from "../ai-credential-pool.js";
 import { allocateRunCosts, sweepRunUsageRequestLogEvents } from "../usage-request-logs.js";
 import { nativeTaskSessionPublicationHandled } from "../native-runtime/native-task-session-publication.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
@@ -59,6 +60,17 @@ type Agent = typeof agents.$inferSelect;
 type RunState = ReturnType<typeof createHeartbeatRunState>;
 type IssueContext = Awaited<ReturnType<ReturnType<typeof createHeartbeatRunPreparation>["getIssueExecutionContext"]>> | null;
 type TaskSession = Awaited<ReturnType<RunState["getTaskSession"]>> | null;
+
+/** Every terminal settlement frees the run's exclusive key-pool lease. The
+ * conditional release is a no-op for runs without one; a crashed run that
+ * never settles here is reclaimed by the lease TTL instead. */
+async function releaseKeyPoolLease(db: Db, runId: string) {
+  try {
+    await releaseRunPoolLease(db, runId);
+  } catch (error) {
+    logger.warn({ err: error, runId }, "Key pool lease release failed; the lease TTL reclaims the slot");
+  }
+}
 
 /** Completion persists terminal outcomes; the executor retains dispatch and cleanup ownership. */
 export interface HeartbeatRunCompletionDependencies extends Pick<RunState,
@@ -704,6 +716,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       finalRunPatch,
       { adapterErrorMeta: adapterResult.errorMeta, secretValues: readFailureReportSecrets() },
     ));
+    await releaseKeyPoolLease(db, run.id);
     let persistedRun: typeof heartbeatRuns.$inferSelect | null =
       persistedRunWrite.run;
     if (!persistedRunWrite.updated) {
@@ -1216,6 +1229,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       logSha256: logSummary?.sha256,
       logCompressed: logSummary?.compressed ?? false,
     }, { error: err, phase: "execute", secretValues: readFailureReportSecrets() }));
+    await releaseKeyPoolLease(db, run.id);
     if (
       !failedRunWrite.updated &&
       !(
@@ -1457,6 +1471,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           ? { resultJson: setupFailureResultJson }
           : {}),
     }, { error: outerErr, phase: "setup", secretValues: readFailureReportSecrets() }).catch(() => ({ run: null, updated: false as const }));
+    await releaseKeyPoolLease(db, runId);
     if (!setupFailureWrite.updated) {
       logger.info(
         {

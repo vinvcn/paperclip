@@ -1,4 +1,5 @@
 import { CHAT_PROVIDERS } from "../types/chat-channels.js";
+import { aiConnectionKeySlotPinSchema } from "../ai-connections.js";
 import { taskWorkspaceSelectionSchema } from "./task-workspace.js";
 import { z } from "zod";
 import { ISSUE_SUMMARIES_MAX_IDS } from "../constants.js";
@@ -311,6 +312,9 @@ export const issueAssigneeAdapterOverridesSchema = z
       .refine(config => !config.env || typeof config.env !== "object" || !Object.keys(config.env).some(key => key.toUpperCase() === "PAPERCLIP_RUNNER_PREPARED_HARNESS_HOME"), "Prepared harness homes must be provisioned by the execution environment, not on a task")
       .refine(config => !config.env || typeof config.env !== "object" || !Object.keys(config.env).some(key => ["BASH_ENV", "ZDOTDIR", "GH_CONFIG_DIR", "PAPERCLIP_GITHUB_LAUNCHER_DIR"].includes(key.toUpperCase())), "Managed shell helpers must be provisioned by the execution environment, not on a task")
       .optional(),
+    // Task-level key-slot pin for pooled credential connections. Wins over the
+    // agent's adapterConfig.keySlot; null/omitted keeps the agent pin.
+    keySlot: aiConnectionKeySlotPinSchema.optional(),
     useProjectWorkspace: z.boolean().optional(),
   })
   .strict();
