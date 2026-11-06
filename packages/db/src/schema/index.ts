@@ -277,3 +277,4 @@ export { userWorkspacePreferences } from "./user_workspace_preferences.js";
 export { issueThreadInteractionIdempotencyKeys } from "./issue_thread_interaction_idempotency_keys.js";
 
 export * from "./credential_pool.js";
+export * from "./credential_pool_cooldowns.js";

@@ -2969,6 +2969,13 @@
       "when": 1793962853303,
       "tag": "0425_brainy_sprite",
       "breakpoints": true
+    },
+    {
+      "idx": 426,
+      "version": "7",
+      "when": 1793974777232,
+      "tag": "0426_hesitant_hawkeye",
+      "breakpoints": true
     }
   ]
 }
