@@ -1,0 +1,1 @@
+ALTER TABLE "credential_pool" ADD COLUMN "last_assigned_at" timestamp with time zone;
