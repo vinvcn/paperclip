@@ -2,7 +2,7 @@ import { createNativeUsageDelivery } from "../native-runtime/native-usage-delive
 import type { PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { agents, agentWakeupRequests, caseHandoffs, cases, companies, costEvents, createDb, credentialPool, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, toolApplications, toolConnections, usageRequestLogs, activityLog, companySecrets } from "@paperclipai/db";
+import { agents, agentWakeupRequests, caseHandoffs, cases, companies, costEvents, createDb, credentialPool, credentialPoolCooldowns, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, toolApplications, toolConnections, usageRequestLogs, activityLog, companySecrets } from "@paperclipai/db";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -15,7 +15,7 @@ import { LegacyControllerLeaseLostError } from "../legacy-controller-lease.js";
 import { requestedRunCancellation } from "../run-cancellation.js";
 import { ProjectAccessDeniedError } from "../project-access-denial.js";
 import { createHeartbeatLifecycle, type HeartbeatLifecycleDependencies } from "./run-lifecycle.js";
-import { createHeartbeatRunPreparation, ConfigurationIncompleteFailure } from "./run-preparation.js";
+import { createHeartbeatRunPreparation, ConfigurationIncompleteFailure, KeyPoolExhaustedFailure } from "./run-preparation.js";
 import { createHeartbeatRunState, getAdapterSessionCodec } from "./run-state.js";
 import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
 import { createHeartbeatRunCompletion, type CompleteHeartbeatRunInput, type FailHeartbeatRunInput, type HeartbeatRunCompletionDependencies } from "./run-completion.js";
@@ -541,5 +541,66 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     ));
     expect(releases).toHaveLength(1);
     expect(releases[0]).toMatchObject({ entityType: "tool_connection", entityId: connection.id, runId: f.run.id, details: { slot: 1 } });
+  });
+
+  // Ticket 05: a run whose latest provider request was a 429 fails as
+  // `provider_rate_limited` with the (slot, model) cooldown snapshot persisted
+  // for the failure marker; the key value itself is never recorded anywhere.
+  async function pooledRunFixture(runId: string, companyId: string) {
+    const [application] = await db.insert(toolApplications).values({ companyId, name: "Key pool app", type: "rest_api" }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId, applicationId: application.id, name: "Pooled NIM gateway", uid: `pooled-gateway-${runId.slice(0, 8)}`,
+      connectionPurpose: "ai", transport: "runtime_auth",
+    }).returning();
+    return connection;
+  }
+
+  async function insertUsageRow(runId: string, companyId: string, httpStatus: number, model: string, metadata: Record<string, unknown> | null) {
+    await db.insert(usageRequestLogs).values({
+      companyId, runId, app: "opencode", provider: "paperclip", biller: "paperclip", model,
+      httpStatus, requestId: randomUUID(), occurredAt: new Date(Date.now() - 5_000), metadata,
+    });
+  }
+
+  it("classifies a run-internal 429 terminal as provider_rate_limited with the pool snapshot", async () => {
+    const f = await fixture();
+    const connection = await pooledRunFixture(f.run.id, f.run.companyId);
+    const cooldownUntil = new Date(Date.now() + 90_000);
+    await db.insert(credentialPoolCooldowns).values({
+      companyId: f.run.companyId, connectionId: connection.id, slot: 3, model: "z-ai/glm-5.3-flash",
+      state: "rpm_cooldown", cooldownUntil, cooldownReason: "rpm", lastRunId: f.run.id,
+    });
+    // The run's latest gateway request is the 429 on (slot 3, model), prefixed
+    // as the managed capture sink records it.
+    await insertUsageRow(f.run.id, f.run.companyId, 429, "paperclip/z-ai/glm-5.3-flash",
+      { keySlot: 3, connectionId: connection.id });
+    f.input.adapterResult = { exitCode: 1, signal: null, timedOut: false, errorMessage: "Native session failed", resultJson: {} };
+    await f.completion.completeRun(f.input);
+    const failed = await read(f.run.id);
+    expect(failed).toMatchObject({ status: "failed", errorCode: "provider_rate_limited" });
+    expect((failed.resultJson as Record<string, unknown>).keyPoolFailure).toMatchObject({
+      reason: "rate_limited", slot: 3, model: "z-ai/glm-5.3-flash", state: "rpm_cooldown", connectionId: connection.id,
+    });
+  });
+
+  it("keeps a generic adapter failure when the run's latest request did not 429", async () => {
+    const f = await fixture();
+    await insertUsageRow(f.run.id, f.run.companyId, 200, "test-model", null);
+    f.input.adapterResult = { exitCode: 1, signal: null, timedOut: false, errorMessage: "Adapter crashed", resultJson: {} };
+    await f.completion.completeRun(f.input);
+    expect(await read(f.run.id)).toMatchObject({ status: "failed", errorCode: "adapter_failed" });
+    expect(((await read(f.run.id)).resultJson as Record<string, unknown>).keyPoolFailure).toBeUndefined();
+  });
+
+  it("records assignment-time key pool exhaustion with its dedicated code and snapshot", async () => {
+    const f = await fixture();
+    await f.completion.failRunSetup(f.setup(new KeyPoolExhaustedFailure(
+      "No key slot of this connection's pool is available (slot 1: leased by run x)",
+      { keyPoolFailure: { reason: "pool_exhausted", slots: [{ slot: 1, state: "healthy", model: null, cooldownUntil: null,
+        leasedByRunId: "run-x", leasedByAgentId: null, leasedByAgentName: null }] } },
+    )));
+    expect(await read(f.run.id)).toMatchObject({ status: "failed", errorCode: "provider_key_pool_exhausted",
+      error: "No key slot of this connection's pool is available (slot 1: leased by run x)",
+      resultJson: { keyPoolFailure: { reason: "pool_exhausted", slots: [{ slot: 1 }] }, executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } });
   });
 });

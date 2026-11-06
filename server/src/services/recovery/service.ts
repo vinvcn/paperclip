@@ -555,6 +555,11 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "low_trust_boundary_mismatch",
   "low_trust_requires_sandbox_environment",
   "low_trust_runtime_services_denied",
+  // Key-pool failures (ticket 05) are not infrastructure noise: the pool
+  // switches slots at the next assignment, and generic continuation retries
+  // would re-enter the same wall without a slot change.
+  "provider_rate_limited",
+  "provider_key_pool_exhausted",
 ]);
 
 // A continuation cancelled with this code is a *deliberate wait* (the latest run

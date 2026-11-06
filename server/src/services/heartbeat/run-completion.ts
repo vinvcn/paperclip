@@ -1,5 +1,5 @@
 import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
-import { releaseRunPoolLease } from "../ai-credential-pool.js";
+import { classifyRunRateLimitFailure, releaseRunPoolLease } from "../ai-credential-pool.js";
 import { allocateRunCosts, sweepRunUsageRequestLogEvents } from "../usage-request-logs.js";
 import { nativeTaskSessionPublicationHandled } from "../native-runtime/native-task-session-publication.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
@@ -11,7 +11,7 @@ import { ChatControlRecoveryUnresolvedError } from "./queue.js";
 import { readTransientRecoveryContractFromRun, readHeartbeatRunErrorFamily, isTransientWorkspaceGitScanCode } from "./retries.js";
 import { type RunSessionOutcome, resolveNextSessionState, normalizeUsageTotals, resolveCacheAdjustedCostUsd, resolveLedgerBiller, resolveLedgerCostStatus, normalizeLedgerBillingType } from "./run-state.js";
 import { readGitConnectionFailure } from "../git-connection-failure.js";
-import { CONFIGURATION_INCOMPLETE_FAILURE_CODE, ConfigurationIncompleteFailure } from "./run-preparation.js";
+import { CONFIGURATION_INCOMPLETE_FAILURE_CODE, ConfigurationIncompleteFailure, isKeyPoolExhaustedFailure } from "./run-preparation.js";
 import { isWorkspaceValidationFailedRun, isWorkspaceValidationFailure, attachPaperclipSessionMetadataToSessionParams } from "./workspaces.js";
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
 import { cancellationResultJson, controllerLeaseLossCancellation, readRunCancellation } from "../run-cancellation.js";
@@ -498,16 +498,6 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
             );
     const recordedResponsibleUserDenialCode =
       normalizeResponsibleUserDenialCode(latestRun?.errorCode);
-    const runErrorCode =
-      outcome === "timed_out"
-        ? "timeout"
-        : outcome === "cancelled"
-          ? (latestRun?.errorCode ?? "cancelled")
-          : outcome === "failed"
-            ? (adapterResult.errorCode ??
-              recordedResponsibleUserDenialCode ??
-              "adapter_failed")
-            : null;
 
     async function persistSessionState(finalizedRun: Run) {
       await updateRuntimeState(
@@ -596,6 +586,30 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       );
     }
 
+    // The sweep above is the last writer of this run's usage request rows, so
+    // the terminal classification waits for it (ticket 05): a run whose latest
+    // gateway request is the 429 the driver forwarded fails as
+    // `provider_rate_limited` with the pool snapshot the failure marker
+    // renders, instead of a generic adapter failure.
+    const rateLimitFailure =
+      outcome === "failed"
+        ? await classifyRunRateLimitFailure(db, {
+            companyId: run.companyId,
+            runId: run.id,
+          }).catch(() => null)
+        : null;
+    const runErrorCode =
+      outcome === "timed_out"
+        ? "timeout"
+        : outcome === "cancelled"
+          ? (latestRun?.errorCode ?? "cancelled")
+          : outcome === "failed"
+            ? (adapterResult.errorCode ??
+              recordedResponsibleUserDenialCode ??
+              rateLimitFailure?.errorCode ??
+              "adapter_failed")
+            : null;
+
     const status =
       outcome === "succeeded"
         ? "succeeded"
@@ -677,6 +691,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
             ...parseObject(adapterResult.resultJson),
             ...(adapterResult.executionRecovery
               ? { executionRecovery: adapterResult.executionRecovery }
+              : {}),
+            ...(rateLimitFailure
+              ? { keyPoolFailure: rateLimitFailure.snapshot }
               : {}),
             ...(outcome === "cancelled" ? controllerLeaseLossResultJson(signal) : {}),
             configFreshness: configFreshnessResultMetadata,
@@ -1161,12 +1178,39 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           : null;
       })
       .catch(() => null);
+    // failRun settles a throw from the adapter try block, so most of the run's
+    // usage request rows are already durable — but a provider_request that
+    // committed to the durable log after the executor's live consumer stopped
+    // is only persisted by the same sweep the completion path runs. Sweep
+    // here too (idempotent per request id), then classify a terminal 429 the
+    // same way the completion path does (ticket 05). A stop that lands during
+    // the failure settles as a cancellation, not a rate-limited terminal.
+    try {
+      await sweepRunUsageRequestLogEvents(db, {
+        companyId: run.companyId,
+        runId: run.id,
+        agentId: run.agentId,
+        issueId,
+      });
+    } catch (error) {
+      logger.warn(
+        { error, runId: run.id },
+        "usage request log sweep failed without affecting run outcome",
+      );
+    }
+    const rateLimitFailure = signal.aborted
+      ? null
+      : await classifyRunRateLimitFailure(db, {
+          companyId: run.companyId,
+          runId: run.id,
+        }).catch(() => null);
     const failureErrorCode =
       workspaceValidationFailure?.code ??
       configurationIncompleteFailure?.code ??
       nonRetryablePreflightFailureCode(err) ??
       recordedResponsibleUserDenialCode ??
       nativeTerminalFailureCode ??
+      rateLimitFailure?.errorCode ??
       "adapter_failed";
     logger.error({ err: identityRedactor.redact({ message: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined }), runId }, "heartbeat execution failed");
 
@@ -1212,6 +1256,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           ...(workspaceValidationFailure?.resultJson ??
             configurationIncompleteFailure?.resultJson ??
             {}),
+          ...(rateLimitFailure
+            ? { keyPoolFailure: rateLimitFailure.snapshot }
+            : {}),
           ...(stoppedDuringFailure ? controllerLeaseLossResultJson(signal) : {}),
           ...(!legacyAdapterEntered && run.runtimeMode !== "native"
             ? {
@@ -1396,6 +1443,12 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       );
     const nonRetryablePreflightCode =
       nonRetryablePreflightFailureCode(outerErr);
+    // Assignment-time pool exhaustion (ticket 05) arrives as the typed
+    // failure from the execution-configuration catch, carrying the pool
+    // snapshot the failure marker renders.
+    const keyPoolExhaustedSetupFailure = isKeyPoolExhaustedFailure(outerErr)
+      ? outerErr
+      : null;
     const workspaceGitScanFailure = isWorkspaceGitScanError(outerErr) ? outerErr : null;
     const setupFailureErrorCode =
       (controllerLeaseLost ? CONTROLLER_LEASE_LOST_FAILURE_CODE : null) ??
@@ -1406,6 +1459,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       sandboxProviderPluginNotReadySetupFailure
         ? CONFIGURATION_INCOMPLETE_FAILURE_CODE
         : null) ??
+      keyPoolExhaustedSetupFailure?.code ??
       recordedResponsibleUserDenialCode ??
       nonRetryablePreflightCode ??
       "setup_failed";
@@ -1429,6 +1483,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       } : null) ??
       workspaceValidationSetupFailure?.resultJson ??
       configurationIncompleteSetupFailure?.resultJson ??
+      keyPoolExhaustedSetupFailure?.resultJson ??
       (unresolvedBaseRefSetupFailure
         ? buildUnresolvedWorkspaceBaseRefResultJson(
             run,

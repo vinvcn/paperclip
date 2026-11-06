@@ -58,4 +58,40 @@ describe("ordinary task interruption", () => {
     expect(container.querySelector('[role="alert"]')?.textContent).toContain("Your task access changed.");
     expect(container.querySelectorAll("button")).toHaveLength(1);
   });
+
+  // Ticket 05 (demo): pooled-key failures surface the pool snapshot inline
+  // without a retry action yet.
+  it("renders the rate_limited pool snapshot without a retry action", async () => {
+    await render({
+      ...failed, responsibility: "user", state: "waiting_for_user", userAction: "rate_limited",
+      keyPool: { reason: "rate_limited", slot: 3, model: "z-ai/glm-5.3-flash", state: "rpm_cooldown",
+        cooldownUntil: null, connectionId: "conn-1" },
+    });
+    expect(container.textContent).toContain("key 3 × z-ai/glm-5.3-flash hit the RPM rate limit. The next retry automatically switches to another key slot.");
+    expect(container.querySelector("button")).toBeNull();
+  });
+
+  it("renders the exhausted-pool occupancy copy for pool_exhausted snapshots", async () => {
+    await render({
+      ...failed, responsibility: "user", state: "waiting_for_user", userAction: "rate_limited",
+      keyPool: { reason: "pool_exhausted", slots: [{ slot: 5, state: "healthy", model: null, cooldownUntil: null,
+        leasedByRunId: "run-x", leasedByAgentId: null, leasedByAgentName: "Chief" }] },
+    });
+    expect(container.textContent).toContain("key 5 is in use by agent Chief");
+    expect(container.querySelector("button")).toBeNull();
+  });
+
+  it("degrades the rate_limited banner to the generic sentence without a snapshot", async () => {
+    await render({ ...failed, responsibility: "user", state: "waiting_for_user", userAction: "rate_limited" });
+    expect(container.textContent).toContain("rate limited this run");
+    expect(container.querySelector("button")).toBeNull();
+  });
+
+  it("hides the rate_limited banner while an attempt is optimistic or taking longer", async () => {
+    const rateLimited = { ...failed, responsibility: "user" as const, state: "waiting_for_user" as const, userAction: "rate_limited" as const };
+    await render(rateLimited, { optimistic: true });
+    expect(container.textContent).toBe("");
+    await render(rateLimited, { takingLonger: true });
+    expect(container.textContent).toContain("Taking longer than usual…");
+  });
 });

@@ -147,6 +147,54 @@ const MAX_AGENT_SESSION_MESSAGE_CHARS = 12_000;
 
 export const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
 
+// Pre-dispatch gate outcome: the connection's key pool cannot serve the run
+// (every slot leased, cooling or disabled). Surfaced with its own errorCode so
+// the presentation shows the pool snapshot instead of a configuration gap; the
+// recovery path must not immediately re-dispatch into the same wall (the pool
+// switches slots, or the operator fixes the pool).
+export const KEY_POOL_EXHAUSTED_FAILURE_CODE = "provider_key_pool_exhausted";
+
+export class KeyPoolExhaustedFailure extends Error {
+  code = KEY_POOL_EXHAUSTED_FAILURE_CODE;
+  resultJson: Record<string, unknown>;
+
+  constructor(message: string, resultJson: Record<string, unknown>) {
+    super(message);
+    this.name = "KeyPoolExhaustedFailure";
+    this.resultJson = resultJson;
+  }
+}
+
+export function isKeyPoolExhaustedFailure(error: unknown): error is KeyPoolExhaustedFailure {
+  return error instanceof KeyPoolExhaustedFailure;
+}
+
+// Assignment-time pool exhaustion arrives here as the pool service's
+// HttpError(422, code) with the pool snapshot in its details (ticket 02).
+// Convert it to the typed failure so the setup settlement records the
+// dedicated errorCode plus the snapshot, instead of a configuration-incomplete
+// blocker routed at the connection settings. Returns null for anything else.
+export function keyPoolExhaustedFailureFromHttpError(error: unknown): KeyPoolExhaustedFailure | null {
+  if (!(error instanceof HttpError) || error.status !== 422) return null;
+  const details = parseObject(error.details);
+  if (details.code !== KEY_POOL_EXHAUSTED_FAILURE_CODE) return null;
+  return new KeyPoolExhaustedFailure(
+    error instanceof Error ? error.message : "The connection's key pool cannot serve this run",
+    {
+      keyPoolFailure: {
+        reason: "pool_exhausted",
+        ...(typeof details.connectionId === "string" && details.connectionId
+          ? { connectionId: details.connectionId }
+          : {}),
+        ...(typeof details.model === "string" && details.model
+          ? { model: details.model }
+          : {}),
+        slots: Array.isArray(details.pool) ? details.pool : [],
+      },
+    },
+  );
+}
+
 // Pre-dispatch gate outcome: required secret/env bindings are missing, so the
 // run must not be dispatched. Surfaced as a configuration-incomplete blocker
 // routed to a human owner instead of N opaque dispatched-then-failed runs.

@@ -2186,6 +2186,83 @@ describe("TaskChatThread runtime transcript selection", () => {
     expect(onRetryFailedRun).toHaveBeenCalledWith("native-usage-limit");
   });
 
+  // Ticket 05: pooled-key failures render the dedicated marker label plus the
+  // pool snapshot copy, with no retry button (the recovery actions arrive
+  // with the follow-up ticket).
+  it("renders the rate-limited marker with the live pool snapshot and no retry", async () => {
+    const onRetryFailedRun = vi.fn();
+    renderThread({
+      comments: [],
+      onAdd: async () => {},
+      issueStatus: "blocked",
+      onRetryFailedRun,
+      interruption: {
+        intentId: null, responsibility: "user", state: "waiting_for_user", nextRetryAt: null,
+        canRetry: false, userAction: "rate_limited", sourceRunIds: ["native-rate-limited"], observedRunId: "native-rate-limited",
+        keyPool: { reason: "rate_limited", slot: 3, model: "z-ai/glm-5.3-flash", state: "rpm_cooldown",
+          cooldownUntil: null, connectionId: "conn-1" },
+      },
+      linkedRuns: [{
+        runId: "native-rate-limited", runtimeMode: "native", status: "failed", errorCode: "provider_rate_limited",
+        agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner",
+        createdAt: "2026-08-25T18:00:00.000Z", startedAt: "2026-08-25T18:00:00.000Z",
+        finishedAt: "2026-08-25T18:00:02.000Z",
+        resultJson: { keyPoolFailure: { reason: "rate_limited", slot: 3, model: "z-ai/glm-5.3-flash", state: "rpm_cooldown" } },
+      }],
+    });
+    const marker = container.querySelector('[data-testid="task-chat-collapsible-marker"]');
+    expect(marker?.textContent).toContain("Rate limited");
+    expect(marker?.textContent).not.toContain("Run failed");
+    const disclosure = marker?.querySelector<HTMLButtonElement>('button[aria-expanded="false"]');
+    expect(disclosure).not.toBeNull();
+    flushSync(() => disclosure!.click());
+    const details = container.querySelector('[data-testid="task-chat-collapsible-marker-details"]');
+    expect(details?.textContent).toContain(
+      "key 3 × z-ai/glm-5.3-flash hit the RPM rate limit. The next retry automatically switches to another key slot.",
+    );
+    expect(details?.textContent).not.toContain("provider_rate_limited");
+    expect(container.querySelector('[data-testid="task-chat-run-failed-try-again"]')).toBeNull();
+  });
+
+  it("falls back to the run's persisted snapshot when the interruption points elsewhere", () => {
+    renderThread({
+      comments: [],
+      onAdd: async () => {},
+      issueStatus: "blocked",
+      onRetryFailedRun: vi.fn(),
+      linkedRuns: [{
+        runId: "legacy-rate-limited", runtimeMode: "legacy", status: "failed", errorCode: "provider_rate_limited",
+        agentId: "agent-1", agentName: "Runner", adapterType: "process",
+        createdAt: "2026-08-25T18:00:00.000Z", startedAt: "2026-08-25T18:00:00.000Z",
+        finishedAt: "2026-08-25T18:00:02.000Z",
+        resultJson: { keyPoolFailure: { reason: "rate_limited", slot: 2, model: "z-ai/glm-5.3-flash", state: "rpm_cooldown" } },
+      }],
+    });
+    expect(container.textContent).toContain("Rate limited");
+    expect(container.textContent).toContain("key 2 × z-ai/glm-5.3-flash hit the RPM rate limit");
+    expect(container.querySelector('[data-testid="task-chat-run-failed-try-again"]')).toBeNull();
+  });
+
+  it("renders the pool-exhausted marker with the occupancy summary and no retry", () => {
+    renderThread({
+      comments: [],
+      onAdd: async () => {},
+      issueStatus: "blocked",
+      onRetryFailedRun: vi.fn(),
+      linkedRuns: [{
+        runId: "setup-exhausted", runtimeMode: "legacy", status: "failed", errorCode: "provider_key_pool_exhausted",
+        agentId: "agent-1", agentName: "Runner", adapterType: "process",
+        createdAt: "2026-08-25T18:00:00.000Z", startedAt: "2026-08-25T18:00:00.000Z",
+        finishedAt: "2026-08-25T18:00:02.000Z",
+        resultJson: { keyPoolFailure: { reason: "pool_exhausted", slots: [{ slot: 1, state: "healthy", model: null,
+          cooldownUntil: null, leasedByRunId: "run-x", leasedByAgentId: null, leasedByAgentName: "Chief" }] } },
+      }],
+    });
+    expect(container.textContent).toContain("Key pool exhausted");
+    expect(container.textContent).toContain("key 1 is in use by agent Chief");
+    expect(container.querySelector('[data-testid="task-chat-run-failed-try-again"]')).toBeNull();
+  });
+
   it("explains a legacy run prevented from starting by a reconciliation hold", () => {
     renderThread({
       comments: [],

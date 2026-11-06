@@ -9,6 +9,7 @@ import { readSystemRecovery } from "./system-recovery-state.js";
 import { PROJECT_ACCESS_DENIED } from "./project-access-denial.js";
 import { authorizationService } from "./authorization.js";
 import { taskWorkspaceProjectRequirements } from "./task-workspace-access.js";
+import { runKeyPoolFailureSnapshot } from "./ai-credential-pool.js";
 
 type ProjectionIssue = Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" | "assigneeAgentId" | "projectId">;
 type ProjectionRun = Pick<typeof heartbeatRuns.$inferSelect,
@@ -51,6 +52,7 @@ export function projectTaskInterruption(issue: ProjectionIssue, input: Projectio
   const userAction = !issue.assigneeAgentId ? "assign_agent" : input.approval || run.errorCode === "native_provider_approval_required" ? "approval"
     : isAiAuthenticationBlocked(run) ? "reconnect"
       : run.errorCode === "native_provider_model_rejected" ? "choose_model"
+      : run.errorCode === "provider_rate_limited" || run.errorCode === "provider_key_pool_exhausted" ? "rate_limited"
       : [agent?.pauseReason, project?.pauseReason, company?.pauseReason].some(reason => reason === "budget" || reason === "budget_exceeded")
         ? "budget" : input.paused || project?.pausedAt || agent?.status === "paused" || company?.status === "paused" ? "resume" : null;
   if (userAction) return { ...base, responsibility: "user", state: "waiting_for_user", userAction };
@@ -110,7 +112,8 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         and ${heartbeatRuns.error} = 'Project is outside this low-trust boundary.' then ${heartbeatRuns.error} else null end`,
       errorCode: heartbeatRuns.errorCode, livenessState: heartbeatRuns.livenessState, scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
       resultJson: sql<Record<string, unknown>>`jsonb_build_object('configurationIncomplete', ${heartbeatRuns.resultJson}->'configurationIncomplete',
-        'projectAccessDenied', ${heartbeatRuns.resultJson}->'projectAccessDenied')`,
+        'projectAccessDenied', ${heartbeatRuns.resultJson}->'projectAccessDenied',
+        'keyPoolFailure', ${heartbeatRuns.resultJson}->'keyPoolFailure')`,
     }).from(requested).innerJoinLateral(latestRuns, sql`true`).innerJoin(heartbeatRuns, and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, latestRuns.id)))
       .leftJoin(agents, and(eq(agents.companyId, heartbeatRuns.companyId), eq(agents.id, heartbeatRuns.agentId)))
       .orderBy(requestedIssueId),
@@ -180,6 +183,15 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     });
     result.set(issue.id, presentation);
     const run = runMap.get(issue.id);
+    if (presentation?.userAction === "rate_limited" && run) {
+      // Live pool state beats the snapshot frozen at failure time; the
+      // persisted snapshot is the fallback once nothing is leasing anymore.
+      const keyPool = await runKeyPoolFailureSnapshot(db, {
+        companyId, runId: run.id, errorCode: run.errorCode,
+        persisted: run.resultJson?.keyPoolFailure,
+      });
+      if (keyPool) presentation.keyPool = keyPool;
+    }
     const runStatus = HEARTBEAT_RUN_STATUSES.find(status => status === run?.status);
     if (presentation?.responsibility === "system" && presentation.state === "failed" && run && runStatus) {
       captureTaskInterruptionFailure({ companyId, taskId: issue.id, agentId: run.agentId,

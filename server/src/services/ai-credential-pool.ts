@@ -1,14 +1,18 @@
-import { and, asc, eq, gt, gte, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, gte, desc, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
-import type {
-  AiConnectionKeySlot,
-  AiConnectionKeySlotCreate,
-  AiConnectionKeySlotList,
-  AiConnectionKeySlotUpdate,
-  CredentialPoolSlotState,
+import {
+  type AiConnectionKeySlot,
+  type AiConnectionKeySlotCreate,
+  type AiConnectionKeySlotList,
+  type AiConnectionKeySlotUpdate,
+  type CredentialPoolSlotState,
+  type KeyPoolFailureSlotView,
+  type KeyPoolFailureSnapshot,
+  readKeyPoolFailureSnapshot,
 } from "@paperclipai/shared";
 import {
   type Db,
+  agents,
   companySecretBindings,
   companySecrets,
   credentialPool,
@@ -125,7 +129,64 @@ function slotDisplayState(
   return cooldown && slotCooldownActive(cooldown, now) ? cooldown.state : "healthy";
 }
 
-function poolExhaustedError(rows: PoolSlotRow[], cooldownBySlot: Map<number, PoolCooldownRow>, now: Date): HttpError {
+/** Structured per-slot display for failure presentation (shared contract). */
+function poolSlotFailureViews(
+  rows: PoolSlotRow[],
+  cooldownBySlot: Map<number, PoolCooldownRow>,
+  now: Date,
+  agentNames: Map<string, string> = new Map(),
+): KeyPoolFailureSlotView[] {
+  return rows.map((row) => {
+    const cooldown = cooldownBySlot.get(row.slot);
+    const active = cooldown && slotCooldownActive(cooldown, now) ? cooldown : null;
+    return {
+      slot: row.slot,
+      state: (!row.enabled ? "disabled" : active ? active.state : "healthy") as KeyPoolFailureSlotView["state"],
+      model: active?.model ?? null,
+      cooldownUntil: active?.cooldownUntil?.toISOString() ?? null,
+      leasedByRunId: row.activeRunId,
+      leasedByAgentId: row.leaseAgentId,
+      leasedByAgentName: row.leaseAgentId ? agentNames.get(row.leaseAgentId) ?? null : null,
+    };
+  });
+}
+
+/** The lease holder's agent name keeps the exhaustion copy readable ("key 5 is
+ * in use by agent Chief"); unresolved names degrade to the raw id rendering. */
+async function poolLeaseAgentNames(db: Db, companyId: string, agentIds: (string | null)[]): Promise<Map<string, string>> {
+  const ids = [...new Set(agentIds.filter((id): id is string => Boolean(id)))];
+  if (!ids.length) return new Map();
+  const rows = await db.select({ id: agents.id, name: agents.name }).from(agents)
+    .where(and(eq(agents.companyId, companyId), inArray(agents.id, ids)));
+  return new Map(rows.map((row) => [row.id, row.name]));
+}
+
+async function poolExhaustedError(
+  db: Db,
+  companyId: string,
+  connectionId: string,
+  modelKey: string | null,
+  now: Date,
+): Promise<HttpError> {
+  // Fresh read at failure time: leases and cooldowns may have changed since
+  // the matrix pre-screened these rows.
+  const rows = await db
+    .select()
+    .from(credentialPool)
+    .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId)))
+    .orderBy(asc(credentialPool.slot));
+  const cooldowns = modelKey
+    ? await db
+      .select()
+      .from(credentialPoolCooldowns)
+      .where(and(
+        eq(credentialPoolCooldowns.companyId, companyId),
+        eq(credentialPoolCooldowns.connectionId, connectionId),
+        eq(credentialPoolCooldowns.model, modelKey),
+      ))
+    : [];
+  const cooldownBySlot = new Map(cooldowns.map((row) => [row.slot, row]));
+  const agentNames = await poolLeaseAgentNames(db, companyId, rows.map((row) => row.leaseAgentId));
   // Snapshot for the operator: who occupies each slot and when it recovers
   // (lease expiry or cooldown end). Never a key value.
   const summary = rows.map((row) => {
@@ -142,6 +203,12 @@ function poolExhaustedError(rows: PoolSlotRow[], cooldownBySlot: Map<number, Poo
   }).join("; ");
   return unprocessable(`No key slot of this connection's pool is available (${summary})`, {
     code: "provider_key_pool_exhausted",
+    // Structured pool snapshot for the failure marker's copy; the same facts
+    // the text summary carries, without any secret material. The connection id
+    // lets the interruption projection refresh live pool state later.
+    connectionId,
+    ...(modelKey ? { model: modelKey } : {}),
+    pool: poolSlotFailureViews(rows, cooldownBySlot, now, agentNames),
   });
 }
 
@@ -192,11 +259,7 @@ export async function selectAssignablePoolSlot(
     const cooldown = cooldownBySlot.get(row.slot);
     return !cooldown || !slotCooldownActive(cooldown, now);
   };
-  const exhausted = async () => poolExhaustedError(await db
-    .select()
-    .from(credentialPool)
-    .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId)))
-    .orderBy(asc(credentialPool.slot)), cooldownBySlot, now);
+  const exhausted = async () => poolExhaustedError(db, companyId, connectionId, modelKey, now);
   if (!runId) {
     // Ephemeral selection for a resolution outside a run: pin, then sticky,
     // then least-recently-used — no lease is taken and stickiness stays put.
@@ -648,6 +711,121 @@ export async function nextCooldownProbeWakeAt(db: Db): Promise<number | null> {
     .orderBy(asc(credentialPoolCooldowns.cooldownUntil))
     .limit(1);
   return row?.until?.getTime() ?? null;
+}
+
+/** A failed run's rate-limit classification: the dedicated errorCode plus the
+ * snapshot the failure marker renders. */
+export interface RunRateLimitFailure {
+  errorCode: "provider_rate_limited";
+  snapshot: KeyPoolFailureSnapshot;
+}
+
+/**
+ * Terminal classification of a run-internal 429 (ticket 05): the run's latest
+ * provider request row is the terminal signal — the driver fails the turn on
+ * the 429 it forwards, so no later agent request can exist for a rate-limited
+ * terminal; if a later request succeeded the run failed for another reason.
+ * Probe rows never count (the probe worker writes them against the original
+ * run's id, long after the run went terminal). The (slot, model) cooldown row
+ * (ticket 03's classifier output, keyed by the same pair the usage row
+ * attributes) supplies the recovery facts; without it the snapshot degrades
+ * and the copy never invents a recovery time.
+ */
+export async function classifyRunRateLimitFailure(
+  db: Db,
+  ctx: { companyId: string; runId: string; now?: Date },
+): Promise<RunRateLimitFailure | null> {
+  const now = ctx.now ?? new Date();
+  const [latest] = await db
+    .select({
+      httpStatus: usageRequestLogs.httpStatus,
+      model: usageRequestLogs.model,
+      metadata: usageRequestLogs.metadata,
+    })
+    .from(usageRequestLogs)
+    .where(and(
+      eq(usageRequestLogs.companyId, ctx.companyId),
+      eq(usageRequestLogs.runId, ctx.runId),
+      sql`(${usageRequestLogs.app} is null or ${usageRequestLogs.app} <> 'key_pool_probe')`,
+    ))
+    .orderBy(desc(usageRequestLogs.occurredAt), desc(usageRequestLogs.id))
+    .limit(1);
+  if (!latest || latest.httpStatus !== 429) return null;
+  const keySlot = typeof latest.metadata?.keySlot === "number" ? latest.metadata.keySlot : null;
+  const connectionId = typeof latest.metadata?.connectionId === "string" ? latest.metadata.connectionId : null;
+  const model = cooldownModelKey(latest.model);
+  const snapshot: KeyPoolFailureSnapshot = { reason: "rate_limited" };
+  if (connectionId) snapshot.connectionId = connectionId;
+  if (model) snapshot.model = model;
+  if (keySlot !== null) snapshot.slot = keySlot;
+  if (keySlot !== null && connectionId && model) {
+    const [cooldown] = await db
+      .select()
+      .from(credentialPoolCooldowns)
+      .where(and(
+        eq(credentialPoolCooldowns.companyId, ctx.companyId),
+        eq(credentialPoolCooldowns.connectionId, connectionId),
+        eq(credentialPoolCooldowns.slot, keySlot),
+        eq(credentialPoolCooldowns.model, model),
+      ))
+      .limit(1);
+    if (cooldown && slotCooldownActive(cooldown, now)) {
+      // slotCooldownActive guarantees a non-healthy state; keep the assignment
+      // honest for the compiler anyway.
+      snapshot.state = cooldown.state === "healthy" ? null : cooldown.state;
+      snapshot.cooldownUntil = cooldown.cooldownUntil?.toISOString() ?? null;
+    }
+  }
+  return { errorCode: "provider_rate_limited", snapshot };
+}
+
+/**
+ * The interruption projection's pool snapshot for a failed run (ticket 05):
+ * live pool state for the run's recorded failure, falling back to the
+ * snapshot persisted on the run at terminal time. `persisted` is the run's
+ * `resultJson.keyPoolFailure`.
+ */
+export async function runKeyPoolFailureSnapshot(
+  db: Db,
+  ctx: { companyId: string; runId: string; errorCode: string | null; persisted: unknown; now?: Date },
+): Promise<KeyPoolFailureSnapshot | null> {
+  const now = ctx.now ?? new Date();
+  const persisted = readKeyPoolFailureSnapshot(ctx.persisted);
+  if (ctx.errorCode === "provider_rate_limited") {
+    const live = await classifyRunRateLimitFailure(db, { companyId: ctx.companyId, runId: ctx.runId, now });
+    if (live) return live.snapshot;
+    return persisted?.reason === "rate_limited" ? persisted : { reason: "rate_limited" };
+  }
+  if (ctx.errorCode === "provider_key_pool_exhausted") {
+    if (persisted?.reason !== "pool_exhausted") return persisted;
+    if (!persisted.connectionId) return persisted;
+    const rows = await db
+      .select()
+      .from(credentialPool)
+      .where(and(eq(credentialPool.companyId, ctx.companyId), eq(credentialPool.connectionId, persisted.connectionId)))
+      .orderBy(asc(credentialPool.slot));
+    if (!rows.length) return persisted;
+    const modelKey = cooldownModelKey(persisted.model);
+    const cooldowns = modelKey
+      ? await db
+        .select()
+        .from(credentialPoolCooldowns)
+        .where(and(
+          eq(credentialPoolCooldowns.companyId, ctx.companyId),
+          eq(credentialPoolCooldowns.connectionId, persisted.connectionId),
+          eq(credentialPoolCooldowns.model, modelKey),
+        ))
+      : [];
+    const cooldownBySlot = new Map(cooldowns.map((row) => [row.slot, row]));
+    const agentNames = await poolLeaseAgentNames(db, ctx.companyId, rows.map((row) => row.leaseAgentId));
+    return {
+      reason: "pool_exhausted",
+      connectionId: persisted.connectionId,
+      ...(persisted.model ? { model: persisted.model } : {}),
+      slots: poolSlotFailureViews(rows, cooldownBySlot, now, agentNames),
+    };
+  }
+  return null;
 }
 
 /** Display cooldown of one slot, derived from its (slot, model) cooldown rows:

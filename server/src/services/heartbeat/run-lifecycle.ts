@@ -267,6 +267,10 @@ export const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
   "low_trust_runtime_services_denied",
   "chat_failed_run_retry_not_authorized",
   CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE,
+  // Assignment-time key pool exhaustion (ticket 05): re-dispatching into the
+  // same wall would burn the retry budget without a slot change. The pool
+  // switches slots on retry, or the operator fixes the pool.
+  "provider_key_pool_exhausted",
 ]);
 
 // Error codes that mark a pre-dispatch setup failure. The adapter process never

@@ -10,6 +10,7 @@ import type { AiConnectionBinding } from "@paperclipai/shared";
 import { readPaperclipSkillSyncPreference, resolvePaperclipDesiredSkillNames, resolveLegacyPaperclipDesiredSkillNames,
   writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
 import { parseObject } from "../../adapters/utils.js";
+import { HttpError } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { AI_CONNECTION_BUSY_RETRY_REASON, extractWakeCommentIds, isNonAssigneeWorkspaceBusyRetry } from "../../modules/run-dispatch/index.js";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
@@ -32,7 +33,8 @@ import type { createHeartbeatRetries } from "./retries.js";
 import type { createHeartbeatLifecycle } from "./run-lifecycle.js";
 import { createHeartbeatPreparationTiming } from "./preparation-timing.js";
 import {
-  ConfigurationIncompleteFailure, applyRunScopedMentionedSkillKeys, resolveExecutionRunAdapterConfig,
+  ConfigurationIncompleteFailure,
+  applyRunScopedMentionedSkillKeys, keyPoolExhaustedFailureFromHttpError, resolveExecutionRunAdapterConfig,
   resolveRunScopedMentionedSkillKeys, type createHeartbeatRunPreparation, type resolveAcceptedPlanWakeRoutingDecision,
 } from "./run-preparation.js";
 import { buildExecutionWorkspaceConfigSnapshot, stripWorkspaceRuntimeFromExecutionRunConfig } from "./workspaces.js";
@@ -221,6 +223,12 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
         await finalizeAiConnectionBusyDeferral(run, error, !authorizedNonAssigneeWake);
         return { prepared: false as const };
       }
+      // Assignment-time pool exhaustion (ticket 05): the pool cannot serve the
+      // run at all. Re-throw as the typed failure so the setup settlement
+      // records the dedicated errorCode plus the pool snapshot, instead of a
+      // configuration-incomplete blocker routed at the connection settings.
+      const keyPoolExhausted = keyPoolExhaustedFailureFromHttpError(error);
+      if (keyPoolExhausted) throw keyPoolExhausted;
       if (responsibleUserId && issueId) {
         await connectionIntentService(db).request({ sub: agent.id, company_id: agent.companyId, run_id: run.id, responsible_user_id: responsibleUserId }, aiBinding.provider, { purpose: "ai" }).catch(() => {
           logger.warn({ runId: run.id, agentId: agent.id }, "Could not attach AI connection request; runtime configuration action remains available");
