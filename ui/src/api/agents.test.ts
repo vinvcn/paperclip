@@ -57,6 +57,28 @@ describe("agentsApi.retryFailedRun", () => {
     await expect(agentsApi.retryFailedRun("agent-1", "original-failure", "company-1"))
       .rejects.toThrow("Task execution is paused.");
   });
+
+  // Ticket 06: a pooled-key "try again" avoids the failed slot once. The
+  // server validates the field against the shared wake schema; the client
+  // sends it only when set, so generic retries keep the exact same payload.
+  it("sends keyPoolAvoidSlot on the wakeup payload when the retry asks to avoid the failed slot", async () => {
+    const post = vi.spyOn(api, "post").mockResolvedValue({ id: "successor", status: "queued" });
+    await expect(agentsApi.retryFailedRun("agent-1", "original-failure", "company-1", { avoidKeySlot: 3 }))
+      .resolves.toEqual({ runId: "successor", issueId: null });
+    expect(post).toHaveBeenCalledExactlyOnceWith("/agents/agent-1/wakeup?companyId=company-1", {
+      source: "on_demand", triggerDetail: "manual", reason: "retry_failed_run", failedRunId: "original-failure",
+      keyPoolAvoidSlot: 3,
+    });
+  });
+
+  it("omits keyPoolAvoidSlot for a switch-key retry without an avoid slot", async () => {
+    const post = vi.spyOn(api, "post").mockResolvedValue({ id: "successor", status: "queued" });
+    await expect(agentsApi.retryFailedRun("agent-1", "original-failure", "company-1", { avoidKeySlot: null }))
+      .resolves.toEqual({ runId: "successor", issueId: null });
+    expect(post).toHaveBeenCalledExactlyOnceWith("/agents/agent-1/wakeup?companyId=company-1", {
+      source: "on_demand", triggerDetail: "manual", reason: "retry_failed_run", failedRunId: "original-failure",
+    });
+  });
 });
 
 it("retries lifecycle work through the company-scoped agent route", async () => {

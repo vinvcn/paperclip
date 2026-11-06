@@ -11,7 +11,7 @@ import {
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { workspaceRestoreMarkerDetail } from "@/lib/workspace-restore-marker";
 import { credentialAccessNotice } from "@/lib/credential-access-notice";
-import { keyPoolFailureMarkerCopy, keyPoolFailureMarkerLabel } from "@/lib/key-pool-failure-marker";
+import { keyPoolFailureMarkerCopy, keyPoolFailureMarkerLabel, keyPoolFailureMarkerSnapshot } from "@/lib/key-pool-failure-marker";
 import type { ActivityEvent, Issue, IssueQueuedCommentQueue, TaskBrowser } from "@paperclipai/shared";
 import { useProjectCreatedItems } from "@/hooks/useProjectCreatedItems";
 import { skillCreatedItems } from "@/components/task-chat/skill-created-items";
@@ -81,6 +81,7 @@ import {
 import type {
   TaskChatInteractionItem,
   TaskChatItem,
+  TaskChatMarkerItem,
   TaskChatMessageItem,
   TaskChatPlanDocumentItem,
   TaskChatRuntimeRequestDecision,
@@ -443,6 +444,11 @@ export type TaskChatThreadProps = ComponentProps<typeof IssueChatThread> & {
   onRetryInitialHistory?: () => void;
   onOpenSkill?: (skillId: string, name: string) => void;
   onDismissInteraction?: (interaction: IssueThreadInteraction) => Promise<void>;
+  /**
+   * Ticket 06: builds the dedicated pooled-key recovery actions for a
+   * key-pool failure marker; the thread view mounts the returned node.
+   */
+  renderKeyPoolActions?: (item: TaskChatMarkerItem) => ReactNode;
 };
 
 type PendingComposerInput =
@@ -577,6 +583,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     tryAgainNoLiveExecutionPathPending = false,
     onRetryFailedRun,
     retryFailedRunId = null,
+    renderKeyPoolActions,
     queuedCommentQueue,
     onEditQueuedComment,
     onReorderQueuedComments,
@@ -1783,6 +1790,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             : "native_runner_process_exited");
         const keyPoolLabel = keyPoolFailureMarkerLabel(code);
         const keyPoolDetail = keyPoolFailureMarkerCopy(code, props.interruption, source.id, meta?.resultJson);
+        const keyPoolSnapshot = keyPoolFailureMarkerSnapshot(props.interruption, source.id, meta?.resultJson);
         const label =
           code === "native_provider_runtime_missing" && source.status === "failed"
             ? "Runtime missing"
@@ -1844,9 +1852,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             tone: source.status === "cancelled" ? "neutral" : "error",
             label,
             detail,
-            // Pooled-key failures have no inline recovery action yet (ticket
-            // 06); the pool itself switches slots on the next attempt.
+            // Pooled-key failures carry their snapshot for the ticket-06
+            // recovery actions; the pool itself switches slots on the next
+            // attempt, so the generic retry flag stays off.
             retryable: keyPoolLabel ? false : code !== "native_session_cleanup_quarantined",
+            ...(keyPoolLabel ? { keyPool: keyPoolSnapshot ?? { reason: code === "provider_key_pool_exhausted" ? "pool_exhausted" as const : "rate_limited" as const } } : {}),
             ...(credentialAccess ? { credentialAccess, retryable: false } : {}),
             collapsible: true,
             runId: source.id,
@@ -1872,6 +1882,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         const code = meta?.errorCode ?? "native_runner_process_exited";
         const keyPoolLabel = keyPoolFailureMarkerLabel(code);
         const keyPoolDetail = keyPoolFailureMarkerCopy(code, props.interruption, source.id, meta?.resultJson);
+        const keyPoolSnapshot = keyPoolFailureMarkerSnapshot(props.interruption, source.id, meta?.resultJson);
         const retryDetail = meta?.scheduledRetryAt
           ? "Retry scheduled automatically."
           : canRetryFailedRun
@@ -1913,7 +1924,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             variant: "interrupted",
             label: branchUnavailable ? "Starting branch unavailable" : restoreFailed ? "Workspace restore failed" : aiRequest?.status === "pending" ? "AI connection needed" : source.status === "cancelled" ? (meta?.startedAt ? "Stopped" : "Couldn't start") : keyPoolLabel ?? "Run failed",
             runId: source.status === "cancelled" ? undefined : source.id,
-            ...(branchUnavailable || aiRequest?.status === "pending" || keyPoolLabel ? { retryable: false } : {}),
+            ...(branchUnavailable || aiRequest?.status === "pending" || keyPoolLabel ? { retryable: false as const } : {}),
+            ...(keyPoolLabel ? { keyPool: keyPoolSnapshot ?? { reason: code === "provider_key_pool_exhausted" ? "pool_exhausted" as const : "rate_limited" as const } } : {}),
             ...(restoreFailed ? {
               retryable: meta?.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive"
                 && meta?.resultJson?.workspaceRestoreFailure !== "restore_invalid_metadata",
@@ -3321,6 +3333,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                         }
                         onRetryFailedRun={retryFailedRunHandler}
                         retryFailedRunId={retryFailedRunId}
+                        renderKeyPoolActions={renderKeyPoolActions}
                         onOpenSkill={onOpenSkill}
                         onOpenBrowser={onOpenBrowser}
                         tail={

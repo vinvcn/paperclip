@@ -18,7 +18,7 @@ describe("ordinary task interruption", () => {
     root = createRoot(container);
   });
   afterEach(async () => { await act(async () => root.unmount()); container.remove(); vi.useRealTimers(); });
-  const render = async (presentation = failed, options: { canRetry?: boolean; optimistic?: boolean; takingLonger?: boolean; error?: Error } = {}) => {
+  const render = async (presentation = failed, options: { canRetry?: boolean; optimistic?: boolean; takingLonger?: boolean; error?: Error; keyPoolActions?: React.ReactNode } = {}) => {
     await act(async () => root.render(<ExecutionBlockerNotice presentation={presentation} canRetry onRetry={retry} {...options} />));
   };
   it("offers one Retry without delegating infrastructure chores", async () => {
@@ -68,6 +68,27 @@ describe("ordinary task interruption", () => {
         cooldownUntil: null, connectionId: "conn-1" },
     });
     expect(container.textContent).toContain("key 3 × z-ai/glm-5.3-flash hit the RPM rate limit. The next retry automatically switches to another key slot.");
+    expect(container.querySelector("button")).toBeNull();
+  });
+
+  // Ticket 06: the host supplies the dedicated recovery actions; the banner
+  // mounts them beside the copy without owning their behavior.
+  it("mounts the supplied key-pool actions beside the rate_limited copy", async () => {
+    await render({
+      ...failed, responsibility: "user", state: "waiting_for_user", userAction: "rate_limited",
+      keyPool: { reason: "rate_limited", slot: 3, model: "z-ai/glm-5.3-flash", state: "rpm_cooldown",
+        cooldownUntil: null, connectionId: "conn-1" },
+    }, { keyPoolActions: <button type="button" data-testid="key-pool-switch-key">Switch key</button> });
+    expect(container.querySelector('[data-testid="key-pool-switch-key"]')).not.toBeNull();
+    expect(container.textContent).toContain("hit the RPM rate limit");
+  });
+
+  it("keeps the rate_limited banner button-free when no actions are supplied", async () => {
+    await render({
+      ...failed, responsibility: "user", state: "waiting_for_user", userAction: "rate_limited",
+      keyPool: { reason: "rate_limited", slot: 3, model: "z-ai/glm-5.3-flash", state: "rpm_cooldown",
+        cooldownUntil: null, connectionId: "conn-1" },
+    });
     expect(container.querySelector("button")).toBeNull();
   });
 

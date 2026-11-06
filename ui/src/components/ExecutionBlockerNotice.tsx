@@ -7,7 +7,7 @@ import { useSecondTick } from "../hooks/useSecondTick";
 import { TaskProjectAccessNotice } from "./TaskProjectAccessNotice";
 
 /** One ordinary interruption surface. Technical records remain in diagnostics. */
-export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, agentName, projectName }: {
+export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, agentName, projectName, keyPoolActions }: {
   presentation: TaskInterruptionPresentation | null | undefined;
   canRetry: boolean;
   onRetry: () => void;
@@ -18,6 +18,9 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
   issueId?: string;
   agentName?: string;
   projectName?: string;
+  /** Ticket 06: dedicated pooled-key recovery actions for the rate_limited
+   * banner, built by the host from presentation.keyPool. */
+  keyPoolActions?: React.ReactNode;
 }) {
   useSecondTick(presentation?.state === "retry_scheduled");
   if (presentation?.projectAccess && !optimistic && !takingLonger) return <TaskProjectAccessNotice
@@ -26,14 +29,16 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
   if (error && !optimistic && !takingLonger) return <div role="alert" className={cn("flex items-center justify-between gap-2 text-sm text-destructive", className)}><span>{error.message}</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>}</div>;
   if (takingLonger) return <div role="status" className={cn("flex items-center justify-between gap-2 text-sm text-muted-foreground", className)}><span>Taking longer than usual…</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>}</div>;
   // Ticket 05 (demo): pooled-key failures surface the pool snapshot inline.
-  // No retry button yet — the dedicated recovery actions arrive with the
-  // follow-up ticket; a new attempt picks another slot by itself.
+  // Ticket 06: the host supplies the dedicated recovery actions through
+  // `keyPoolActions`; without it the banner stays action-free and a new
+  // attempt picks another slot by itself.
   if (!optimistic && !takingLonger && presentation?.userAction === "rate_limited") {
     return (
       <div className={cn("pt-4", className)}>
-        <div role="status" aria-label="Task status" className="flex items-center justify-between gap-3 text-sm rounded-lg bg-destructive/10 p-4 text-foreground">
+        <div role="status" aria-label="Task status" className="flex flex-wrap items-center gap-3 text-sm rounded-lg bg-destructive/10 p-4 text-foreground">
           <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />
           <span className="min-w-0 flex-1">{keyPoolFailureCopy(presentation.keyPool ?? { reason: "rate_limited" })}</span>
+          {keyPoolActions}
         </div>
       </div>
     );

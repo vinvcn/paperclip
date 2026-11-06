@@ -23,7 +23,9 @@ import { useTaskBrowsers, useBrowserArrivals } from "@/hooks/useTaskBrowsers";
 import { WorkspaceExportRecovery } from "../components/WorkspaceExportRecovery";
 import { DispositionRecoveryProvider } from "../components/DispositionRecoveryNotice";
 import { AgentAvatar } from "@/components/AgentAvatar";
-import { mergeComposerRunSettings, type ComposerRunSettings } from "@/components/task-chat/composer-run-settings";
+import { mergeComposerRunSettings, switchModelRetryOverrides, type ComposerRunSettings } from "@/components/task-chat/composer-run-settings";
+import { KeyPoolFailureActions } from "@/components/task-chat/KeyPoolFailureActions";
+import type { TaskChatMarkerItem } from "@/components/task-chat/task-chat-model";
 import { AgentIdentity } from "@/components/AgentIdentity";
 import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
 import { agentChatDraft } from "@/lib/agent-chat-draft";
@@ -398,6 +400,8 @@ import {
   type IssueTreeControlMode,
   type WorkspaceFileRef,
   workspaceFileRefSchema,
+  aiConnectionBindingSchema,
+  aiRoutingHarness,
   isUuidLike,
 } from "@paperclipai/shared";
 
@@ -1679,13 +1683,16 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     recordIssueDetailReadiness({ activity: !activityPending, "linked-runs": !linkedRunsPending, runtime: runtimeSelectionKnown });
   }, [issueId, issueQueryRef, activityPending, linkedRunsPending, runtimeSelectionKnown]);
   const retryFailedRun = useMutation({
-    mutationFn: async (runId: string) => {
+    mutationFn: async ({ runId, avoidKeySlot }: { runId: string; avoidKeySlot?: number | null }) => {
       const failedRun = resolvedLinkedRuns.find((run) => run.runId === runId);
       if (!failedRun) throw new Error("Failed run is no longer available.");
       return agentsApi.retryFailedRun(
         failedRun.agentId,
         failedRun.runId,
         companyId,
+        // Ticket 06: "Try again" avoids the failed pool slot once; a
+        // switch-key retry passes null and the pool picks freely.
+        { avoidKeySlot },
       );
     },
     onSuccess: (result) => {
@@ -1716,6 +1723,56 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       });
     },
   });
+
+  // Ticket 06: the pooled-key recovery actions beneath a key-pool failure
+  // marker. "Try again"/"Switch key" ride the shared retryFailedRun mutation
+  // (avoiding the failed slot once or letting the pool pick freely); "Switch
+  // model" first saves the task-level model override, then re-dispatches the
+  // same failed run in place.
+  const renderKeyPoolActions = useCallback((item: TaskChatMarkerItem) => {
+    const runId = item.runId;
+    if (!runId) return null;
+    const failedRun = resolvedLinkedRuns.find((run) => run.runId === runId);
+    const failedRunAgent = failedRun ? agentMap.get(failedRun.agentId) : undefined;
+    const binding = failedRunAgent
+      ? aiConnectionBindingSchema.safeParse(failedRunAgent.runtimeConfig?.aiConnection).data
+      : undefined;
+    const harness = failedRunAgent
+      ? aiRoutingHarness(failedRunAgent.adapterType, failedRunAgent.adapterConfig.provider, failedRunAgent.adapterConfig.acpxAgent)
+      : "opencode_local";
+    return (
+      <KeyPoolFailureActions
+        companyId={companyId}
+        snapshot={item.keyPool}
+        binding={binding}
+        harness={harness}
+        retryPending={retryFailedRun.isPending && retryFailedRun.variables?.runId === runId}
+        onRetry={({ avoidKeySlot }) =>
+          retryFailedRun.mutateAsync({ runId, avoidKeySlot }).then(() => undefined)
+        }
+        onSwitchModelRetry={async (model) => {
+          try {
+            const updated = await issuesApi.update(issueId, {
+              assigneeAdapterOverrides: switchModelRetryOverrides(
+                assigneeAdapterOverrides,
+                failedRunAgent?.adapterType,
+                model,
+              ),
+            });
+            queryClient.setQueryData(queryKeys.issues.detail(issueId), updated);
+          } catch (error) {
+            pushToast({
+              title: "Model override failed",
+              body: error instanceof Error ? error.message : "Unable to save the model override",
+              tone: "error",
+            });
+            return;
+          }
+          await retryFailedRun.mutateAsync({ runId, avoidKeySlot: null }).then(() => undefined);
+        }}
+      />
+    );
+  }, [agentMap, assigneeAdapterOverrides, companyId, issueId, queryClient, resolvedLinkedRuns, retryFailedRun]);
 
   const interruptibleIssueRun = useMemo(
     () => resolveInterruptibleIssueRun(resolvedActiveRun, resolvedLiveRuns),
@@ -2685,11 +2742,12 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             feedbackTermsUrl={feedbackTermsUrl}
             linkedRuns={timelineRuns}
             onRetryFailedRun={(runId) =>
-              retryFailedRun.mutateAsync(runId).then(() => undefined)
+              retryFailedRun.mutateAsync({ runId }).then(() => undefined)
             }
             retryFailedRunId={
-              retryFailedRun.isPending ? retryFailedRun.variables : null
+              retryFailedRun.isPending ? retryFailedRun.variables.runId : null
             }
+            renderKeyPoolActions={renderKeyPoolActions}
             timelineEvents={timelineEvents}
             workModeChanges={workModeChanges}
             liveRuns={resolvedLiveRuns}

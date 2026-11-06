@@ -24,6 +24,7 @@ import type {
   DecisionHistoryItem,
   ConversationTaskHandoff,
   AttentionItem,
+  KeyPoolFailureSnapshot,
 } from "@paperclipai/shared";
 import type {
   PaperclipQuestionResponse,
@@ -267,6 +268,10 @@ export interface TaskChatMarkerItem {
   createdAtIso?: string;
   runHref?: string;
   planHref?: string;
+  /** The pooled-key snapshot behind a "Rate limited"/"Key pool exhausted"
+   * marker (ticket 05/06). Present only for those two error codes; the
+   * thread's key-pool action renderer consumes it for the recovery actions. */
+  keyPool?: KeyPoolFailureSnapshot;
   /** An actionable credential denial is always expanded in the task conversation. */
   credentialAccess?: {
     agentName: string;
