@@ -2,8 +2,8 @@ import { createNativeUsageDelivery } from "../native-runtime/native-usage-delive
 import type { PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { agents, agentWakeupRequests, caseHandoffs, cases, companies, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, usageRequestLogs } from "@paperclipai/db";
-import { eq, sql } from "drizzle-orm";
+import { agents, agentWakeupRequests, caseHandoffs, cases, companies, costEvents, createDb, credentialPool, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, toolApplications, toolConnections, usageRequestLogs, activityLog, companySecrets } from "@paperclipai/db";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import * as usageReceipts from "../usage-receipts.js";
@@ -510,5 +510,36 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(f.deps.setWakeupStatus).not.toHaveBeenCalled();
     expect(f.deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
     expect(f.deps.finalizeAgentStatus).not.toHaveBeenCalled();
+  });
+
+  it.each(["completeRun", "failRun", "failRunSetup"] as const)("frees the run's exclusive key-pool lease at the %s terminal write", async operation => {
+    const f = await fixture();
+    // A pooled gateway connection whose only slot is exclusively leased by
+    // this run: the terminal settlement must hand the slot back (the run
+    // crashed without settling is reclaimed by the lease TTL instead).
+    const [application] = await db.insert(toolApplications).values({ companyId: f.run.companyId, name: "Key pool app", type: "rest_api" }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: f.run.companyId, applicationId: application.id, name: "Pooled NIM gateway", uid: "pooled-gateway",
+      connectionPurpose: "ai", transport: "runtime_auth",
+    }).returning();
+    const [secret] = await db.insert(companySecrets).values({ companyId: f.run.companyId, key: "pool-slot-1", name: "ai-pool-terminal-slot-1" }).returning();
+    const [slot] = await db.insert(credentialPool).values({
+      companyId: f.run.companyId, connectionId: connection.id, slot: 1, secretRef: secret.id,
+      activeRunId: f.run.id, leaseExpiresAt: new Date(Date.now() + 600_000), leaseAgentId: f.agent.id, lastAssignedAgentId: f.agent.id,
+    }).returning();
+    if (operation === "completeRun") await f.completion.completeRun(f.input);
+    else if (operation === "failRun") await f.completion.failRun(f.failure(new Error("Provider failed")));
+    else await f.completion.failRunSetup(f.setup(new Error("setup broke")));
+    const released = (await db.select().from(credentialPool).where(eq(credentialPool.id, slot.id)))[0]!;
+    // The exclusive lease is gone; the sticky anchor survives for the next
+    // assignment so the agent returns to its cache-affine slot.
+    expect(released).toMatchObject({ activeRunId: null, leaseExpiresAt: null, leaseAgentId: null, lastAssignedAgentId: f.agent.id });
+    // The release lands in the connection's activity log exactly once.
+    const releases = await db.select().from(activityLog).where(and(
+      eq(activityLog.companyId, f.run.companyId),
+      eq(activityLog.action, "ai_connection.key_slot_released"),
+    ));
+    expect(releases).toHaveLength(1);
+    expect(releases[0]).toMatchObject({ entityType: "tool_connection", entityId: connection.id, runId: f.run.id, details: { slot: 1 } });
   });
 });

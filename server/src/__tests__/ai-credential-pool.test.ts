@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -25,8 +25,8 @@ import { aiConnectionService } from "../services/ai-connections.js";
 import { releaseRunPoolLease } from "../services/ai-credential-pool.js";
 import { secretService } from "../services/secrets.js";
 import { prepareManagedAiRuntime } from "../services/ai-connection-runtime.js";
-import { syncConnectionCredentialBindings } from "../services/connection-credential-bindings.js";
-import { activityLog } from "@paperclipai/db";
+import { credentialPoolSlotConfigPath, syncConnectionCredentialBindings } from "../services/connection-credential-bindings.js";
+import { activityLog, secretAccessEvents } from "@paperclipai/db";
 import express from "express";
 import request from "supertest";
 import { aiConnectionRoutes } from "../routes/ai-connections.js";
@@ -193,6 +193,42 @@ describe("runtimeCredential pool assignment", () => {
       // run invalidates the stored session instead of reusing its captured key.
       expect(runtime.sessionIdentity).toContain("pool-slot-1");
     } finally { await runtime.cleanup(); }
+  });
+
+  it("attributes pooled key access to the grant's responsible user and the consuming run (ticket-01 review F3)", async () => {
+    const owner = "keypool-attributed-user";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const service = aiConnectionService(db);
+    // A personal grant carries the responsible user — the same attribution
+    // source the grant credential() path passes as audit context.
+    const account = await service.save(companyId, owner, {
+      provider: "openai", method: "api_key", ownership: "personal", name: "Attributed NIM gateway",
+      apiKey: "fixture-connection-attributed", agentIds: [], allAgents: true,
+      routing: { kind: "gateway", protocol: "chat", baseUrl: "https://integrate.api.nvidia.example/v1", auth: "bearer", models: [] },
+    } as never, "fixture-connection-attributed");
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, account.grantId));
+    expect(grant).toMatchObject({ kind: "user", subjectUserId: owner });
+    const [agent] = await db.insert(agents).values({ companyId, name: "Attributed runner" }).returning({ id: agents.id });
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent!.id }).returning({ id: heartbeatRuns.id });
+    const pooledKey = "fixture-nvapi-key-attributed";
+    const secret = await secretService(db).create(companyId, { name: "ai-pool-attributed-slot-1", provider: "local_encrypted", value: pooledKey }, { userId: owner });
+    await db.insert(credentialPool).values({ companyId, connectionId: account.connectionId, slot: 1, secretRef: secret.id });
+    await syncConnectionCredentialBindings(db, connection);
+    await expect(service.runtimeCredential({ connection, grant }, { pool: { heartbeatRunId: run!.id, agentId: agent!.id } }))
+      .resolves.toMatchObject({ value: pooledKey, keySlot: 1 });
+    const [event] = await db.select().from(secretAccessEvents)
+      .where(eq(secretAccessEvents.secretId, secret!.id))
+      .orderBy(desc(secretAccessEvents.createdAt))
+      .limit(1);
+    expect(event).toMatchObject({
+      responsibleUserId: owner,
+      heartbeatRunId: run!.id,
+      consumerType: "tool_connection",
+      consumerId: account.connectionId,
+      configPath: credentialPoolSlotConfigPath(1),
+      outcome: "success",
+    });
   });
 });
 
