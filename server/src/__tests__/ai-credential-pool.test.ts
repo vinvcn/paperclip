@@ -532,6 +532,125 @@ describe("key pool assignment matrix (ticket 02)", () => {
   });
 });
 
+describe("key pool one-shot avoid slot (ticket 06)", () => {
+  let service: ReturnType<typeof aiConnectionService>;
+  let connectionId: string;
+  let grantId: string;
+  let agentA: string;
+  const owner = "keypool-avoid-user";
+  const slotKeys = new Map<number, string>([[1, "fixture-nvapi-avoid-1"], [2, "fixture-nvapi-avoid-2"]]);
+
+  beforeAll(async () => {
+    service = aiConnectionService(db);
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", membershipRole: "member", status: "active" });
+    const account = await createGatewayConnectionForUser(owner, "Avoid NIM gateway", "fixture-connection-avoid-key");
+    connectionId = account.connectionId;
+    grantId = account.grantId;
+    for (const [slot, value] of slotKeys) {
+      const secret = await secretService(db).create(companyId, { name: `ai-pool-avoid-${connectionId.slice(0, 8)}-slot-${slot}`, provider: "local_encrypted", value }, { userId: owner });
+      await db.insert(credentialPool).values({ companyId, connectionId, slot, secretRef: secret.id });
+    }
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connectionId));
+    await syncConnectionCredentialBindings(db, connection);
+    const [inserted] = await db.insert(agents).values({ companyId, name: "Avoid agent" }).returning({ id: agents.id });
+    agentA = inserted!.id;
+  }, 60000);
+
+  const connectionRow = async () => {
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connectionId));
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, grantId));
+    return { connection, grant };
+  };
+  const newRun = async () => (await db.insert(heartbeatRuns).values({ companyId, agentId: agentA }).returning({ id: heartbeatRuns.id }))[0]!.id;
+  const lease = async (runId: string, input: { pinnedSlot?: number | null; avoidSlot?: number | null; model?: string } = {}) =>
+    service.runtimeCredential(await connectionRow(), {
+      pool: { heartbeatRunId: runId, agentId: agentA, pinnedSlot: input.pinnedSlot ?? null, avoidSlot: input.avoidSlot ?? null, model: input.model ?? MODEL_A },
+    });
+  const resetPool = async () => {
+    await db.update(credentialPool).set({
+      state: "healthy", cooldownUntil: null, cooldownReason: null, enabled: true,
+      activeRunId: null, leaseExpiresAt: null, leaseAgentId: null,
+      lastAssignedAgentId: null, lastAssignedAt: null, updatedAt: new Date(),
+    }).where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId)));
+    await db.delete(credentialPoolCooldowns).where(and(eq(credentialPoolCooldowns.companyId, companyId), eq(credentialPoolCooldowns.connectionId, connectionId)));
+  };
+
+  afterEach(resetPool);
+
+  it("avoids the failed slot for one assignment even though stickiness would return to it", async () => {
+    const firstRun = await newRun();
+    await expect(lease(firstRun)).resolves.toMatchObject({ keySlot: 1 });
+    await releaseRunPoolLease(db, firstRun);
+    // The retry wake carries the failed slot: the next assignment skips it
+    // once — the just-failed key is not handed back to the same agent.
+    const retryRun = await newRun();
+    await expect(lease(retryRun, { avoidSlot: 1 })).resolves.toMatchObject({ keySlot: 2 });
+    await releaseRunPoolLease(db, retryRun);
+  });
+
+  it("returns the avoided slot to the normal matrix on the following assignment", async () => {
+    const firstRun = await newRun();
+    await expect(lease(firstRun, { avoidSlot: 2 })).resolves.toMatchObject({ keySlot: 1 });
+    await releaseRunPoolLease(db, firstRun);
+    // The avoid rode the first wake only: a later assignment without it may
+    // use the previously avoided slot again. This agent's stickiness now
+    // points at slot 1, so reach the recovered slot through the pin lane —
+    // the same lane the switch-key retry uses to return to a healthy slot.
+    const secondRun = await newRun();
+    await expect(lease(secondRun, { pinnedSlot: 2 })).resolves.toMatchObject({ keySlot: 2 });
+  });
+
+  it("fast-fails when the avoid leaves no assignable slot, then serves it again without the avoid", async () => {
+    // Slot 2 is the only eligible key for the model; avoiding it must refuse
+    // the run instead of silently handing back the failed key.
+    await coolSlot(connectionId, 1, MODEL_A, "daily_cooldown", new Date(Date.now() + 3_600_000));
+    const retryRun = await newRun();
+    await expect(lease(retryRun, { avoidSlot: 2 })).rejects.toMatchObject({ details: { code: "provider_key_pool_exhausted" } });
+    // The same wake without the avoid (switch-key retry semantics) serves the
+    // slot the matrix considers assignable.
+    const switchRun = await newRun();
+    await expect(lease(switchRun)).resolves.toMatchObject({ keySlot: 2 });
+  });
+
+  it("keeps the pin above the avoid: a pinned slot is used even when avoided", async () => {
+    const runId = await newRun();
+    await expect(lease(runId, { pinnedSlot: 2, avoidSlot: 2 })).resolves.toMatchObject({ keySlot: 2 });
+  });
+
+  it("keeps in-run re-resolutions on the same slot when the avoid is active", async () => {
+    const runId = await newRun();
+    const first = await lease(runId, { avoidSlot: 1 });
+    expect(first.keySlot).toBe(2);
+    const second = await lease(runId, { avoidSlot: 1 });
+    expect(second.keySlot).toBe(2);
+  });
+
+  it("projects the avoided slot through prepareManagedAiRuntime's env slot selection", async () => {
+    // The full preparation chain: the avoid rides the run context into
+    // runtimeCredential, and the projected PAPERCLIP_AI_PROVIDER_KEY_SLOT is
+    // the slot the matrix picked without the avoided one.
+    const runtime = await prepareManagedAiRuntime(db, {
+      companyId, agentId: agentA, responsibleUserId: owner, adapterType: "paperclip_runner",
+      binding: { provider: "openai", method: "api_key", mode: "shared", connectionId, grantId },
+      config: { provider: "opencode", model: `paperclip/${MODEL_A}` },
+      avoidKeySlot: 1,
+    });
+    try {
+      expect(runtime.keySlot).toBe(2);
+      expect((runtime.config.env as Record<string, string>).PAPERCLIP_AI_PROVIDER_KEY_SLOT).toBe("2");
+    } finally { await runtime.cleanup(); }
+    // Without the avoid the normal matrix serves the never-used slot 1.
+    const runtime2 = await prepareManagedAiRuntime(db, {
+      companyId, agentId: agentA, responsibleUserId: owner, adapterType: "paperclip_runner",
+      binding: { provider: "openai", method: "api_key", mode: "shared", connectionId, grantId },
+      config: { provider: "opencode", model: `paperclip/${MODEL_A}` },
+    });
+    try {
+      expect(runtime2.keySlot).toBe(1);
+    } finally { await runtime2.cleanup(); }
+  });
+});
+
 describe("key pool cooldown state machine (ticket 03)", () => {
   let service: ReturnType<typeof aiConnectionService>;
   let connectionId: string;

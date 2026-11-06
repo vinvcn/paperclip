@@ -66,6 +66,15 @@ function readAgentKeySlotPin(adapterConfig: Record<string, unknown> | undefined)
   return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : null;
 }
 
+/** One-shot pooled-key avoid from a failed-run retry wake (ticket 06). The
+ * wake route stores the validated slot under contextSnapshot.keyPoolAvoidSlot;
+ * this defensive re-check keeps a malformed stored value from steering
+ * assignment. Null when the wake carries no avoid. */
+export function readWakeKeyPoolAvoidSlot(context: Record<string, unknown> | undefined): number | null {
+  const value = parseObject(context).keyPoolAvoidSlot;
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : null;
+}
+
 export interface HeartbeatExecutionConfigurationInput {
   run: typeof heartbeatRuns.$inferSelect;
   agent: typeof agents.$inferSelect;
@@ -82,6 +91,9 @@ export interface HeartbeatExecutionConfigurationInput {
     /** Task-level key-slot pin (assigneeAdapterOverrides.keySlot); wins over
      * the agent's adapterConfig.keySlot. Null/omitted keeps the agent pin. */
     keySlotOverride?: number | null;
+    /** One-shot pooled-key avoid (ticket 06) read from the retry wake's
+     * context: this run's pool assignment skips the just-failed slot once. */
+    keySlotAvoid?: number | null;
   };
   config: {
     sourceWorkspaceConfig: Record<string, unknown>;
@@ -107,7 +119,7 @@ export interface HeartbeatExecutionConfigurationInput {
 export async function prepareHeartbeatExecutionConfiguration(db: Db, input: HeartbeatExecutionConfigurationInput) {
   const { run, agent, onFailureSecretsResolved, onManagedAiRuntimeAcquired, onIdentityRedactorPrepared } = input;
   const time = createHeartbeatPreparationTiming(run.id);
-  const { issueId, context, responsibleUserId, acceptedPlanContinuationWake, acceptedPlanWakeRoutingDecision, taskProjectContext, routineEnvContext, pinnedSkillTest, keySlotOverride } = input.task;
+  const { issueId, context, responsibleUserId, acceptedPlanContinuationWake, acceptedPlanWakeRoutingDecision, taskProjectContext, routineEnvContext, pinnedSkillTest, keySlotOverride, keySlotAvoid } = input.task;
   const { selectedEnvironmentId, selectedEnvironmentForConfig, resolvedInstanceSettings, persistedNativeExecutionInput } = input.environment;
   const sourceWorkspaceConfig = agent.adapterType === "paperclip_runner"
     ? { ...input.config.sourceWorkspaceConfig,
@@ -208,7 +220,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   onFailureSecretsResolved(() => collectRunFailureSecretValues(resolvedConfig.env, secretKeys));
   if (aiBinding) {
     try {
-      managedAiRuntime = await time("configuration_ai_runtime", () => prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig, heartbeatRunId: run.id, pinnedKeySlot: keySlotOverride ?? readAgentKeySlotPin(agent.adapterConfig) }));
+      managedAiRuntime = await time("configuration_ai_runtime", () => prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig, heartbeatRunId: run.id, pinnedKeySlot: keySlotOverride ?? readAgentKeySlotPin(agent.adapterConfig), avoidKeySlot: keySlotAvoid ?? null }));
       onManagedAiRuntimeAcquired(managedAiRuntime);
     } catch (error) {
       // Only fresh executions can receive a pre-provider wait receipt. A
