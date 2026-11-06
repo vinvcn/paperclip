@@ -1,16 +1,12 @@
 import { and, asc, eq } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
-import {
-  type AiConnectionKeySlot,
-  type AiConnectionKeySlotCreate,
-  type AiConnectionKeySlotList,
-  type AiConnectionKeySlotUpdate,
-  type Db,
-  companySecretBindings,
-  companySecrets,
-  credentialPool,
-  toolConnections,
-} from "@paperclipai/db";
+import type {
+  AiConnectionKeySlot,
+  AiConnectionKeySlotCreate,
+  AiConnectionKeySlotList,
+  AiConnectionKeySlotUpdate,
+} from "@paperclipai/shared";
+import { type Db, companySecretBindings, companySecrets, credentialPool, toolConnections } from "@paperclipai/db";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { secretService } from "./secrets.js";
@@ -194,7 +190,7 @@ export function aiCredentialPoolService(db: Db) {
         .values({ companyId, connectionId, slot: input.slot, label: input.label ?? null, secretRef: secret.id })
         .returning();
       await bindSlotSecret(tx, companyId, connectionId, input.slot, secret.id);
-      await logActivity(tx, {
+      await logActivity(tx as unknown as Db, {
         companyId,
         actorType: actor.actorType,
         actorId: actor.actorId,
@@ -232,7 +228,7 @@ export function aiCredentialPoolService(db: Db) {
         .where(eq(credentialPool.id, row.id))
         .returning();
       if (input.keyValue !== undefined) await bindSlotSecret(tx, companyId, connectionId, input.slot, patch.secretRef!);
-      await logActivity(tx, {
+      await logActivity(tx as unknown as Db, {
         companyId,
         actorType: actor.actorType,
         actorId: actor.actorId,
@@ -270,7 +266,7 @@ export function aiCredentialPoolService(db: Db) {
         eq(companySecretBindings.targetId, connectionId),
         eq(companySecretBindings.configPath, credentialPoolSlotConfigPath(slot)),
       ));
-      await logActivity(tx, {
+      await logActivity(tx as unknown as Db, {
         companyId,
         actorType: actor.actorType,
         actorId: actor.actorId,
