@@ -147,6 +147,28 @@ const MAX_AGENT_SESSION_MESSAGE_CHARS = 12_000;
 
 export const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
 
+// Pre-dispatch gate outcome: the connection's key pool cannot serve the run
+// (every slot leased, cooling or disabled). Surfaced with its own errorCode so
+// the presentation shows the pool snapshot instead of a configuration gap; the
+// recovery path must not immediately re-dispatch into the same wall (the pool
+// switches slots, or the operator fixes the pool).
+export const KEY_POOL_EXHAUSTED_FAILURE_CODE = "provider_key_pool_exhausted";
+
+export class KeyPoolExhaustedFailure extends Error {
+  code = KEY_POOL_EXHAUSTED_FAILURE_CODE;
+  resultJson: Record<string, unknown>;
+
+  constructor(message: string, resultJson: Record<string, unknown>) {
+    super(message);
+    this.name = "KeyPoolExhaustedFailure";
+    this.resultJson = resultJson;
+  }
+}
+
+export function isKeyPoolExhaustedFailure(error: unknown): error is KeyPoolExhaustedFailure {
+  return error instanceof KeyPoolExhaustedFailure;
+}
+
 // Pre-dispatch gate outcome: required secret/env bindings are missing, so the
 // run must not be dispatched. Surfaced as a configuration-incomplete blocker
 // routed to a human owner instead of N opaque dispatched-then-failed runs.
