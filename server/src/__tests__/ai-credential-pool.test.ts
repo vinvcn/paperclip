@@ -68,8 +68,12 @@ async function createGatewayConnectionForUser(owner: string, name: string, key: 
   } as never, key);
 }
 
-/** NIM-style model ids: the upstream body form usage rows record (the
- * managed `paperclip/` prefix is stripped by the projection). */
+/** NIM-style upstream model ids. Usage rows record the full routed model
+ * string the runner's capture sink saw — `paperclip/<model>` for managed
+ * gateway traffic (review F1: production 429 rows are 24/24 prefixed, bare
+ * ids match nothing) — so usage fixtures insert the prefixed form, while
+ * cooldown rows keep this bare id (the probe addresses the gateway with the
+ * bare upstream body model). */
 const MODEL_A = "meta/llama-3.3-70b-instruct";
 const MODEL_B = "meta/qwen3-coder-480b";
 
@@ -611,24 +615,26 @@ describe("key pool cooldown state machine (ticket 03)", () => {
     const runId = await newRunId();
     await takePoolSlotLease(db, { companyId, connectionId, slotId, runId, agentId: agentA, modelKey: MODEL_A, now: new Date(), respectCooldown: true });
     const now = new Date();
-    // Two window requests for the pair (the 429 row itself counts as traffic).
+    // Two window requests for the pair (the 429 row itself counts as traffic),
+    // recorded the way the capture sink writes them: the prefixed routed model.
     for (const status of [200, 429]) {
       await db.insert(usageRequestLogs).values({
         companyId, runId, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
-        model: MODEL_A, httpStatus: status, requestId: randomUUID(), occurredAt: new Date(now.getTime() - 5_000),
+        model: `paperclip/${MODEL_A}`, httpStatus: status, requestId: randomUUID(), occurredAt: new Date(now.getTime() - 5_000),
         metadata: { keySlot: 1 },
       });
     }
-    const classification = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: MODEL_A, retryAfterSeconds: 120, now });
+    // recordForRun hands the classifier the usage row's stored model string.
+    const classification = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: `paperclip/${MODEL_A}`, retryAfterSeconds: 120, now });
     expect(classification).toMatchObject({ state: "rpm_cooldown", windowCount: 2, retryAfterSeconds: 120 });
     // retry-after 120s > the 90s floor wins.
     expect(classification!.cooldownUntil.getTime()).toBe(now.getTime() + 120_000);
     expect(await cooldownRow(MODEL_A)).toMatchObject({ state: "rpm_cooldown", cooldownReason: "rpm", lastRunId: runId });
     // A short retry-after falls back to the 90s floor.
-    const short = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: MODEL_A, retryAfterSeconds: 5, now: new Date(now.getTime() + 1) });
+    const short = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: `paperclip/${MODEL_A}`, retryAfterSeconds: 5, now: new Date(now.getTime() + 1) });
     expect(short!.cooldownUntil.getTime()).toBe(now.getTime() + 1 + 90_000);
     // No header: the 90s fallback.
-    const none = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: MODEL_A, retryAfterSeconds: null, now: new Date(now.getTime() + 2) });
+    const none = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: `paperclip/${MODEL_A}`, retryAfterSeconds: null, now: new Date(now.getTime() + 2) });
     expect(none!.cooldownUntil.getTime()).toBe(now.getTime() + 2 + 90_000);
     // Evidence lands in the activity log.
     const [logged] = await db.select().from(activityLog)
@@ -644,10 +650,10 @@ describe("key pool cooldown state machine (ticket 03)", () => {
     const now = new Date();
     await db.insert(usageRequestLogs).values({
       companyId, runId, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
-      model: MODEL_A, httpStatus: 429, requestId: randomUUID(), occurredAt: now,
+      model: `paperclip/${MODEL_A}`, httpStatus: 429, requestId: randomUUID(), occurredAt: now,
       metadata: { keySlot: 1 },
     });
-    const classification = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: MODEL_A, now });
+    const classification = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: `paperclip/${MODEL_A}`, now });
     expect(classification).toMatchObject({ state: "daily_cooldown", windowCount: 1 });
     expect(classification!.cooldownUntil.getTime()).toBe(now.getTime() + 24 * 60 * 60 * 1000);
     expect(await cooldownRow(MODEL_A)).toMatchObject({ state: "daily_cooldown", cooldownReason: "daily" });
@@ -668,20 +674,49 @@ describe("key pool cooldown state machine (ticket 03)", () => {
     const leaseRun = await newRunId();
     await takePoolSlotLease(db, { companyId, connectionId, slotId, runId: leaseRun, agentId: agentA, modelKey: MODEL_A, now: new Date(), respectCooldown: true });
     await expect(classifyKeySlot429(db, { companyId, runId: leaseRun, keySlot: 7, model: MODEL_A, now: new Date() })).resolves.toBeNull();
-    // The managed paperclip/ prefix resolves to the same cooldown key as the
-    // bare upstream model id the usage rows record.
+    // The hook receives the usage row's stored model string (the prefixed
+    // routed form) and still writes the cooldown row under the bare upstream
+    // id the probe needs.
     const now = new Date();
     await db.insert(usageRequestLogs).values({
       companyId, runId: leaseRun, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
-      model: MODEL_A, httpStatus: 429, requestId: randomUUID(), occurredAt: now, metadata: { keySlot: 1 },
+      model: `paperclip/${MODEL_A}`, httpStatus: 429, requestId: randomUUID(), occurredAt: now, metadata: { keySlot: 1 },
     });
     await db.insert(usageRequestLogs).values({
       companyId, runId: leaseRun, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
-      model: MODEL_A, httpStatus: 429, requestId: randomUUID(), occurredAt: now, metadata: { keySlot: 1 },
+      model: `paperclip/${MODEL_A}`, httpStatus: 429, requestId: randomUUID(), occurredAt: now, metadata: { keySlot: 1 },
     });
     const classification = await classifyKeySlot429(db, { companyId, runId: leaseRun, keySlot: 1, model: `paperclip/${MODEL_A}`, now });
     expect(classification!.windowCount).toBe(2);
     expect(await cooldownRow(MODEL_A)).toMatchObject({ state: "rpm_cooldown" });
+  });
+
+  it("classifies production-shaped traffic: prefixed usage rows with in-window traffic reach rpm_cooldown (review F1)", async () => {
+    // The real capture path end to end: the runner's usage sink records the
+    // routed model string (`paperclip/<model>` — production 429 rows are 24/24
+    // prefixed), recordForRun hands that same string to the classifier, and a
+    // pair with real in-window traffic must classify as RPM, not as the
+    // spurious daily limit the bare-id lookup produced.
+    const runId = await newRunId();
+    await takePoolSlotLease(db, { companyId, connectionId, slotId, runId, agentId: agentA, modelKey: MODEL_A, now: new Date(), respectCooldown: true });
+    const now = new Date();
+    for (const status of [200, 200, 429]) {
+      await db.insert(usageRequestLogs).values({
+        companyId, runId, agentId: agentA, app: "opencode", provider: "paperclip", biller: "paperclip",
+        model: `paperclip/${MODEL_A}`, httpStatus: status, requestId: randomUUID(), occurredAt: new Date(now.getTime() - 5_000),
+        metadata: { keySlot: 1 },
+      });
+    }
+    const classification = await classifyKeySlot429(db, { companyId, runId, keySlot: 1, model: `paperclip/${MODEL_A}`, now });
+    expect(classification).toMatchObject({ state: "rpm_cooldown", windowCount: 3 });
+    // The cooldown row stays keyed by the bare upstream id for the probe.
+    expect(await cooldownRow(MODEL_A)).toMatchObject({ state: "rpm_cooldown", cooldownReason: "rpm" });
+    // The pair is ineligible for the target model while the other model of the
+    // same key stays assignable (plan §10 core, now under the real convention).
+    await expect(service.runtimeCredential(await connectionRow(), { pool: { model: MODEL_A } }))
+      .rejects.toMatchObject({ details: { code: "provider_key_pool_exhausted" } });
+    await expect(service.runtimeCredential(await connectionRow(), { pool: { model: MODEL_B } }))
+      .resolves.toMatchObject({ keySlot: 1 });
   });
 
   it("computes the probe deadline from due daily cooldowns only", async () => {

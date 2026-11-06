@@ -74,9 +74,13 @@ export const PROBE_LEAD_MS = 5 * 60 * 1000;
 export const PROBE_DEFER_MS = 2 * 60 * 60 * 1000;
 
 /**
- * The cooldown key is the upstream model id: usage rows record the request
- * body model, and the managed `paperclip/` routing prefix (added by the env
- * projection for gateway connections) never reaches the upstream body.
+ * The cooldown store's key: the bare upstream model id. Usage rows record the
+ * full routed model string the runner's capture sink saw (`input.options.model`,
+ * which carries the managed `paperclip/` prefix for gateway connections — the
+ * production usage log has only prefixed rows), but the probe worker addresses
+ * the gateway with the bare upstream body model, so cooldown rows strip the
+ * prefix. The window count queries by the usage row's stored string instead
+ * (review F1): the classifier receives exactly what the row records.
  */
 export function cooldownModelKey(model: string | null | undefined): string | null {
   if (!model) return null;
@@ -477,7 +481,10 @@ export interface KeySlot429Classification {
  * status — including this row) that still ends in 429 means an RPM limit;
  * a 429 with an empty window means the daily limit. The window counts usage
  * rows carrying `metadata.keySlot` for the pair (ticket 04 populates it; rows
- * without it cannot be attributed and stay uncounted).
+ * without it cannot be attributed and stay uncounted), matched by the model
+ * form the row stores: `ctx.model` is the routed string the usage row itself
+ * records (`paperclip/<model>` for managed gateway traffic), while the
+ * cooldown row stores the bare upstream id for the probe (review F1).
  *
  * The cooldown row is found through the run's exclusive lease: usage rows do
  * not carry connection identity (ticket 04 adds keySlot only), and a run
@@ -497,6 +504,8 @@ export async function classifyKeySlot429(
   },
 ): Promise<KeySlot429Classification | null> {
   const now = ctx.now ?? new Date();
+  // The cooldown row keeps the bare upstream id (the probe needs it); the
+  // window count below uses the usage row's stored model form.
   const model = cooldownModelKey(ctx.model);
   if (!model) return null;
   const [leaseRow] = await db
@@ -514,7 +523,12 @@ export async function classifyKeySlot429(
     .from(usageRequestLogs)
     .where(and(
       eq(usageRequestLogs.companyId, ctx.companyId),
-      eq(usageRequestLogs.model, model),
+      // Review F1: count by the model form the usage row stores. Usage rows
+      // record the full routed model string the capture sink saw
+      // (`paperclip/<model>` for managed gateway traffic — production 429
+      // rows are 24/24 prefixed), and `ctx.model` is that same string handed
+      // over by recordForRun, so this equality is the storage's own identity.
+      eq(usageRequestLogs.model, ctx.model),
       gte(usageRequestLogs.occurredAt, new Date(now.getTime() - COOLDOWN_WINDOW_MS)),
       sql`${usageRequestLogs.metadata}->>'keySlot' = ${String(ctx.keySlot)}`,
     ));
