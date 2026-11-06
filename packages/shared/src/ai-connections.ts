@@ -207,6 +207,49 @@ export interface AiConnectionList {
   canManageConnections: boolean;
   connections: AiManagedConnectionSummary[];
 }
+
+/** Health states of one credential pool slot. Cooldown transitions belong to the cooldown ticket. */
+export const CREDENTIAL_POOL_SLOT_STATES = ["healthy", "rpm_cooldown", "daily_cooldown"] as const;
+export type CredentialPoolSlotState = (typeof CREDENTIAL_POOL_SLOT_STATES)[number];
+export const credentialPoolSlotStateSchema = z.enum(CREDENTIAL_POOL_SLOT_STATES);
+
+/** One pooled key slot on an AI connection. The key value itself is never exposed. */
+export interface AiConnectionKeySlot {
+  id: string;
+  slot: number;
+  label: string | null;
+  enabled: boolean;
+  state: CredentialPoolSlotState;
+  cooldownUntil: string | null;
+  cooldownReason: string | null;
+  activeRunId: string | null;
+  leaseExpiresAt: string | null;
+  leaseAgentId: string | null;
+  lastAssignedAgentId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface AiConnectionKeySlotList {
+  connectionId: string;
+  slots: AiConnectionKeySlot[];
+}
+export const aiConnectionKeySlotCreateSchema = z
+  .object({
+    slot: z.number().int().min(1).max(100),
+    label: z.string().trim().min(1).max(160).optional(),
+    keyValue: z.string().trim().min(1).max(4096),
+  })
+  .strict();
+export type AiConnectionKeySlotCreate = z.infer<typeof aiConnectionKeySlotCreateSchema>;
+export const aiConnectionKeySlotUpdateSchema = z
+  .object({
+    slot: z.number().int().min(1).max(100),
+    label: z.string().trim().min(1).max(160).nullable().optional(),
+    keyValue: z.string().trim().min(1).max(4096).optional(),
+    enabled: z.boolean().optional(),
+  })
+  .strict();
+export type AiConnectionKeySlotUpdate = z.infer<typeof aiConnectionKeySlotUpdateSchema>;
 export const createAiConnectionSchema = z
   .object({
     ...requirement,

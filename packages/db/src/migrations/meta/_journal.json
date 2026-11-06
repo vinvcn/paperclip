@@ -2955,6 +2955,13 @@
       "when": 1793808625401,
       "tag": "0423_kind_brood",
       "breakpoints": true
+    },
+    {
+      "idx": 424,
+      "version": "7",
+      "when": 1793954460652,
+      "tag": "0424_small_hedge_knight",
+      "breakpoints": true
     }
   ]
 }
