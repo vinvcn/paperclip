@@ -11,6 +11,7 @@ export function managedProviderRouting(
   harness: string,
   credential: string,
   model: string,
+  keySlot?: number | null,
 ) {
   const env: Record<string, string> = {};
   const config: Record<string, unknown> = {};
@@ -18,6 +19,10 @@ export function managedProviderRouting(
   let hermesConfig = "";
   const baseUrl = aiRoutingBaseUrl(route, harness);
   const openrouter = isOpenRouterUrl(baseUrl);
+  // Key-pool slot provenance beside the gateway key projection: the runner's
+  // usage capture reads it for per-key usage attribution (ticket 04). This is
+  // an additive env key only — routing decisions are unchanged.
+  if (typeof keySlot === "number") env.PAPERCLIP_AI_PROVIDER_KEY_SLOT = String(keySlot);
   if (route.kind === "bedrock") {
     env.CLAUDE_CODE_USE_BEDROCK = "1";
     env.AWS_REGION = route.region!;

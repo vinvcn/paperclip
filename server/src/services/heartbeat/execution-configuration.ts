@@ -56,6 +56,14 @@ export function bindHeartbeatRunnerHomeMode(config: Record<string, unknown>, per
   return { ...config, homeMode };
 }
 
+/** Key-slot pin from the agent's adapterConfig. The shared validator rejects
+ * invalid values at write time; this defensively re-checks so a stored legacy
+ * value can never pin a run to a malformed slot. */
+function readAgentKeySlotPin(adapterConfig: Record<string, unknown> | undefined): number | null {
+  const value = parseObject(adapterConfig).keySlot;
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : null;
+}
+
 export interface HeartbeatExecutionConfigurationInput {
   run: typeof heartbeatRuns.$inferSelect;
   agent: typeof agents.$inferSelect;
@@ -69,6 +77,9 @@ export interface HeartbeatExecutionConfigurationInput {
     routineEnvContext: Awaited<ReturnType<ReturnType<typeof createHeartbeatRunPreparation>["getRoutineEnvForExecutionIssue"]>>;
     /** Resolved from the durable Studio test row by task-context, never wake input. */
     pinnedSkillTest?: { key: string; versionId: string } | null;
+    /** Task-level key-slot pin (assigneeAdapterOverrides.keySlot); wins over
+     * the agent's adapterConfig.keySlot. Null/omitted keeps the agent pin. */
+    keySlotOverride?: number | null;
   };
   config: {
     sourceWorkspaceConfig: Record<string, unknown>;
@@ -94,7 +105,7 @@ export interface HeartbeatExecutionConfigurationInput {
 export async function prepareHeartbeatExecutionConfiguration(db: Db, input: HeartbeatExecutionConfigurationInput) {
   const { run, agent, onFailureSecretsResolved, onManagedAiRuntimeAcquired, onIdentityRedactorPrepared } = input;
   const time = createHeartbeatPreparationTiming(run.id);
-  const { issueId, context, responsibleUserId, acceptedPlanContinuationWake, acceptedPlanWakeRoutingDecision, taskProjectContext, routineEnvContext, pinnedSkillTest } = input.task;
+  const { issueId, context, responsibleUserId, acceptedPlanContinuationWake, acceptedPlanWakeRoutingDecision, taskProjectContext, routineEnvContext, pinnedSkillTest, keySlotOverride } = input.task;
   const { selectedEnvironmentId, selectedEnvironmentForConfig, resolvedInstanceSettings, persistedNativeExecutionInput } = input.environment;
   const sourceWorkspaceConfig = agent.adapterType === "paperclip_runner"
     ? { ...input.config.sourceWorkspaceConfig,
@@ -195,7 +206,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   onFailureSecretsResolved(() => collectRunFailureSecretValues(resolvedConfig.env, secretKeys));
   if (aiBinding) {
     try {
-      managedAiRuntime = await time("configuration_ai_runtime", () => prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig }));
+      managedAiRuntime = await time("configuration_ai_runtime", () => prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig, heartbeatRunId: run.id, pinnedKeySlot: keySlotOverride ?? readAgentKeySlotPin(agent.adapterConfig) }));
       onManagedAiRuntimeAcquired(managedAiRuntime);
     } catch (error) {
       // Only fresh executions can receive a pre-provider wait receipt. A

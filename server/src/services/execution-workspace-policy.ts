@@ -396,6 +396,9 @@ export function resolveExecutionWorkspaceMode(input: {
 
 interface ParsedIssueAssigneeAdapterOverrides {
   adapterConfig: Record<string, unknown> | null;
+  /** Task-level key-slot pin (shared schema guarantees a positive integer or
+   * null); wins over the agent's adapterConfig.keySlot. */
+  keySlot: number | null;
   useProjectWorkspace: boolean | null;
 }
 
@@ -408,13 +411,18 @@ export function parseIssueAssigneeAdapterOverrides(
   );
   const adapterConfig =
     Object.keys(parsedAdapterConfig).length > 0 ? parsedAdapterConfig : null;
+  const keySlot =
+    typeof parsed.keySlot === "number" && Number.isInteger(parsed.keySlot) && parsed.keySlot >= 1
+      ? parsed.keySlot
+      : null;
   const useProjectWorkspace =
     typeof parsed.useProjectWorkspace === "boolean"
       ? parsed.useProjectWorkspace
       : null;
-  if (!adapterConfig && useProjectWorkspace === null) return null;
+  if (!adapterConfig && keySlot === null && useProjectWorkspace === null) return null;
   return {
     adapterConfig,
+    keySlot,
     useProjectWorkspace,
   };
 }

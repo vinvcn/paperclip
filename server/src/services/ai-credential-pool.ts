@@ -1,4 +1,4 @@
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, isNull, lt, or } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import type {
   AiConnectionKeySlot,
@@ -7,7 +7,7 @@ import type {
   AiConnectionKeySlotUpdate,
 } from "@paperclipai/shared";
 import { type Db, companySecretBindings, companySecrets, credentialPool, toolConnections } from "@paperclipai/db";
-import { conflict, notFound, unprocessable } from "../errors.js";
+import { conflict, notFound, unprocessable, HttpError } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 import { logger } from "../middleware/logger.js";
@@ -23,32 +23,207 @@ export interface AssignablePoolSlot {
 
 export type PoolSlotActor = { actorType: "user" | "agent" | "system"; actorId: string };
 
+/** Run-scoped assignment inputs. A heartbeatRunId turns the resolution into an
+ * exclusive lease (activeRunId) released at the run's terminal write; without
+ * one the resolution only selects (no lease, no stickiness writes). */
+export interface PoolSlotAssignmentContext {
+  agentId: string | null;
+  heartbeatRunId: string | null;
+  /** Key-slot pin (agent adapterConfig.keySlot or task override): assignment
+   * uses this slot unconditionally — cooldown included (warn logged) — but a
+   * disabled slot stays off and a missing slot fails the run. */
+  pinnedSlot?: number | null;
+}
+
 /**
- * Ticket-01 assignment rule: the lowest enabled healthy slot, in deterministic
- * slot order. Ticket 02 replaces this function with the full matrix
- * (pin → sticky → exclusive lease → fast-fail); its callers and the
- * "no assignable slot → fall through to the single credential" contract are
- * the stable seam.
+ * Crashed runs never reach their terminal lease release, so their slot is
+ * reclaimed by this TTL instead. It must comfortably exceed any ordinary run
+ * (the terminal release is the normal path; an expired lease merely admits the
+ * next run once the deadline passes).
+ */
+export const POOL_LEASE_TTL_MS = 2 * 60 * 60 * 1000 + 5 * 60 * 1000;
+
+const poolLeaseActor = { actorType: "system" as const, actorId: "key_pool" };
+
+type PoolSlotRow = typeof credentialPool.$inferSelect;
+
+function mostStaleFirst(a: PoolSlotRow, b: PoolSlotRow) {
+  const aAt = a.lastAssignedAt?.getTime() ?? Number.NEGATIVE_INFINITY;
+  const bAt = b.lastAssignedAt?.getTime() ?? Number.NEGATIVE_INFINITY;
+  return aAt - bAt || a.slot - b.slot;
+}
+
+function poolExhaustedError(rows: PoolSlotRow[]): HttpError {
+  // Snapshot for the operator: who occupies each slot and when it recovers
+  // (lease expiry or cooldown end). Never a key value.
+  const summary = rows.map((row) => {
+    const parts = [`slot ${row.slot}: ${row.enabled ? row.state : "disabled"}`];
+    if (row.activeRunId) {
+      parts.push(`leased by run ${row.activeRunId}${row.leaseAgentId ? ` (agent ${row.leaseAgentId})` : ""}${row.leaseExpiresAt ? ` until ${row.leaseExpiresAt.toISOString()}` : ""}`);
+    } else if (row.state !== "healthy" && row.cooldownUntil) {
+      parts.push(`cooldown until ${row.cooldownUntil.toISOString()}`);
+    }
+    return parts.join(", ");
+  }).join("; ");
+  return unprocessable(`No key slot of this connection's pool is available (${summary})`, {
+    code: "provider_key_pool_exhausted",
+  });
+}
+
+/**
+ * Ticket-02 assignment matrix: pin → sticky (cache affinity) → exclusive lease
+ * (least recently used) → fast-fail. Callers and the fall-through contract:
+ * a connection with no pool, or with zero enabled slots, returns null so the
+ * original single-credential path serves the request unchanged; a pool with
+ * enabled slots that cannot serve throws `provider_key_pool_exhausted` with a
+ * pool snapshot. Without a lease context the matrix only selects — no lease or
+ * stickiness writes.
  */
 export async function selectAssignablePoolSlot(
   db: Db,
   companyId: string,
   connectionId: string,
+  lease?: PoolSlotAssignmentContext,
 ): Promise<AssignablePoolSlot | null> {
-  const [slot] = await db
-    .select({ id: credentialPool.id, slot: credentialPool.slot, label: credentialPool.label, secretRef: credentialPool.secretRef })
+  const rows = await db
+    .select()
     .from(credentialPool)
-    .where(
-      and(
-        eq(credentialPool.companyId, companyId),
-        eq(credentialPool.connectionId, connectionId),
-        eq(credentialPool.enabled, true),
-        eq(credentialPool.state, "healthy"),
-      ),
-    )
-    .orderBy(asc(credentialPool.slot))
-    .limit(1);
-  return slot ?? null;
+    .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId)))
+    .orderBy(asc(credentialPool.slot));
+  if (!rows.length) return null;
+  const enabled = rows.filter((row) => row.enabled);
+  // Zero enabled slots means the operator switched the pool off: keep the
+  // ticket-01 fall-through to the single credential instead of failing runs.
+  if (!enabled.length) return null;
+  const runId = lease?.heartbeatRunId ?? null;
+  if (!runId) {
+    // Ephemeral selection for a resolution outside a run: pin, then sticky,
+    // then least-recently-used — no lease is taken and stickiness stays put.
+    const pinned = lease?.pinnedSlot != null ? enabled.find((row) => row.slot === lease.pinnedSlot) : undefined;
+    const healthy = enabled.filter((row) => row.state === "healthy");
+    const sticky = lease?.agentId
+      ? [...healthy].sort((a, b) => (b.lastAssignedAt?.getTime() ?? 0) - (a.lastAssignedAt?.getTime() ?? 0))
+        .find((row) => row.lastAssignedAgentId === lease.agentId)
+      : undefined;
+    const chosen = pinned ?? sticky ?? [...healthy].sort(mostStaleFirst)[0];
+    if (!chosen) throw poolExhaustedError(rows);
+    return { id: chosen.id, slot: chosen.slot, label: chosen.label, secretRef: chosen.secretRef };
+  }
+  const agentId = lease?.agentId ?? null;
+  const now = new Date();
+  // A lease is taken (or refreshed) by a conditional UPDATE that re-checks
+  // every eligibility criterion atomically — two runs can never hold the same
+  // slot because the second UPDATE re-reads the committed row and matches
+  // nothing (exclusive-lease cap of 1 active run per slot).
+  const takeLease = async (slotId: string) => {
+    const [row] = await db
+      .update(credentialPool)
+      .set({
+        activeRunId: runId,
+        leaseExpiresAt: new Date(now.getTime() + POOL_LEASE_TTL_MS),
+        leaseAgentId: agentId,
+        lastAssignedAgentId: agentId,
+        lastAssignedAt: now,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(credentialPool.id, slotId),
+          or(
+            isNull(credentialPool.activeRunId),
+            eq(credentialPool.activeRunId, runId),
+            lt(credentialPool.leaseExpiresAt, now),
+          ),
+        ),
+      )
+      .returning();
+    return row ?? null;
+  };
+  const logLease = (slot: number, pinned: boolean, expiresAt: Date) =>
+    logActivity(db, {
+      companyId,
+      ...poolLeaseActor,
+      action: "ai_connection.key_slot_leased",
+      entityType: "tool_connection",
+      entityId: connectionId,
+      runId,
+      agentId,
+      details: { slot, pinned, leaseExpiresAt: expiresAt.toISOString() },
+    }).catch((error) => logger.warn({ err: error, companyId, connectionId, runId }, "Key slot lease activity log pending"));
+  if (lease?.pinnedSlot != null) {
+    const pinned = rows.find((row) => row.slot === lease.pinnedSlot);
+    if (!pinned) {
+      throw unprocessable(`The pinned key slot ${lease.pinnedSlot} does not exist on this connection's key pool`, {
+        code: "ai_connection_pinned_slot_unavailable",
+      });
+    }
+    if (!pinned.enabled) {
+      throw unprocessable(`The pinned key slot ${lease.pinnedSlot} is disabled on this connection's key pool`, {
+        code: "ai_connection_pinned_slot_unavailable",
+      });
+    }
+    // Pin bypasses the cooldown state machine unconditionally (risk accepted by
+    // the operator), but never the operator's enabled switch or the exclusive
+    // lease of another run.
+    if (pinned.state !== "healthy") {
+      await logActivity(db, {
+        companyId,
+        ...poolLeaseActor,
+        action: "ai_connection.key_slot_pin_cooldown",
+        entityType: "tool_connection",
+        entityId: connectionId,
+        runId,
+        agentId,
+        details: { slot: pinned.slot, state: pinned.state, cooldownUntil: pinned.cooldownUntil?.toISOString() ?? null },
+      }).catch((error) => logger.warn({ err: error, companyId, connectionId, runId }, "Pinned cooldown slot activity log pending"));
+      logger.warn({ companyId, connectionId, runId, slot: pinned.slot, state: pinned.state },
+        "Pinned key slot is in cooldown and will be used anyway");
+    }
+    const taken = await takeLease(pinned.id);
+    if (taken) {
+      await logLease(taken.slot, true, taken.leaseExpiresAt!);
+      return { id: taken.id, slot: taken.slot, label: taken.label, secretRef: taken.secretRef };
+    }
+    throw poolExhaustedError(await db
+      .select()
+      .from(credentialPool)
+      .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId)))
+      .orderBy(asc(credentialPool.slot)));
+  }
+  // Sticky: the agent's last slot keeps its prompt cache (key = account) while
+  // it is healthy and free. A slot leased by this same run still counts — a
+  // credential re-resolution inside one run must land on the same slot.
+  if (agentId) {
+    const sticky = [...enabled]
+      .filter((row) => row.state === "healthy" && row.lastAssignedAgentId === agentId)
+      .sort((a, b) => (b.lastAssignedAt?.getTime() ?? Number.NEGATIVE_INFINITY) - (a.lastAssignedAt?.getTime() ?? Number.NEGATIVE_INFINITY) || a.slot - b.slot);
+    for (const candidate of sticky) {
+      const taken = await takeLease(candidate.id);
+      if (taken) {
+        await logLease(taken.slot, false, taken.leaseExpiresAt!);
+        return { id: taken.id, slot: taken.slot, label: taken.label, secretRef: taken.secretRef };
+      }
+    }
+  }
+  // Exclusive lease: least recently used first (NULL lastAssignedAt = never
+  // used). Each conditional UPDATE re-checks eligibility atomically, so a
+  // candidate another run just claimed simply fails and the next is tried.
+  const free = [...enabled]
+    .filter((row) => row.state === "healthy" && (!row.activeRunId || row.activeRunId === runId
+      || (row.leaseExpiresAt !== null && row.leaseExpiresAt < now)))
+    .sort(mostStaleFirst);
+  for (const candidate of free) {
+    const taken = await takeLease(candidate.id);
+    if (taken) {
+      await logLease(taken.slot, false, taken.leaseExpiresAt!);
+      return { id: taken.id, slot: taken.slot, label: taken.label, secretRef: taken.secretRef };
+    }
+  }
+  throw poolExhaustedError(await db
+    .select()
+    .from(credentialPool)
+    .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId)))
+    .orderBy(asc(credentialPool.slot)));
 }
 
 /** Resolves the pooled key value through the same encrypted company-secret path as the grant credential. */
@@ -57,6 +232,7 @@ export async function resolvePoolSlotValue(
   companyId: string,
   connectionId: string,
   slot: AssignablePoolSlot,
+  attribution?: { responsibleUserId?: string | null; heartbeatRunId?: string | null },
 ): Promise<string> {
   const [secret] = await db
     .select()
@@ -70,7 +246,40 @@ export async function resolvePoolSlotValue(
     configPath: credentialPoolSlotConfigPath(slot.slot),
     actorType: "system",
     actorId: null,
+    // Audit attribution mirrors the grant credential() path: the responsible
+    // user behind the run that consumed this pooled key.
+    responsibleUserId: attribution?.responsibleUserId ?? null,
+    heartbeatRunId: attribution?.heartbeatRunId ?? null,
   });
+}
+
+/**
+ * Terminal runs release their exclusive lease (success, failure, cancellation
+ * and setup failure all land here). Idempotent by run: a run without a lease
+ * updates nothing. Crashed runs are reclaimed by the lease TTL instead.
+ */
+export async function releaseRunPoolLease(db: Db, runId: string): Promise<number> {
+  const released = await db
+    .update(credentialPool)
+    .set({ activeRunId: null, leaseExpiresAt: null, leaseAgentId: null, updatedAt: new Date() })
+    .where(eq(credentialPool.activeRunId, runId))
+    .returning({
+      companyId: credentialPool.companyId,
+      connectionId: credentialPool.connectionId,
+      slot: credentialPool.slot,
+    });
+  for (const row of released) {
+    await logActivity(db, {
+      companyId: row.companyId,
+      ...poolLeaseActor,
+      action: "ai_connection.key_slot_released",
+      entityType: "tool_connection",
+      entityId: row.connectionId,
+      runId,
+      details: { slot: row.slot },
+    }).catch((error) => logger.warn({ err: error, companyId: row.companyId, connectionId: row.connectionId, runId }, "Key slot release activity log pending"));
+  }
+  return released.length;
 }
 
 function slotView(row: typeof credentialPool.$inferSelect): AiConnectionKeySlot {

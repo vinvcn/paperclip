@@ -249,6 +249,13 @@ export async function prepareManagedAiRuntime(
     allowUninstalledShared?: boolean;
     allowLegacyValidation?: boolean;
     config: Record<string, unknown>;
+    /** The run this preparation serves. Present for heartbeat runs: the key
+     * pool takes an exclusive lease on the resolved slot (activeRunId) and
+     * releases it at the run's terminal write. */
+    heartbeatRunId?: string | null;
+    /** Resolved key-slot pin (task override, else agent adapterConfig.keySlot).
+     * Assignment uses the pinned slot unconditionally — cooldown included. */
+    pinnedKeySlot?: number | null;
   },
 ) {
   const configuredEnv =
@@ -314,19 +321,28 @@ export async function prepareManagedAiRuntime(
       return (await db.select({ epoch: companySecrets.aiSessionEpoch, version: companySecrets.latestVersion })
         .from(companySecrets).where(and(eq(companySecrets.companyId, input.companyId), eq(companySecrets.id, credentialRef.secretId))).limit(1))[0];
     };
-    const { value, freshness } = await (async () => {
-      if (noAuth) return { value: "", freshness: undefined };
+    const { value, freshness, keySlot } = await (async () => {
+      if (noAuth) return { value: "", freshness: undefined, keySlot: null as number | null };
       // Recovering a rotated quota token can advance the secret version during
       // the first read. Re-read the saved credential, retaining the epoch guard
       // against a concurrent reconnect or explicit rotation.
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const before = await readFreshness();
         const ownership = managedProbeCredentialLocks.getStore();
-        const value = await service.runtimeCredential(selection,
-          ownership?.active && ownership.companyId === input.companyId ? { credentialLockHeld: true } : undefined);
+        const resolution = await service.runtimeCredential(selection, {
+          ...(ownership?.active && ownership.companyId === input.companyId ? { credentialLockHeld: true as const } : {}),
+          // The run's exclusive key-pool lease: assignment, stickiness and the
+          // projected PAPERCLIP_AI_PROVIDER_KEY_SLOT all key off this context.
+          pool: {
+            agentId: input.agentId,
+            heartbeatRunId: input.heartbeatRunId ?? null,
+            pinnedSlot: input.pinnedKeySlot ?? null,
+          },
+        });
+        const value = resolution.value;
         const after = await readFreshness();
         if (before && after && before.version === after.version && before.epoch === after.epoch) {
-          return { value, freshness: after };
+          return { value, freshness: after, keySlot: resolution.keySlot };
         }
         if (!before || before.epoch !== after?.epoch) break;
       }
@@ -401,7 +417,7 @@ export async function prepareManagedAiRuntime(
       }), { mode: 0o600 });
       if (antigravitySubscription) await writeFile(authFile, originalCredential, { mode: 0o600 });
     }
-    const projected = routing ? managedProviderRouting(routing, harness, value, typeof input.config.model === "string" ? input.config.model : "") : undefined;
+    const projected = routing ? managedProviderRouting(routing, harness, value, typeof input.config.model === "string" ? input.config.model : "", keySlot) : undefined;
     if (projected) {
       const customHeaders = env.ANTHROPIC_CUSTOM_HEADERS ?? process.env.ANTHROPIC_CUSTOM_HEADERS;
       Object.assign(env, projected.env);
@@ -431,7 +447,15 @@ export async function prepareManagedAiRuntime(
       .digest("hex")
       .slice(0, 16);
     const identity = `${selection.grant.id}:${input.responsibleUserId ?? "shared"}:${generation}`;
-    const sessionIdentity = `${selection.grant.id}:${input.responsibleUserId ?? "shared"}:${noAuth ? "no-auth" : `${credentialRef!.secretId}:${freshness!.epoch}`}`;
+    // Pooled credentials must bind the warm session to its slot: the session
+    // captured one key at creation (opencode driver builds the provider proxy
+    // from the session-time environment once), so a later run resolved to a
+    // different slot gets a different sessionIdentity and the stored identity
+    // comparison forces a session rebuild instead of reusing the old key.
+    // per_turn lifecycle sessions are short-lived and unaffected by default.
+    const sessionIdentity = `${selection.grant.id}:${input.responsibleUserId ?? "shared"}:${
+      noAuth ? "no-auth" : keySlot !== null ? `pool-slot-${keySlot}:${credentialRef!.secretId}:${freshness!.epoch}` : `${credentialRef!.secretId}:${freshness!.epoch}`
+    }`;
     let homeRemoved = false;
     let ownsGoogleRecovery = false;
     let removalOnly = false;
@@ -606,6 +630,9 @@ export async function prepareManagedAiRuntime(
     };
     return {
       sessionIdentity,
+      // The key-pool slot this runtime's credential came from (null when the
+      // connection has no pool); mirrored into env.PAPERCLIP_AI_PROVIDER_KEY_SLOT.
+      keySlot,
       ...(retainedCleanupScope ? { retainedCleanupScope } : {}),
       ...(subscriptionFile && input.binding.provider === "openai" && credentialRef && freshness ? {
         credentialWriteback: { grantId: selection.grant.id, secretId: credentialRef.secretId, sessionEpoch: freshness.epoch,

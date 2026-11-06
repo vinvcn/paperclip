@@ -989,25 +989,44 @@ export function aiConnectionService(db: Db) {
   }
 
   /** Never hand a consumed token to a new provider while its replacement awaits commit. */
-  async function runtimeCredential(row: Parameters<typeof credential>[0], ownership?: { credentialLockHeld: true }) {
+  async function runtimeCredential(row: Parameters<typeof credential>[0], options?: {
+    credentialLockHeld?: true;
+    /** Key-pool assignment context: the run taking the exclusive lease, its
+     * agent, and the key-slot pin resolved from agent adapterConfig.keySlot or
+     * the task's assigneeAdapterOverrides.keySlot. Omitted for resolutions
+     * outside a run (selection only, no lease). */
+    pool?: { agentId?: string | null; heartbeatRunId?: string | null; pinnedSlot?: number | null };
+  }): Promise<{ value: string; keySlot: number | null }> {
     const metadata = aiConnectionMetadataSchema.safeParse(row.connection.config.ai);
-    // Key pool: a connection with pool slots resolves its key from the pool
-    // instead of the single grant credential. Assignment is the ticket-01
-    // minimal rule (lowest healthy slot); ticket 02 replaces it with the full
-    // matrix. Only keyed (api_key) connections pool credentials — subscription
-    // credentials are rotating OAuth token blobs, and no-auth connections need
-    // no key at all. No pool, or no assignable slot, falls through to the
-    // original single-credential path unchanged (backward compatible).
+    // Key pool: a connection with pool slots resolves its key through the
+    // ticket-02 assignment matrix (pin → sticky → exclusive lease → fast-fail)
+    // instead of the single grant credential. Only keyed (api_key) connections
+    // pool credentials — subscription credentials are rotating OAuth token
+    // blobs, and no-auth connections need no key at all. No pool, or zero
+    // enabled slots, falls through to the original single-credential path
+    // unchanged (backward compatible); a pool with enabled slots that cannot
+    // serve fails fast with `provider_key_pool_exhausted` and a pool snapshot.
     if (metadata.success && metadata.data.method === "api_key" && metadata.data.routing?.auth !== "none") {
-      const slot = await selectAssignablePoolSlot(db, row.connection.companyId, row.connection.id);
-      if (slot) return resolvePoolSlotValue(db, row.connection.companyId, row.connection.id, slot);
+      const slot = await selectAssignablePoolSlot(db, row.connection.companyId, row.connection.id, options?.pool && {
+        agentId: options.pool.agentId ?? null,
+        heartbeatRunId: options.pool.heartbeatRunId ?? null,
+        pinnedSlot: options.pool.pinnedSlot ?? null,
+      });
+      if (slot) return {
+        value: await resolvePoolSlotValue(db, row.connection.companyId, row.connection.id, slot, {
+          // Audit attribution mirrors the grant credential() path.
+          responsibleUserId: row.grant.subjectUserId,
+          heartbeatRunId: options?.pool?.heartbeatRunId ?? null,
+        }),
+        keySlot: slot.slot,
+      };
     }
-    if (!metadata.success || !["openai", "google"].includes(metadata.data.provider) || metadata.data.method !== "subscription") return credential(row);
+    if (!metadata.success || !["openai", "google"].includes(metadata.data.provider) || metadata.data.method !== "subscription") return { value: await credential(row), keySlot: null };
     // Retirement callbacks acquire this same mutation lock to persist their
     // final generation. Join them before taking the lock they need. A caller
     // already holding it must only check, for both rotated-credential lanes.
     const scope = { companyId: row.connection.companyId, accountKey: row.grant.id };
-    if (ownership?.credentialLockHeld) assertAiCredentialCleanupSettled(scope);
+    if (options?.credentialLockHeld) assertAiCredentialCleanupSettled(scope);
     else await reconcileRetainedAiCleanup(scope);
     let savingReplacement = false;
     return withAccountHomeSecretMutationLock(undefined, row.connection.companyId, async () => {
@@ -1059,7 +1078,7 @@ export function aiConnectionService(db: Db) {
       });
       if (recovered) await quotaCredentialRecovery(row.connection.companyId, row.grant.id).clear()
         .catch(error => logger.warn({ err: error, grantId: row.grant.id }, "Saved runtime credential recovery cleanup pending"));
-      return value;
+      return { value, keySlot: null };
     }).catch(error => {
       // Once a matching replacement is found, a failed write or commit must
       // defer execution. Keep its journal so the next attempt can save it.
