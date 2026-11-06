@@ -1178,10 +1178,26 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           : null;
       })
       .catch(() => null);
-    // failRun settles a throw from the adapter try block, so the run's usage
-    // request rows are already durable: classify a terminal 429 the same way
-    // the completion path does (ticket 05). A stop that lands during the
-    // failure settles as a cancellation, not a rate-limited terminal.
+    // failRun settles a throw from the adapter try block, so most of the run's
+    // usage request rows are already durable — but a provider_request that
+    // committed to the durable log after the executor's live consumer stopped
+    // is only persisted by the same sweep the completion path runs. Sweep
+    // here too (idempotent per request id), then classify a terminal 429 the
+    // same way the completion path does (ticket 05). A stop that lands during
+    // the failure settles as a cancellation, not a rate-limited terminal.
+    try {
+      await sweepRunUsageRequestLogEvents(db, {
+        companyId: run.companyId,
+        runId: run.id,
+        agentId: run.agentId,
+        issueId,
+      });
+    } catch (error) {
+      logger.warn(
+        { error, runId: run.id },
+        "usage request log sweep failed without affecting run outcome",
+      );
+    }
     const rateLimitFailure = signal.aborted
       ? null
       : await classifyRunRateLimitFailure(db, {

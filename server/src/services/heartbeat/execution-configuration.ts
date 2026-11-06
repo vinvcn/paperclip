@@ -33,8 +33,8 @@ import type { createHeartbeatRetries } from "./retries.js";
 import type { createHeartbeatLifecycle } from "./run-lifecycle.js";
 import { createHeartbeatPreparationTiming } from "./preparation-timing.js";
 import {
-  ConfigurationIncompleteFailure, KEY_POOL_EXHAUSTED_FAILURE_CODE, KeyPoolExhaustedFailure,
-  applyRunScopedMentionedSkillKeys, resolveExecutionRunAdapterConfig,
+  ConfigurationIncompleteFailure,
+  applyRunScopedMentionedSkillKeys, keyPoolExhaustedFailureFromHttpError, resolveExecutionRunAdapterConfig,
   resolveRunScopedMentionedSkillKeys, type createHeartbeatRunPreparation, type resolveAcceptedPlanWakeRoutingDecision,
 } from "./run-preparation.js";
 import { buildExecutionWorkspaceConfigSnapshot, stripWorkspaceRuntimeFromExecutionRunConfig } from "./workspaces.js";
@@ -227,28 +227,8 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       // run at all. Re-throw as the typed failure so the setup settlement
       // records the dedicated errorCode plus the pool snapshot, instead of a
       // configuration-incomplete blocker routed at the connection settings.
-      if (
-        error instanceof HttpError &&
-        error.status === 422 &&
-        parseObject(error.details).code === KEY_POOL_EXHAUSTED_FAILURE_CODE
-      ) {
-        const details = parseObject(error.details);
-        throw new KeyPoolExhaustedFailure(
-          error instanceof Error ? error.message : "The connection's key pool cannot serve this run",
-          {
-            keyPoolFailure: {
-              reason: "pool_exhausted",
-              ...(typeof details.connectionId === "string" && details.connectionId
-                ? { connectionId: details.connectionId }
-                : {}),
-              ...(typeof details.model === "string" && details.model
-                ? { model: details.model }
-                : {}),
-              slots: Array.isArray(details.pool) ? details.pool : [],
-            },
-          },
-        );
-      }
+      const keyPoolExhausted = keyPoolExhaustedFailureFromHttpError(error);
+      if (keyPoolExhausted) throw keyPoolExhausted;
       if (responsibleUserId && issueId) {
         await connectionIntentService(db).request({ sub: agent.id, company_id: agent.companyId, run_id: run.id, responsible_user_id: responsibleUserId }, aiBinding.provider, { purpose: "ai" }).catch(() => {
           logger.warn({ runId: run.id, agentId: agent.id }, "Could not attach AI connection request; runtime configuration action remains available");

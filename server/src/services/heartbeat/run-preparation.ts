@@ -169,6 +169,32 @@ export function isKeyPoolExhaustedFailure(error: unknown): error is KeyPoolExhau
   return error instanceof KeyPoolExhaustedFailure;
 }
 
+// Assignment-time pool exhaustion arrives here as the pool service's
+// HttpError(422, code) with the pool snapshot in its details (ticket 02).
+// Convert it to the typed failure so the setup settlement records the
+// dedicated errorCode plus the snapshot, instead of a configuration-incomplete
+// blocker routed at the connection settings. Returns null for anything else.
+export function keyPoolExhaustedFailureFromHttpError(error: unknown): KeyPoolExhaustedFailure | null {
+  if (!(error instanceof HttpError) || error.status !== 422) return null;
+  const details = parseObject(error.details);
+  if (details.code !== KEY_POOL_EXHAUSTED_FAILURE_CODE) return null;
+  return new KeyPoolExhaustedFailure(
+    error instanceof Error ? error.message : "The connection's key pool cannot serve this run",
+    {
+      keyPoolFailure: {
+        reason: "pool_exhausted",
+        ...(typeof details.connectionId === "string" && details.connectionId
+          ? { connectionId: details.connectionId }
+          : {}),
+        ...(typeof details.model === "string" && details.model
+          ? { model: details.model }
+          : {}),
+        slots: Array.isArray(details.pool) ? details.pool : [],
+      },
+    },
+  );
+}
+
 // Pre-dispatch gate outcome: required secret/env bindings are missing, so the
 // run must not be dispatched. Surfaced as a configuration-incomplete blocker
 // routed to a human owner instead of N opaque dispatched-then-failed runs.
