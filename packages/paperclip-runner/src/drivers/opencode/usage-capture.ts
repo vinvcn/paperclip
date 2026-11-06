@@ -24,6 +24,9 @@ export interface UsageCaptureSink {
 export function createUsageCaptureSink(input: {
   app: string;
   model: string;
+  /** Pooled key attribution (ticket 04); absent for non-pooled credentials. */
+  keySlot?: number | null;
+  connectionId?: string | null;
   capacity?: number;
 }): UsageCaptureSink {
   const capacity = input.capacity ?? 4096;
@@ -37,6 +40,8 @@ export function createUsageCaptureSink(input: {
         provider,
         biller,
         model: input.model,
+        keySlot: input.keySlot ?? null,
+        connectionId: input.connectionId ?? null,
         ...observation,
       };
       if (deliver) {

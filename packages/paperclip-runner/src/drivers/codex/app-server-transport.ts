@@ -213,9 +213,10 @@ const SAFE_ENVIRONMENT_KEYS = [
   "ALL_PROXY",
   "CODEX_HOME",
   // Only the selected managed provider credential enters the trusted server.
-  // Its non-secret slot provenance marker rides the same channel.
+  // Its non-secret slot provenance markers ride the same channel.
   "PAPERCLIP_AI_PROVIDER_KEY",
   "PAPERCLIP_AI_PROVIDER_KEY_SLOT",
+  "PAPERCLIP_AI_PROVIDER_CONNECTION_ID",
   "HOME",
   "HTTP_PROXY",
   "HTTPS_PROXY",

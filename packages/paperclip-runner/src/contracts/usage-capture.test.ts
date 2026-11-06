@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  AI_PROVIDER_CONNECTION_ID_ENV,
+  AI_PROVIDER_KEY_SLOT_ENV,
+  connectionIdFromEnvironment,
+  keySlotFromEnvironment,
   parseProviderRequestUsageRecord,
   usageCaptureEnabled,
   usageProviderAndBillerFromModel,
@@ -23,6 +27,8 @@ function validRecord(overrides: Partial<ProviderRequestUsageRecord> = {}): Provi
     providerRequestId: "upstream-1",
     usage: { inputTokens: 100, cachedInputTokens: 40, cacheWriteTokens: null, outputTokens: 20 },
     usageMissing: false,
+    keySlot: null,
+    connectionId: null,
     ...overrides,
   };
 }
@@ -37,6 +43,26 @@ describe("usage capture contract", () => {
     expect(usageCaptureEnabled({ [USAGE_CAPTURE_ENV]: "0" })).toBe(false);
     expect(usageCaptureEnabled({ [USAGE_CAPTURE_ENV]: "off" })).toBe(false);
     expect(usageCaptureEnabled({ [USAGE_CAPTURE_ENV]: "OFF" })).toBe(false);
+  });
+
+  it("reads the pooled key slot and its owning connection from the projected environment (ticket 04)", () => {
+    expect(AI_PROVIDER_KEY_SLOT_ENV).toBe("PAPERCLIP_AI_PROVIDER_KEY_SLOT");
+    expect(AI_PROVIDER_CONNECTION_ID_ENV).toBe("PAPERCLIP_AI_PROVIDER_CONNECTION_ID");
+    const pooled = { [AI_PROVIDER_KEY_SLOT_ENV]: "3", [AI_PROVIDER_CONNECTION_ID_ENV]: "conn-uuid-1" };
+    expect(keySlotFromEnvironment(pooled)).toBe(3);
+    expect(connectionIdFromEnvironment(pooled)).toBe("conn-uuid-1");
+    // No projection (non-pool credentials, probes, direct traffic): no attribution.
+    expect(keySlotFromEnvironment(undefined)).toBeNull();
+    expect(keySlotFromEnvironment({})).toBeNull();
+    expect(keySlotFromEnvironment({ [AI_PROVIDER_KEY_SLOT_ENV]: "" })).toBeNull();
+    expect(connectionIdFromEnvironment(undefined)).toBeNull();
+    expect(connectionIdFromEnvironment({})).toBeNull();
+    expect(connectionIdFromEnvironment({ [AI_PROVIDER_CONNECTION_ID_ENV]: "" })).toBeNull();
+    // A malformed slot is "not pooled", never a bogus attribution.
+    expect(keySlotFromEnvironment({ [AI_PROVIDER_KEY_SLOT_ENV]: "abc" })).toBeNull();
+    expect(keySlotFromEnvironment({ [AI_PROVIDER_KEY_SLOT_ENV]: "1.5" })).toBeNull();
+    expect(keySlotFromEnvironment({ [AI_PROVIDER_KEY_SLOT_ENV]: "-2" })).toBeNull();
+    expect(keySlotFromEnvironment({ [AI_PROVIDER_KEY_SLOT_ENV]: "1000001" })).toBeNull();
   });
 
   it("splits provider and biller the same way the server's native billing does", () => {
@@ -138,5 +164,41 @@ describe("usage capture contract", () => {
       { kind: PROVIDER_REQUEST_USAGE_KIND, request: validRecord({ usageMissing: "yes" as unknown as boolean }) },
       now,
     )).toBeNull();
+  });
+
+  it("carries key-slot attribution through the durable parse boundary (ticket 04)", () => {
+    const now = Date.now();
+    // A pooled record round-trips both fields.
+    const pooled = validRecord({ keySlot: 3, connectionId: "conn-uuid-1" });
+    expect(parseProviderRequestUsageRecord({ kind: PROVIDER_REQUEST_USAGE_KIND, request: pooled }, now)).toEqual(pooled);
+    // Older runner builds do not send the fields; they parse as unattributed.
+    const legacy = validRecord() as Partial<ProviderRequestUsageRecord>;
+    delete legacy.keySlot;
+    delete legacy.connectionId;
+    expect(parseProviderRequestUsageRecord(
+      { kind: PROVIDER_REQUEST_USAGE_KIND, request: legacy as ProviderRequestUsageRecord },
+      now,
+    )).toMatchObject({ keySlot: null, connectionId: null });
+    // Explicit nulls stay null.
+    expect(parseProviderRequestUsageRecord(
+      { kind: PROVIDER_REQUEST_USAGE_KIND, request: validRecord({ keySlot: null, connectionId: null }) },
+      now,
+    )).toMatchObject({ keySlot: null, connectionId: null });
+  });
+
+  it("drops records with malformed key attribution instead of storing it", () => {
+    const now = Date.now();
+    const cases: Array<Partial<ProviderRequestUsageRecord>> = [
+      { keySlot: -1 },
+      { keySlot: 1.5 },
+      { keySlot: 1_000_001 },
+      { keySlot: "3" as unknown as number },
+      { connectionId: "" },
+      { connectionId: "x".repeat(201) },
+      { connectionId: 42 as unknown as string },
+    ];
+    for (const overrides of cases) {
+      expect(parseProviderRequestUsageRecord({ kind: PROVIDER_REQUEST_USAGE_KIND, request: validRecord(overrides) }, now)).toBeNull();
+    }
   });
 });

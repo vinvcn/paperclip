@@ -67,6 +67,19 @@ describe('controller-configured environment across native runner boundaries', ()
     const rustAllowlist = readFileSync(new URL('../runner/crates/runner-core/src/configured_environment.rs', import.meta.url), 'utf8');
     expect(rustAllowlist).toContain('"PAPERCLIP_AI_PROVIDER_KEY_SLOT"');
   });
+
+  it('admits the key-pool connection marker beside the slot at every runner environment boundary (ticket 04)', async () => {
+    const readFileSync = (await import('node:fs')).readFileSync;
+    // The connection id rides the same channel as the slot so usage records
+    // can attribute rows to the pool's connection (review F2). The same three
+    // boundaries apply.
+    const connectionEnv = { PAPERCLIP_AI_PROVIDER_CONNECTION_ID: 'conn-uuid-1' };
+    expect(createSanitizedCodexEnvironment({ ...source, ...connectionEnv }).PAPERCLIP_AI_PROVIDER_CONNECTION_ID).toBe('conn-uuid-1');
+    expect(createCapabilityRunnerdProviderEnvironment({ provider: 'opencode', options: { environment: { ...source, ...connectionEnv } }, identity, codexHome: '/isolated/codex-home', runtimeContextPath: '/isolated/runtime-context.json', hasRuntimeContext: false }).PAPERCLIP_AI_PROVIDER_CONNECTION_ID).toBe('conn-uuid-1');
+    expect(GENERATED_RUNTIME_ENVIRONMENT_KEYS.has('PAPERCLIP_AI_PROVIDER_CONNECTION_ID')).toBe(true);
+    const rustAllowlist = readFileSync(new URL('../runner/crates/runner-core/src/configured_environment.rs', import.meta.url), 'utf8');
+    expect(rustAllowlist).toContain('"PAPERCLIP_AI_PROVIDER_CONNECTION_ID"');
+  });
 });
 
 
