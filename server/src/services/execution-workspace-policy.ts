@@ -396,9 +396,10 @@ export function resolveExecutionWorkspaceMode(input: {
 
 interface ParsedIssueAssigneeAdapterOverrides {
   adapterConfig: Record<string, unknown> | null;
-  /** Task-level key-slot pin (shared schema guarantees a positive integer or
-   * null); wins over the agent's adapterConfig.keySlot. */
-  keySlot: number | null;
+  /** Task-level key-slot pin (shared schema guarantees a positive integer);
+   * present only when the task pins a slot — wins over the agent's
+   * adapterConfig.keySlot. */
+  keySlot?: number;
   useProjectWorkspace: boolean | null;
 }
 
@@ -422,7 +423,9 @@ export function parseIssueAssigneeAdapterOverrides(
   if (!adapterConfig && keySlot === null && useProjectWorkspace === null) return null;
   return {
     adapterConfig,
-    keySlot,
+    // Only a pinned slot adds the key, so overrides without a pin keep the
+    // exact shape this helper has always returned.
+    ...(keySlot !== null ? { keySlot } : {}),
     useProjectWorkspace,
   };
 }
