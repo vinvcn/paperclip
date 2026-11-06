@@ -149,6 +149,9 @@ export interface IssueCreationSource {
 
 export interface IssueAssigneeAdapterOverrides {
   adapterConfig?: Record<string, unknown>;
+  /** Task-level key-slot pin for pooled credential connections; wins over the
+   * agent's adapterConfig.keySlot. Null/omitted keeps the agent pin. */
+  keySlot?: number | null;
   useProjectWorkspace?: boolean;
 }
 

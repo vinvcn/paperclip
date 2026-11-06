@@ -51,13 +51,25 @@ export type UpsertAgentInstructionsFile = z.infer<typeof upsertAgentInstructions
 
 const adapterConfigSchema = z.record(z.string(), z.unknown()).superRefine((value, ctx) => {
   const envValue = value.env;
-  if (envValue === undefined) return;
-  const parsed = envConfigSchema.safeParse(envValue);
-  if (!parsed.success) {
+  if (envValue !== undefined) {
+    const parsed = envConfigSchema.safeParse(envValue);
+    if (!parsed.success) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "adapterConfig.env must be a map of valid env bindings",
+        path: ["env"],
+      });
+    }
+  }
+  // Key-slot pin for pooled credential connections (ticket 02): null clears
+  // the pin; anything else must be a positive integer slot number.
+  const keySlot = value.keySlot;
+  if (keySlot !== undefined && keySlot !== null
+    && (typeof keySlot !== "number" || !Number.isInteger(keySlot) || keySlot < 1)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      message: "adapterConfig.env must be a map of valid env bindings",
-      path: ["env"],
+      message: "adapterConfig.keySlot must be a positive integer slot number",
+      path: ["keySlot"],
     });
   }
 });

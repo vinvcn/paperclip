@@ -678,6 +678,18 @@ describe("issue validators", () => {
     expect(updateIssueSchema.safeParse(overrides).success).toBe(false);
   });
 
+  it.each([3, null])("accepts task-level key slot pin %p on create and update", keySlot => {
+    const overrides = { assigneeAdapterOverrides: { keySlot } };
+    expect(createIssueSchema.safeParse({ title: "Task", ...overrides }).success).toBe(true);
+    expect(updateIssueSchema.safeParse(overrides).success).toBe(true);
+  });
+
+  it.each([0, -2, 1.5, "3", true])("rejects task-level key slot pin %p", keySlot => {
+    const overrides = { assigneeAdapterOverrides: { keySlot } };
+    expect(createIssueSchema.safeParse({ title: "Task", ...overrides }).success).toBe(false);
+    expect(updateIssueSchema.safeParse(overrides).success).toBe(false);
+  });
+
   it("rejects retired model profiles in agent runtime config", () => {
     const parsed = createAgentSchema.safeParse({
       name: "Coder",

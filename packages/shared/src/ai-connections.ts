@@ -1,6 +1,14 @@
 import { z } from "zod";
 import { aiProviderRoutingSchema, aiRoutingHarness, isAiRoutingCompatible, type AiProviderRouting } from "./ai-provider-routing.js";
 
+/** Key-slot pin: names one credential_pool slot by number. An agent pins its
+ * default through adapterConfig.keySlot; a task overrides it through
+ * assigneeAdapterOverrides.keySlot. Assignment honors the pin unconditionally
+ * (cooldown included); a disabled slot stays off and a missing slot fails the
+ * run. Non-integers and non-positive slots are rejected. */
+export const aiConnectionKeySlotPinSchema = z.number().int().min(1).nullable();
+export type AiConnectionKeySlotPin = NonNullable<z.infer<typeof aiConnectionKeySlotPinSchema>>;
+
 /** Runtime authentication is a separate transport, never a tool or channel. */
 export const connectionPurposeTransportSchema = z.discriminatedUnion(
   "connectionPurpose",
