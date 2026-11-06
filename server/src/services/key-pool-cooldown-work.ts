@@ -147,11 +147,26 @@ async function probeOnce(
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${keyValue}` },
     body: JSON.stringify({ model: row.model, messages: [{ role: "user", content: "ping" }], max_tokens: 1 }),
-    signal,
+    // Hard bound (review F4): a silent upstream must never hang the sweep. The
+    // caller's abort wins first; the 60s timeout backs it — the runner proxy
+    // gives full agent traffic 600s (provider-proxy.ts), but a 1-token probe
+    // needs a fraction of that. A timed-out fetch rejects, so the sweep leaves
+    // the row untouched for the worker's retry (upstream silence is not quota
+    // evidence).
+    signal: AbortSignal.any([
+      ...(signal ? [signal] : []),
+      AbortSignal.timeout(60_000),
+    ]),
   });
   const body = await response.json().catch(() => null);
   const usage = (body as { usage?: { prompt_tokens?: unknown; completion_tokens?: unknown } } | null)?.usage;
-  const { provider, biller } = usageProviderAndBillerFromModel(row.model);
+  // Review F3: derive provider/biller from the model form the usage log
+  // stores — normal rows record the routed `paperclip/<model>` string
+  // (biller "paperclip"), so the bare cooldown id must not split the same
+  // model into a second billing group on the Usage page. (Assumes the
+  // opencode_local routed form; ticket 04's metadata.connectionId
+  // groundwork narrows this.)
+  const { provider, biller } = usageProviderAndBillerFromModel(`paperclip/${row.model}`);
   await db.insert(usageRequestLogs).values({
     companyId: row.companyId,
     runId: row.lastRunId,

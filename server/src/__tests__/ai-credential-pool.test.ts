@@ -801,8 +801,12 @@ describe("key pool probe worker (ticket 03)", () => {
     // run whose 429 started the cooldown, flagged as a probe.
     const usage = await probeUsageRows();
     expect(usage).toHaveLength(1);
+    // Review F3: provider/biller derive from the model form the usage log
+    // stores — normal rows record `paperclip/<model>` (biller "paperclip"), so the
+    // probe's row must not split the same model into a second billing group.
     expect(usage[0]).toMatchObject({
       runId, httpStatus: 200, model: MODEL_A, inputTokens: 1, outputTokens: 1,
+      provider: "paperclip", biller: "paperclip",
       metadata: { probe: true, keySlot: 1 },
     });
     expect(usage[0]!.requestId).toMatch(/^keypool-probe-/);
@@ -841,6 +845,33 @@ describe("key pool probe worker (ticket 03)", () => {
     expect(after.cooldownUntil!.getTime()).toBe(before.cooldownUntil!.getTime());
     expect(await probeUsageRows()).toHaveLength(0);
     expect(await activityActions()).toHaveLength(0);
+  });
+
+  it("bounds the probe fetch with a hard timeout signal and honors the caller's abort (review F4)", async () => {
+    const signals: AbortSignal[] = [];
+    const capturingFetch: typeof fetch = async (_url, init) => {
+      signals.push(init?.signal as AbortSignal);
+      return new Response("{}", { status: 200 });
+    };
+    // Even with no caller signal the fetch carries a signal: a silent upstream
+    // must never hang the sweep (the hard timeout composes in).
+    const runId = await newRun();
+    await insertDueCooldown(MODEL_A, runId);
+    await probeDueSlotCooldowns(db, new Date(), { fetchImpl: capturingFetch });
+    expect(signals[0]).toBeInstanceOf(AbortSignal);
+    expect(signals[0]!.aborted).toBe(false);
+    // The caller's abort still propagates through the composition.
+    await insertDueCooldown(MODEL_B, await newRun());
+    const controller = new AbortController();
+    const held: AbortSignal[] = [];
+    const secondFetch: typeof fetch = async (_url, init) => {
+      held.push(init?.signal as AbortSignal);
+      return new Response("{}", { status: 200 });
+    };
+    await probeDueSlotCooldowns(db, new Date(), { fetchImpl: secondFetch, signal: controller.signal });
+    controller.abort();
+    expect(held[0]).toBeInstanceOf(AbortSignal);
+    expect(held[0]!.aborted).toBe(true);
   });
 
   it("skips rows without run attribution and rows whose connection is not an api-key gateway", async () => {
