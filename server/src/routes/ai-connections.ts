@@ -27,6 +27,8 @@ import {
   type AiConnectionBinding,
   type AiConnectionList,
   aiConnectionPoolConfigSchema,
+  aiConnectionKeySlotCreateSchema,
+  aiConnectionKeySlotUpdateSchema,
 } from "@paperclipai/shared";
 import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { forbidden, notFound, unprocessable } from "../errors.js";
@@ -34,6 +36,7 @@ import { accessService } from "../services/access.js";
 import { logActivity } from "../services/activity-log.js";
 import { aiConnectionRouterService } from "../services/ai-connection-router.js";
 import { aiConnectionService } from "../services/ai-connections.js";
+import { aiCredentialPoolService } from "../services/ai-credential-pool.js";
 import { validate } from "../middleware/validate.js";
 import { probeCopilotConnection } from "../services/copilot-connection-probe.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -155,6 +158,7 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
   const service = aiConnectionService(db);
   const localLogin = localAiLoginService(db);
   const pools = aiConnectionRouterService(db);
+  const keyPools = aiCredentialPoolService(db);
   router.get("/companies/:companyId/ai-connection-pools", managementGuard("connections:read", "GET /companies/:companyId/ai-connection-pools", { personal: true }), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertBoardOrAgent(req); assertCompanyAccess(req, companyId);
@@ -306,6 +310,66 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
             ),
           ),
       );
+    },
+  );
+  router.get(
+    "/companies/:companyId/ai-connections/:connectionId/keys", managementGuard("connections:read", "GET /companies/:companyId/ai-connections/:connectionId/keys", { personal: true }),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertBoardOrAgent(req);
+      assertCompanyAccess(req, companyId);
+      if (!(await canManageAiConnections(db, req, companyId))) throw forbidden("Manage connections permission is required");
+      const connectionId = req.params.connectionId as string;
+      if (!z.string().uuid().safeParse(connectionId).success) throw unprocessable("Invalid connection ID");
+      res.setHeader("Cache-Control", "no-store");
+      res.json(await keyPools.listSlots(companyId, connectionId));
+    },
+  );
+  router.post(
+    "/companies/:companyId/ai-connections/:connectionId/keys", managementGuard("connections:configure", "POST /companies/:companyId/ai-connections/:connectionId/keys", { personal: true }),
+    validate(aiConnectionKeySlotCreateSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertBoardOrAgent(req);
+      assertCompanyAccess(req, companyId);
+      if (!(await canManageAiConnections(db, req, companyId))) throw forbidden("Manage connections permission is required");
+      const connectionId = req.params.connectionId as string;
+      if (!z.string().uuid().safeParse(connectionId).success) throw unprocessable("Invalid connection ID");
+      const input = aiConnectionKeySlotCreateSchema.parse(req.body);
+      const actor = getActorInfo(req);
+      res.status(201).json(await keyPools.addSlot(companyId, connectionId, input, { actorType: actor.actorType, actorId: actor.actorId }));
+    },
+  );
+  router.patch(
+    "/companies/:companyId/ai-connections/:connectionId/keys", managementGuard("connections:configure", "PATCH /companies/:companyId/ai-connections/:connectionId/keys", { personal: true }),
+    validate(aiConnectionKeySlotUpdateSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertBoardOrAgent(req);
+      assertCompanyAccess(req, companyId);
+      if (!(await canManageAiConnections(db, req, companyId))) throw forbidden("Manage connections permission is required");
+      const connectionId = req.params.connectionId as string;
+      if (!z.string().uuid().safeParse(connectionId).success) throw unprocessable("Invalid connection ID");
+      const input = aiConnectionKeySlotUpdateSchema.parse(req.body);
+      if (input.label === undefined && input.enabled === undefined && input.keyValue === undefined)
+        throw unprocessable("Provide a label, a key value, or an enabled flag to change");
+      const actor = getActorInfo(req);
+      res.json(await keyPools.updateSlot(companyId, connectionId, input, { actorType: actor.actorType, actorId: actor.actorId }));
+    },
+  );
+  router.delete(
+    "/companies/:companyId/ai-connections/:connectionId/keys", managementGuard("connections:configure", "DELETE /companies/:companyId/ai-connections/:connectionId/keys", { personal: true }),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertBoardOrAgent(req);
+      assertCompanyAccess(req, companyId);
+      if (!(await canManageAiConnections(db, req, companyId))) throw forbidden("Manage connections permission is required");
+      const connectionId = req.params.connectionId as string;
+      if (!z.string().uuid().safeParse(connectionId).success) throw unprocessable("Invalid connection ID");
+      const { slot } = z.object({ slot: z.number().int().min(1).max(100) }).strict().parse(req.body);
+      const actor = getActorInfo(req);
+      await keyPools.removeSlot(companyId, connectionId, slot, { actorType: actor.actorType, actorId: actor.actorId });
+      res.json({ ok: true });
     },
   );
   router.post(

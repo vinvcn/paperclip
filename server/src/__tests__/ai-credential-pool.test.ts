@@ -23,6 +23,10 @@ import { aiConnectionService } from "../services/ai-connections.js";
 import { secretService } from "../services/secrets.js";
 import { prepareManagedAiRuntime } from "../services/ai-connection-runtime.js";
 import { syncConnectionCredentialBindings } from "../services/connection-credential-bindings.js";
+import { activityLog } from "@paperclipai/db";
+import express from "express";
+import request from "supertest";
+import { aiConnectionRoutes } from "../routes/ai-connections.js";
 
 let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
 let db: ReturnType<typeof createDb>;
@@ -146,5 +150,91 @@ describe("runtimeCredential pool assignment", () => {
       expect(env.PAPERCLIP_AI_PROVIDER_URL).toBe("https://integrate.api.nvidia.example/v1");
       expect(env.PAPERCLIP_AI_PROVIDER_KEY).not.toContain("fixture-connection-projected");
     } finally { await runtime.cleanup(); }
+  });
+});
+
+describe("key slot API", () => {
+  async function buildApp(actor: Record<string, unknown>) {
+    const { errorHandler } = await import("../middleware/index.js");
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { req.actor = actor as never; next(); });
+    app.use("/api", aiConnectionRoutes(db));
+    app.use(errorHandler);
+    return app;
+  }
+
+  const boardActor = { type: "board", source: "local_implicit", userId, companyIds: [companyId] };
+
+  it("creates, lists, updates and removes key slots without ever exposing the key value", async () => {
+    const account = await createGatewayConnectionForUser(userId, "Key API NIM gateway", "fixture-connection-api-key");
+    const app = await buildApp(boardActor);
+    const base = `/api/companies/${companyId}/ai-connections/${account.connectionId}/keys`;
+
+    const created = await request(app).post(base).send({ slot: 3, label: "nim-account-3", keyValue: "fixture-nvapi-key-api-3" });
+    expect(created.status).toBe(201);
+    expect(created.body).toMatchObject({ slot: 3, label: "nim-account-3", state: "healthy", enabled: true });
+    expect(JSON.stringify(created.body)).not.toContain("fixture-nvapi-key-api-3");
+
+    // Duplicate slot is a conflict.
+    expect((await request(app).post(base).send({ slot: 3, keyValue: "fixture-nvapi-key-again" })).status).toBe(409);
+
+    const list = await request(app).get(base);
+    expect(list.status).toBe(200);
+    expect(list.body).toEqual({ connectionId: account.connectionId, slots: [expect.objectContaining({ slot: 3, label: "nim-account-3" })] });
+    expect(JSON.stringify(list.body)).not.toContain("fixture-nvapi-key-api-3");
+
+    // Label and enabled toggle.
+    const patched = await request(app).patch(base).send({ slot: 3, label: "nim-account-3 renamed", enabled: false });
+    expect(patched.status).toBe(200);
+    expect(patched.body).toMatchObject({ slot: 3, label: "nim-account-3 renamed", enabled: false });
+
+    // Replacing the key writes a NEW secret and repoints the slot.
+    const before = await db.select().from(credentialPool).where(eq(credentialPool.connectionId, account.connectionId));
+    const rotated = await request(app).patch(base).send({ slot: 3, keyValue: "fixture-nvapi-key-api-3b" });
+    expect(rotated.status).toBe(200);
+    const after = await db.select().from(credentialPool).where(eq(credentialPool.connectionId, account.connectionId));
+    expect(after[0]!.secretRef).not.toBe(before[0]!.secretRef);
+    const [oldSecret] = await db.select().from(companySecrets).where(eq(companySecrets.id, before[0]!.secretRef));
+    expect(oldSecret).toBeUndefined(); // the replaced generation is cleaned up
+    expect(JSON.stringify(rotated.body)).not.toContain("fixture-nvapi-key-api-3b");
+
+    // Activity log covers every mutation, never the key value.
+    const actions = (await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, account.connectionId)))).map((row) => row.action);
+    expect(actions).toEqual(expect.arrayContaining(["ai_connection.key_slot_added", "ai_connection.key_slot_updated", "ai_connection.key_slot_updated"]));
+    const details = (await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, account.connectionId)))).flatMap((row) => JSON.stringify(row.details ?? {}));
+    expect(details.join("\n")).not.toContain("fixture-nvapi-key-api-3");
+
+    const removed = await request(app).delete(base).send({ slot: 3 });
+    expect(removed.status).toBe(200);
+    expect((await request(app).get(base)).body.slots).toEqual([]);
+    // The slot's secret is removed with it.
+    const remaining = await db.select().from(companySecrets).where(and(eq(companySecrets.companyId, companyId), eq(companySecrets.name, "ai-pool-fixture-slot-1")));
+    expect(remaining).toHaveLength(1); // unrelated fixture secret untouched
+  });
+
+  it("rejects invalid slots and enforces connection-manager permissions", async () => {
+    const account = await createGatewayConnectionForUser(userId, "Key API guard NIM gateway", "fixture-connection-guard-key");
+    const app = await buildApp(boardActor);
+    const base = `/api/companies/${companyId}/ai-connections/${account.connectionId}/keys`;
+
+    // Unknown connection → 404; unknown slot → 404.
+    expect((await request(app).get(`/api/companies/${companyId}/ai-connections/${randomUUID()}/keys`)).status).toBe(404);
+    expect((await request(app).patch(base).send({ slot: 9, label: "x" })).status).toBe(404);
+    // Malformed body → 400 by the repo's zod convention.
+    expect((await request(app).post(base).send({ slot: 0, keyValue: "x" })).status).toBe(400);
+    expect((await request(app).delete(base).send({})).status).toBe(400);
+
+    // A viewer cannot manage keys.
+    await db.insert(companyMemberships).values({ companyId, principalId: "keypool-viewer", principalType: "user", status: "active", membershipRole: "viewer" });
+    const viewerApp = await buildApp({ type: "board", source: "session", userId: "keypool-viewer", companyIds: [companyId], memberships: [{ companyId, status: "active", membershipRole: "viewer" }] });
+    expect((await request(viewerApp).get(base)).status).toBe(403);
+    expect((await request(viewerApp).post(base).send({ slot: 1, keyValue: "fixture-x" })).status).toBe(403);
+    expect((await request(viewerApp).patch(base).send({ slot: 1, enabled: true })).status).toBe(403);
+    expect((await request(viewerApp).delete(base).send({ slot: 1 })).status).toBe(403);
+
+    // Another company's actor cannot see the connection's keys at all.
+    const stranger = await buildApp({ type: "board", source: "session", userId: "stranger", companyIds: [randomUUID()] });
+    expect((await request(stranger).get(base)).status).toBe(403);
   });
 });
