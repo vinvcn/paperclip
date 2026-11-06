@@ -1,4 +1,5 @@
 import type { TaskInterruptionPresentation } from "@paperclipai/shared";
+import { keyPoolFailureCopy } from "@paperclipai/shared";
 import { AlertCircle } from "lucide-react";
 import { Button } from "./ui/button";
 import { cn } from "../lib/utils";
@@ -24,6 +25,19 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
     canRetry={canRetry && presentation.canRetry} onRetry={onRetry} error={error} className={className} />;
   if (error && !optimistic && !takingLonger) return <div role="alert" className={cn("flex items-center justify-between gap-2 text-sm text-destructive", className)}><span>{error.message}</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>}</div>;
   if (takingLonger) return <div role="status" className={cn("flex items-center justify-between gap-2 text-sm text-muted-foreground", className)}><span>Taking longer than usual…</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>}</div>;
+  // Ticket 05 (demo): pooled-key failures surface the pool snapshot inline.
+  // No retry button yet — the dedicated recovery actions arrive with the
+  // follow-up ticket; a new attempt picks another slot by itself.
+  if (!optimistic && !takingLonger && presentation?.userAction === "rate_limited") {
+    return (
+      <div className={cn("pt-4", className)}>
+        <div role="status" aria-label="Task status" className="flex items-center justify-between gap-3 text-sm rounded-lg bg-destructive/10 p-4 text-foreground">
+          <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />
+          <span className="min-w-0 flex-1">{keyPoolFailureCopy(presentation.keyPool ?? { reason: "rate_limited" })}</span>
+        </div>
+      </div>
+    );
+  }
   if (optimistic || !presentation || presentation.responsibility !== "system" ||
       !["failed", "retry_scheduled"].includes(presentation.state)) return null;
   const seconds = Math.max(0, Math.ceil((Date.parse(presentation.nextRetryAt ?? "") - Date.now()) / 1000));

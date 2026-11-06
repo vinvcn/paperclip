@@ -11,6 +11,7 @@ import {
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { workspaceRestoreMarkerDetail } from "@/lib/workspace-restore-marker";
 import { credentialAccessNotice } from "@/lib/credential-access-notice";
+import { keyPoolFailureMarkerCopy, keyPoolFailureMarkerLabel } from "@/lib/key-pool-failure-marker";
 import type { ActivityEvent, Issue, IssueQueuedCommentQueue, TaskBrowser } from "@paperclipai/shared";
 import { useProjectCreatedItems } from "@/hooks/useProjectCreatedItems";
 import { skillCreatedItems } from "@/components/task-chat/skill-created-items";
@@ -1780,6 +1781,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           (source.status === "timed_out"
             ? "native_runner_timed_out"
             : "native_runner_process_exited");
+        const keyPoolLabel = keyPoolFailureMarkerLabel(code);
+        const keyPoolDetail = keyPoolFailureMarkerCopy(code, props.interruption, source.id, meta?.resultJson);
         const label =
           code === "native_provider_runtime_missing" && source.status === "failed"
             ? "Runtime missing"
@@ -1789,6 +1792,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             ? "Approval required"
             : code === "native_provider_usage_limit" && source.status === "failed"
             ? "Usage limit reached"
+            : keyPoolLabel
+            ? keyPoolLabel
             : source.status === "cancelled"
               ? "Run cancelled"
               : source.status === "interrupted"
@@ -1804,7 +1809,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             ? `The run was cancelled${responseBoundary}.`
             : source.status === "interrupted"
               ? `The run was interrupted${responseBoundary}.`
-              : code === "native_provider_runtime_missing"
+              : keyPoolDetail
+                ? keyPoolDetail
+                : code === "native_provider_runtime_missing"
                 ? "The selected provider runtime is missing a required package. Reinstall or rebuild Paperclip with its bundled provider dependencies, restart the server, then test the agent's runtime before retrying."
               : code === "native_provider_approval_required"
                 ? "This operation requires approval, but this runner has no interactive approval handler. Review the operation and update the agent's permission setting before retrying."
@@ -1824,7 +1831,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           : undefined;
         const finishedAt =
           meta?.finishedAt ?? meta?.startedAt ?? meta?.createdAt;
-        if (!historical && (!props.interruption || credentialAccess ||
+        if (!historical && (!props.interruption || credentialAccess || keyPoolLabel ||
             (props.interruption.responsibility === "user" &&
               ["native_provider_model_rejected", "native_provider_approval_required"].includes(code)))) entriesWithFailures.push({
           ms: toMs(finishedAt),
@@ -1837,7 +1844,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             tone: source.status === "cancelled" ? "neutral" : "error",
             label,
             detail,
-            retryable: code !== "native_session_cleanup_quarantined",
+            // Pooled-key failures have no inline recovery action yet (ticket
+            // 06); the pool itself switches slots on the next attempt.
+            retryable: keyPoolLabel ? false : code !== "native_session_cleanup_quarantined",
             ...(credentialAccess ? { credentialAccess, retryable: false } : {}),
             collapsible: true,
             runId: source.id,
@@ -1861,6 +1870,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       if (sourceHasLegacyStop) {
         settledRunIds.add(source.id);
         const code = meta?.errorCode ?? "native_runner_process_exited";
+        const keyPoolLabel = keyPoolFailureMarkerLabel(code);
+        const keyPoolDetail = keyPoolFailureMarkerCopy(code, props.interruption, source.id, meta?.resultJson);
         const retryDetail = meta?.scheduledRetryAt
           ? "Retry scheduled automatically."
           : canRetryFailedRun
@@ -1880,6 +1891,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           ? aiRequest.status === "pending"
             ? "Use the connection card below to continue."
             : "This run stopped because its AI account was unavailable."
+          : keyPoolDetail
+          ? keyPoolDetail
           : source.status === "cancelled"
             ? code === "execution_reconciliation_required"
               ? "The previous execution must be checked before this task can continue. Your message is preserved. View the stopped run for details."
@@ -1890,7 +1903,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             ? `Workspace setup failed before the agent started. ${retryDetail}`
             : `The run failed (${code}). ${retryDetail}`;
         const id = `${source.id}:failure`;
-        if (!historical && (!props.interruption || credentialAccess)) entriesWithFailures.push({
+        if (!historical && (!props.interruption || credentialAccess || keyPoolDetail)) entriesWithFailures.push({
           ms: toMs(meta?.finishedAt ?? meta?.startedAt ?? meta?.createdAt),
           order: 3,
           id,
@@ -1898,9 +1911,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             id,
             kind: "marker",
             variant: "interrupted",
-            label: branchUnavailable ? "Starting branch unavailable" : restoreFailed ? "Workspace restore failed" : aiRequest?.status === "pending" ? "AI connection needed" : source.status === "cancelled" ? (meta?.startedAt ? "Stopped" : "Couldn't start") : "Run failed",
+            label: branchUnavailable ? "Starting branch unavailable" : restoreFailed ? "Workspace restore failed" : aiRequest?.status === "pending" ? "AI connection needed" : source.status === "cancelled" ? (meta?.startedAt ? "Stopped" : "Couldn't start") : keyPoolLabel ?? "Run failed",
             runId: source.status === "cancelled" ? undefined : source.id,
-            ...(branchUnavailable || aiRequest?.status === "pending" ? { retryable: false } : {}),
+            ...(branchUnavailable || aiRequest?.status === "pending" || keyPoolLabel ? { retryable: false } : {}),
             ...(restoreFailed ? {
               retryable: meta?.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive"
                 && meta?.resultJson?.workspaceRestoreFailure !== "restore_invalid_metadata",
