@@ -74,6 +74,8 @@ function filterDimsFromSearchParams(searchParams: URLSearchParams): UsagePrefere
   if (provider) filters.provider = provider;
   const model = searchParams.get("model");
   if (model) filters.model = model;
+  const key = searchParams.get("key");
+  if (key) filters.key = key;
   const status = searchParams.get("status");
   if (isUsageStatusFilter(status)) filters.status = status;
   return filters;
@@ -133,7 +135,7 @@ function presetForBounds(bounds: { from?: string; to?: string }): UsageTimeRange
   return null;
 }
 
-const WINDOW_PARAM_KEYS = ["app", "provider", "model", "status", "from", "to"] as const;
+const WINDOW_PARAM_KEYS = ["app", "provider", "model", "key", "status", "from", "to"] as const;
 
 /**
  * The URL params the page wants, given the URL it has, the company's stored
@@ -174,6 +176,7 @@ function normalizedParams(
   if (!next.get("app") && stored.filters.app) next.set("app", stored.filters.app);
   if (!next.get("provider") && stored.filters.provider) next.set("provider", stored.filters.provider);
   if (!next.get("model") && stored.filters.model) next.set("model", stored.filters.model);
+  if (!next.get("key") && stored.filters.key) next.set("key", stored.filters.key);
   if (!isUsageStatusFilter(next.get("status"))) {
     next.delete("status");
     if (stored.filters.status) next.set("status", stored.filters.status);
@@ -296,7 +299,7 @@ function SummaryCards({ summary, busy }: { summary: UsageSummary | undefined; bu
 function UsageFilterBar({ facets, filters, onFilterChange, selectedRange, onRangeChange, pageSize, onPageSizeChange, refreshing, onRefresh }: {
   facets: UsageSummaryFacets | undefined;
   filters: UsageLogFilters;
-  onFilterChange: (key: "app" | "provider" | "model" | "status", value: string | null) => void;
+  onFilterChange: (key: "app" | "provider" | "model" | "key" | "status", value: string | null) => void;
   selectedRange: UsageTimeRange | "custom";
   onRangeChange: (range: UsageTimeRange) => void;
   pageSize: UsagePageSize;
@@ -375,6 +378,23 @@ function UsageFilterBar({ facets, filters, onFilterChange, selectedRange, onRang
             that is actually applied instead of silently reading as All. */}
         {filters.model != null && !(facets?.models ?? []).some((facet) => facet.value === filters.model) ? (
           <option value={filters.model}>{filters.model}</option>
+        ) : null}
+      </NativeSelect>
+      <NativeSelect
+        aria-label="Filter by key"
+        className={selectClass}
+        value={filters.key ?? "all"}
+        onChange={(event) => onFilterChange("key", event.target.value === "all" ? null : event.target.value)}
+      >
+        <option value="all">All keys</option>
+        {(facets?.keys ?? []).map((facet) => (
+          <option key={facet.value} value={facet.value}>{facet.value}</option>
+        ))}
+        {/* Present only when the URL's (or a remembered) key sits outside the
+            window's facets, so the select keeps showing the value that is
+            actually applied instead of silently reading as All. */}
+        {filters.key != null && !(facets?.keys ?? []).some((facet) => facet.value === filters.key) ? (
+          <option value={filters.key}>{filters.key}</option>
         ) : null}
       </NativeSelect>
       <NativeSelect
@@ -483,7 +503,7 @@ export function Usage() {
   };
 
   /** Write one filter to the URL and the company's remembered filters; `null` removes the param so links stay clean. */
-  const onFilterChange = (key: "app" | "provider" | "model" | "status", value: string | null) => {
+  const onFilterChange = (key: "app" | "provider" | "model" | "key" | "status", value: string | null) => {
     const dims: UsagePreferenceFilters = { ...filterDims };
     if (value) {
       // The status select only ever offers the known classes.
@@ -635,6 +655,7 @@ export function Usage() {
     filterDims.app && `app "${filterDims.app}"`,
     filterDims.provider && `provider "${providerDisplayName(filterDims.provider)}"`,
     filterDims.model && `model "${filterDims.model}"`,
+    filterDims.key && `key "${filterDims.key}"`,
     filterDims.status && `status ${STATUS_FILTER_LABELS[filterDims.status]}`,
   ].filter((name): name is string => typeof name === "string"), [filterDims]);
 
@@ -718,6 +739,7 @@ export function Usage() {
                             <th scope="col" className="px-4 py-2 text-left font-medium">App</th>
                             <th scope="col" className="px-4 py-2 text-left font-medium">Provider</th>
                             <th scope="col" className="px-4 py-2 text-left font-medium">Model</th>
+                            <th scope="col" className="px-4 py-2 text-left font-medium">Key</th>
                             <th scope="col" className="px-4 py-2 text-right font-medium">Cost</th>
                             <th scope="col" className="px-4 py-2 text-right font-medium">Status</th>
                             <th scope="col" className="py-2 pl-4 text-right font-medium">Duration</th>
@@ -732,6 +754,10 @@ export function Usage() {
                               <td className="px-4 py-3">{row.app}</td>
                               <td className="px-4 py-3">{providerDisplayName(row.provider)}</td>
                               <td className="px-4 py-3 font-mono">{row.model}</td>
+                              {/* Pooled key attribution (metadata.keySlot), shown in the facets' key-<slot> form. */}
+                              <td className="px-4 py-3 font-mono">
+                                {typeof row.metadata?.keySlot === "number" ? `key-${row.metadata.keySlot}` : "—"}
+                              </td>
                               <td className="whitespace-nowrap px-4 py-3 text-right tabular-nums">
                                 {requestCostCell(row)}
                               </td>
