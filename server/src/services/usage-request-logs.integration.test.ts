@@ -1009,6 +1009,43 @@ describeEmbeddedPostgres("usage request log persistence", () => {
     expect(row.metadata).toEqual({ usageMissing: true });
   });
 
+  it("persists pooled key attribution in metadata without breaking re-delivery idempotency (ticket 04)", async () => {
+    const service = usageRequestLogService(db);
+    const requestId = randomUUID();
+    const payload = usageEvent(requestId, { keySlot: 3, connectionId: "conn-uuid-1" });
+    expect(await service.recordForRun({ companyId, runId, agentId, issueId }, payload)).toBe(true);
+    // Re-delivery inserts nothing, so the attribution is written exactly once.
+    expect(await service.recordForRun({ companyId, runId, agentId, issueId }, payload)).toBe(false);
+    const rows = await db.select().from(usageRequestLogs)
+      .where(and(eq(usageRequestLogs.companyId, companyId), eq(usageRequestLogs.requestId, requestId)));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.metadata).toEqual({ keySlot: 3, connectionId: "conn-uuid-1" });
+  });
+
+  it("combines usage_missing with key attribution in one metadata object", async () => {
+    const service = usageRequestLogService(db);
+    const requestId = randomUUID();
+    expect(await service.recordForRun(
+      { companyId, runId, agentId, issueId },
+      usageEvent(requestId, { usageMissing: true, usage: null, keySlot: 5, connectionId: "conn-uuid-2" }),
+    )).toBe(true);
+    const [row] = await db.select().from(usageRequestLogs)
+      .where(and(eq(usageRequestLogs.companyId, companyId), eq(usageRequestLogs.requestId, requestId)));
+    expect(row.metadata).toEqual({ usageMissing: true, keySlot: 5, connectionId: "conn-uuid-2" });
+  });
+
+  it("stores no metadata for records without usage gaps or pooled attribution", async () => {
+    const service = usageRequestLogService(db);
+    const requestId = randomUUID();
+    expect(await service.recordForRun(
+      { companyId, runId, agentId, issueId },
+      usageEvent(requestId, { keySlot: null, connectionId: null }),
+    )).toBe(true);
+    const [row] = await db.select().from(usageRequestLogs)
+      .where(and(eq(usageRequestLogs.companyId, companyId), eq(usageRequestLogs.requestId, requestId)));
+    expect(row.metadata).toBeNull();
+  });
+
   describe("run cost allocation", () => {
     const model = "openrouter/anthropic/claude-sonnet-4";
     const otherModel = "openai/gpt-5.2";

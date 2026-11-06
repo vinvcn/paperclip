@@ -295,19 +295,34 @@ export function usageRequestLogService(db: Db) {
           providerRequestId: parsed.providerRequestId,
           requestId: parsed.requestId,
           occurredAt: new Date(parsed.startedAtMs),
-          ...(parsed.usageMissing ? { metadata: { usageMissing: true } } : {}),
+          ...((parsed.usageMissing || parsed.keySlot != null || parsed.connectionId != null)
+            ? {
+                metadata: {
+                  ...(parsed.usageMissing ? { usageMissing: true } : {}),
+                  // Key-pool attribution (ticket 04): the pooled slot and its
+                  // owning connection as the runner's capture sink saw them.
+                  ...(parsed.keySlot != null ? { keySlot: parsed.keySlot } : {}),
+                  ...(parsed.connectionId != null ? { connectionId: parsed.connectionId } : {}),
+                },
+              }
+            : {}),
         }).onConflictDoNothing().returning({ id: usageRequestLogs.id, metadata: usageRequestLogs.metadata });
       });
       const stored = inserted[0];
       // Key-pool 429 classification hook (ticket 03): a 429 row attributed to
-      // a pooled key slot (metadata.keySlot — ticket 04 populates it) updates
-      // that (slot, model) cooldown. Must never affect the usage insert.
+      // a pooled key slot (metadata.keySlot + metadata.connectionId — ticket
+      // 04 populates both) updates that (slot, model) cooldown. Reading the
+      // stored metadata (not the payload) keeps re-delivery from ever
+      // re-classifying: only a first insert carries a row here. Must never
+      // affect the usage insert.
       const keySlot = typeof stored?.metadata?.keySlot === "number" ? stored.metadata.keySlot : null;
+      const connectionId = typeof stored?.metadata?.connectionId === "string" ? stored.metadata.connectionId : null;
       if (parsed.httpStatus === 429 && keySlot !== null) {
         await classifyKeySlot429(db, {
           companyId: binding.companyId,
           runId: binding.runId,
           keySlot,
+          connectionId,
           model: parsed.model,
           retryAfterSeconds: retryAfterSecondsFromPayload(payload),
         }).catch((error) => {
