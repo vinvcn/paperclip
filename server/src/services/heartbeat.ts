@@ -427,6 +427,7 @@ import {
 import {
   releaseRuntimeServicesForRun,
 } from "./workspace-runtime.js";
+import { releaseRunPoolLease } from "./ai-credential-pool.js";
 
 import { issueService } from "./issues.js";
 import {
@@ -1835,6 +1836,19 @@ export function heartbeatService(
     runOptions: { nativeLeaseOwner?: string; nativeRestartRecovery?: NativeRestartRecoveryClaim; onNativeExecutionLeaseAcquired?: () => Promise<void> },
   ) {
     const attemptStartedAtMs = Date.now();
+    // Preparation aborts (agent missing, issue checkout failure, budget stop,
+    // ...) never reach the terminal settlement in run-completion, so this
+    // attempt-scoped release is the choke point that frees the run's exclusive
+    // key-pool lease on every exit path (review F7). releaseRunPoolLease is
+    // idempotent by run: for runs that did settle, the earlier terminal
+    // release wins and this is a no-op.
+    async function releaseRunKeyPoolLease() {
+      try {
+        await releaseRunPoolLease(db, runId);
+      } catch (error) {
+        logger.warn({ err: error, runId }, "Key pool lease release failed; the lease TTL reclaims the slot");
+      }
+    }
     let attestedQuestionResponseAtMs: number | null = null;
     if ((await getSchedulingSuppression()).suppressed) {
       try {
@@ -3842,6 +3856,11 @@ export function heartbeatService(
             providerResourceDisposition: providerResourceDispositionForRun,
             nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
           }));
+          // Same choke point for the key-pool lease: this guard is exactly the
+          // "not resumed, not finalized, no native ownership" boundary where
+          // the environment lease is freed, so the exclusive key-pool lease
+          // must not outlive it (review F7).
+          await releaseRunKeyPoolLease();
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
           caseHandoffCleanupSettled = true;
         }

@@ -10,6 +10,8 @@ import type {
 } from "@paperclipai/shared";
 import { parseProviderRequestUsageRecord } from "../vendor/paperclip-runner/index.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { classifyKeySlot429 } from "./ai-credential-pool.js";
+import { logger } from "../middleware/logger.js";
 
 export type UsageRequestLogRow = typeof usageRequestLogs.$inferSelect;
 
@@ -220,6 +222,22 @@ function recordObject(value: unknown): Record<string, unknown> {
 }
 
 /**
+ * The 429 classification's retry-after input, extracted from the raw payload
+ * when the runner captures response headers (`request.headers["retry-after"]`,
+ * seconds form). Current runner builds do not capture headers into the usage
+ * payload, so this reads null in practice and the classifier's 90s fallback
+ * applies; a future capture that adds the header is picked up unchanged.
+ */
+export function retryAfterSecondsFromPayload(payload: unknown): number | null {
+  const headers = recordObject(recordObject(recordObject(payload).request).headers);
+  const raw = Object.entries(headers)
+    .find(([name]) => name.toLowerCase() === "retry-after")?.[1];
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return Math.ceil(raw);
+  if (typeof raw === "string" && /^\d+(\.\d+)?$/.test(raw.trim())) return Math.ceil(Number(raw));
+  return null;
+}
+
+/**
  * Persistence for the Usage request log (docs/specs/usage-request-logs.md).
  * One row per provider HTTP call the runner proxy observed. Agent, issue and
  * project are resolved server-side from the run; the runner never sends them.
@@ -278,8 +296,24 @@ export function usageRequestLogService(db: Db) {
           requestId: parsed.requestId,
           occurredAt: new Date(parsed.startedAtMs),
           ...(parsed.usageMissing ? { metadata: { usageMissing: true } } : {}),
-        }).onConflictDoNothing().returning({ id: usageRequestLogs.id });
+        }).onConflictDoNothing().returning({ id: usageRequestLogs.id, metadata: usageRequestLogs.metadata });
       });
+      const stored = inserted[0];
+      // Key-pool 429 classification hook (ticket 03): a 429 row attributed to
+      // a pooled key slot (metadata.keySlot — ticket 04 populates it) updates
+      // that (slot, model) cooldown. Must never affect the usage insert.
+      const keySlot = typeof stored?.metadata?.keySlot === "number" ? stored.metadata.keySlot : null;
+      if (parsed.httpStatus === 429 && keySlot !== null) {
+        await classifyKeySlot429(db, {
+          companyId: binding.companyId,
+          runId: binding.runId,
+          keySlot,
+          model: parsed.model,
+          retryAfterSeconds: retryAfterSecondsFromPayload(payload),
+        }).catch((error) => {
+          logger.warn({ err: error, runId: binding.runId, keySlot }, "Key slot 429 classification failed without affecting the usage record");
+        });
+      }
       return inserted.length > 0;
     },
 

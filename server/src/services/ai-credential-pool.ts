@@ -1,17 +1,27 @@
-import { and, asc, eq, isNull, lt, or } from "drizzle-orm";
+import { and, asc, eq, gt, gte, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import type {
   AiConnectionKeySlot,
   AiConnectionKeySlotCreate,
   AiConnectionKeySlotList,
   AiConnectionKeySlotUpdate,
+  CredentialPoolSlotState,
 } from "@paperclipai/shared";
-import { type Db, companySecretBindings, companySecrets, credentialPool, toolConnections } from "@paperclipai/db";
+import {
+  type Db,
+  companySecretBindings,
+  companySecrets,
+  credentialPool,
+  credentialPoolCooldowns,
+  toolConnections,
+  usageRequestLogs,
+} from "@paperclipai/db";
 import { conflict, notFound, unprocessable, HttpError } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 import { logger } from "../middleware/logger.js";
 import { credentialPoolSlotConfigPath } from "./connection-credential-bindings.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 
 /** The credential_pool row chosen to serve the next credential resolution. */
 export interface AssignablePoolSlot {
@@ -33,6 +43,11 @@ export interface PoolSlotAssignmentContext {
    * uses this slot unconditionally — cooldown included (warn logged) — but a
    * disabled slot stays off and a missing slot fails the run. */
   pinnedSlot?: number | null;
+  /** Target model of the resolution. Cooldowns are tracked per (slot, model)
+   * because NIM quota is counted per key × model (plan §10): the matrix checks
+   * the target model's cooldown instead of the deprecated slot-level column.
+   * Absent model (e.g. account-identity resolutions) skips cooldown filtering. */
+  model?: string | null;
 }
 
 /**
@@ -42,6 +57,50 @@ export interface PoolSlotAssignmentContext {
  * next run once the deadline passes).
  */
 export const POOL_LEASE_TTL_MS = 2 * 60 * 60 * 1000 + 5 * 60 * 1000;
+
+/**
+ * Cooldown state machine constants (ticket 03, all values are decided):
+ * a 429 on (slot, model) classifies as RPM when the pair saw real traffic in
+ * the window (>= 2 requests) and as the daily limit otherwise; the probe
+ * worker verifies daily recoveries from 5 minutes before the deadline onward
+ * and defers by 2 hours per probe that does not prove recovery.
+ */
+export const COOLDOWN_WINDOW_MS = 60_000;
+/** Minimum requests by the pair inside the window for an RPM classification. */
+export const COOLDOWN_WINDOW_THRESHOLD = 2;
+export const RPM_COOLDOWN_MIN_MS = 90_000;
+export const DAILY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+export const PROBE_LEAD_MS = 5 * 60 * 1000;
+export const PROBE_DEFER_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * The cooldown store's key: the bare upstream model id. Usage rows record the
+ * full routed model string the runner's capture sink saw (`input.options.model`,
+ * which carries the managed `paperclip/` prefix for gateway connections — the
+ * production usage log has only prefixed rows), but the probe worker addresses
+ * the gateway with the bare upstream body model, so cooldown rows strip the
+ * prefix. The window count queries by the usage row's stored string instead
+ * (review F1): the classifier receives exactly what the row records.
+ */
+export function cooldownModelKey(model: string | null | undefined): string | null {
+  if (!model) return null;
+  return model.startsWith("paperclip/") ? model.slice("paperclip/".length) : model;
+}
+
+export type PoolCooldownRow = typeof credentialPoolCooldowns.$inferSelect;
+
+/**
+ * Whether a (slot, model) cooldown still withholds assignment eligibility at
+ * `now`. `daily_cooldown` cools until the probe worker proves recovery; an
+ * `rpm_cooldown` becomes assignable the moment its deadline passes — the
+ * deadline IS the transition (the 60s window has closed, no probe needed and
+ * no write required). This query-time rule is pinned by the ticket-03 tests.
+ */
+export function slotCooldownActive(row: Pick<PoolCooldownRow, "state" | "cooldownUntil">, now: Date): boolean {
+  if (row.state === "daily_cooldown") return true;
+  if (row.state === "rpm_cooldown") return row.cooldownUntil !== null && row.cooldownUntil > now;
+  return false;
+}
 
 const poolLeaseActor = { actorType: "system" as const, actorId: "key_pool" };
 
@@ -53,15 +112,31 @@ function mostStaleFirst(a: PoolSlotRow, b: PoolSlotRow) {
   return aAt - bAt || a.slot - b.slot;
 }
 
-function poolExhaustedError(rows: PoolSlotRow[]): HttpError {
+/** Display state of one slot for the target model, derived from the (slot,
+ * model) cooldown rows — the credential_pool state column is deprecated. */
+function slotDisplayState(
+  cooldownBySlot: Map<number, PoolCooldownRow>,
+  row: PoolSlotRow,
+  enabled: boolean,
+  now: Date,
+): string {
+  if (!enabled) return "disabled";
+  const cooldown = cooldownBySlot.get(row.slot);
+  return cooldown && slotCooldownActive(cooldown, now) ? cooldown.state : "healthy";
+}
+
+function poolExhaustedError(rows: PoolSlotRow[], cooldownBySlot: Map<number, PoolCooldownRow>, now: Date): HttpError {
   // Snapshot for the operator: who occupies each slot and when it recovers
   // (lease expiry or cooldown end). Never a key value.
   const summary = rows.map((row) => {
-    const parts = [`slot ${row.slot}: ${row.enabled ? row.state : "disabled"}`];
+    const parts = [`slot ${row.slot}: ${slotDisplayState(cooldownBySlot, row, row.enabled, now)}`];
     if (row.activeRunId) {
       parts.push(`leased by run ${row.activeRunId}${row.leaseAgentId ? ` (agent ${row.leaseAgentId})` : ""}${row.leaseExpiresAt ? ` until ${row.leaseExpiresAt.toISOString()}` : ""}`);
-    } else if (row.state !== "healthy" && row.cooldownUntil) {
-      parts.push(`cooldown until ${row.cooldownUntil.toISOString()}`);
+    } else {
+      const cooldown = cooldownBySlot.get(row.slot);
+      if (cooldown && cooldown.state !== "healthy" && cooldown.cooldownUntil) {
+        parts.push(`cooldown until ${cooldown.cooldownUntil.toISOString()}`);
+      }
     }
     return parts.join(", ");
   }).join("; ");
@@ -71,13 +146,17 @@ function poolExhaustedError(rows: PoolSlotRow[]): HttpError {
 }
 
 /**
- * Ticket-02 assignment matrix: pin → sticky (cache affinity) → exclusive lease
- * (least recently used) → fast-fail. Callers and the fall-through contract:
- * a connection with no pool, or with zero enabled slots, returns null so the
- * original single-credential path serves the request unchanged; a pool with
- * enabled slots that cannot serve throws `provider_key_pool_exhausted` with a
- * pool snapshot. Without a lease context the matrix only selects — no lease or
- * stickiness writes.
+ * Ticket-02 assignment matrix with ticket-03 (slot, model) eligibility: pin →
+ * sticky (cache affinity) → exclusive lease (least recently used) → fast-fail.
+ * Callers and the fall-through contract: a connection with no pool, or with
+ * zero enabled slots, returns null so the original single-credential path
+ * serves the request unchanged; a pool with enabled slots that cannot serve
+ * throws `provider_key_pool_exhausted` with a pool snapshot. Without a lease
+ * context the matrix only selects — no lease or stickiness writes.
+ *
+ * Cooldown eligibility is read from the (slot, model) cooldown rows for the
+ * target model (plan §10: NIM quota is per key × model); the slot-level state
+ * column on credential_pool is deprecated and never consulted here.
  */
 export async function selectAssignablePoolSlot(
   db: Db,
@@ -96,49 +175,49 @@ export async function selectAssignablePoolSlot(
   // ticket-01 fall-through to the single credential instead of failing runs.
   if (!enabled.length) return null;
   const runId = lease?.heartbeatRunId ?? null;
+  const modelKey = cooldownModelKey(lease?.model);
+  const now = new Date();
+  const cooldowns = modelKey
+    ? await db
+      .select()
+      .from(credentialPoolCooldowns)
+      .where(and(
+        eq(credentialPoolCooldowns.companyId, companyId),
+        eq(credentialPoolCooldowns.connectionId, connectionId),
+        eq(credentialPoolCooldowns.model, modelKey),
+      ))
+    : [];
+  const cooldownBySlot = new Map(cooldowns.map((row) => [row.slot, row]));
+  const assignable = (row: PoolSlotRow) => {
+    const cooldown = cooldownBySlot.get(row.slot);
+    return !cooldown || !slotCooldownActive(cooldown, now);
+  };
+  const exhausted = async () => poolExhaustedError(await db
+    .select()
+    .from(credentialPool)
+    .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId)))
+    .orderBy(asc(credentialPool.slot)), cooldownBySlot, now);
   if (!runId) {
     // Ephemeral selection for a resolution outside a run: pin, then sticky,
     // then least-recently-used — no lease is taken and stickiness stays put.
     const pinned = lease?.pinnedSlot != null ? enabled.find((row) => row.slot === lease.pinnedSlot) : undefined;
-    const healthy = enabled.filter((row) => row.state === "healthy");
+    const healthy = enabled.filter(assignable);
     const sticky = lease?.agentId
       ? [...healthy].sort((a, b) => (b.lastAssignedAt?.getTime() ?? 0) - (a.lastAssignedAt?.getTime() ?? 0))
         .find((row) => row.lastAssignedAgentId === lease.agentId)
       : undefined;
     const chosen = pinned ?? sticky ?? [...healthy].sort(mostStaleFirst)[0];
-    if (!chosen) throw poolExhaustedError(rows);
+    if (!chosen) throw await exhausted();
     return { id: chosen.id, slot: chosen.slot, label: chosen.label, secretRef: chosen.secretRef };
   }
   const agentId = lease?.agentId ?? null;
-  const now = new Date();
   // A lease is taken (or refreshed) by a conditional UPDATE that re-checks
   // every eligibility criterion atomically — two runs can never hold the same
   // slot because the second UPDATE re-reads the committed row and matches
   // nothing (exclusive-lease cap of 1 active run per slot).
-  const takeLease = async (slotId: string) => {
-    const [row] = await db
-      .update(credentialPool)
-      .set({
-        activeRunId: runId,
-        leaseExpiresAt: new Date(now.getTime() + POOL_LEASE_TTL_MS),
-        leaseAgentId: agentId,
-        lastAssignedAgentId: agentId,
-        lastAssignedAt: now,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(credentialPool.id, slotId),
-          or(
-            isNull(credentialPool.activeRunId),
-            eq(credentialPool.activeRunId, runId),
-            lt(credentialPool.leaseExpiresAt, now),
-          ),
-        ),
-      )
-      .returning();
-    return row ?? null;
-  };
+  const takeLease = (slotId: string, respectCooldown: boolean) => takePoolSlotLease(db, {
+    companyId, connectionId, slotId, runId, agentId, modelKey, now, respectCooldown,
+  });
   const logLease = (slot: number, pinned: boolean, expiresAt: Date) =>
     logActivity(db, {
       companyId,
@@ -148,7 +227,7 @@ export async function selectAssignablePoolSlot(
       entityId: connectionId,
       runId,
       agentId,
-      details: { slot, pinned, leaseExpiresAt: expiresAt.toISOString() },
+      details: { slot, model: modelKey, pinned, leaseExpiresAt: expiresAt.toISOString() },
     }).catch((error) => logger.warn({ err: error, companyId, connectionId, runId }, "Key slot lease activity log pending"));
   if (lease?.pinnedSlot != null) {
     const pinned = rows.find((row) => row.slot === lease.pinnedSlot);
@@ -164,8 +243,10 @@ export async function selectAssignablePoolSlot(
     }
     // Pin bypasses the cooldown state machine unconditionally (risk accepted by
     // the operator), but never the operator's enabled switch or the exclusive
-    // lease of another run.
-    if (pinned.state !== "healthy") {
+    // lease of another run. The warn judges the pinned slot for the target
+    // model only — another model's cooldown does not shame this pin.
+    const pinnedCooldown = modelKey ? cooldownBySlot.get(pinned.slot) : undefined;
+    if (pinnedCooldown && slotCooldownActive(pinnedCooldown, now)) {
       await logActivity(db, {
         companyId,
         ...poolLeaseActor,
@@ -174,31 +255,33 @@ export async function selectAssignablePoolSlot(
         entityId: connectionId,
         runId,
         agentId,
-        details: { slot: pinned.slot, state: pinned.state, cooldownUntil: pinned.cooldownUntil?.toISOString() ?? null },
+        details: {
+          slot: pinned.slot,
+          model: pinnedCooldown.model,
+          state: pinnedCooldown.state,
+          cooldownUntil: pinnedCooldown.cooldownUntil?.toISOString() ?? null,
+        },
       }).catch((error) => logger.warn({ err: error, companyId, connectionId, runId }, "Pinned cooldown slot activity log pending"));
-      logger.warn({ companyId, connectionId, runId, slot: pinned.slot, state: pinned.state },
+      logger.warn({ companyId, connectionId, runId, slot: pinned.slot, model: pinnedCooldown.model, state: pinnedCooldown.state },
         "Pinned key slot is in cooldown and will be used anyway");
     }
-    const taken = await takeLease(pinned.id);
+    const taken = await takeLease(pinned.id, false);
     if (taken) {
       await logLease(taken.slot, true, taken.leaseExpiresAt!);
       return { id: taken.id, slot: taken.slot, label: taken.label, secretRef: taken.secretRef };
     }
-    throw poolExhaustedError(await db
-      .select()
-      .from(credentialPool)
-      .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId)))
-      .orderBy(asc(credentialPool.slot)));
+    throw await exhausted();
   }
   // Sticky: the agent's last slot keeps its prompt cache (key = account) while
-  // it is healthy and free. A slot leased by this same run still counts — a
-  // credential re-resolution inside one run must land on the same slot.
+  // it is assignable for the target model and free. A slot leased by this same
+  // run still counts — a credential re-resolution inside one run must land on
+  // the same slot.
   if (agentId) {
     const sticky = [...enabled]
-      .filter((row) => row.state === "healthy" && row.lastAssignedAgentId === agentId)
+      .filter((row) => assignable(row) && row.lastAssignedAgentId === agentId)
       .sort((a, b) => (b.lastAssignedAt?.getTime() ?? Number.NEGATIVE_INFINITY) - (a.lastAssignedAt?.getTime() ?? Number.NEGATIVE_INFINITY) || a.slot - b.slot);
     for (const candidate of sticky) {
-      const taken = await takeLease(candidate.id);
+      const taken = await takeLease(candidate.id, true);
       if (taken) {
         await logLease(taken.slot, false, taken.leaseExpiresAt!);
         return { id: taken.id, slot: taken.slot, label: taken.label, secretRef: taken.secretRef };
@@ -209,21 +292,69 @@ export async function selectAssignablePoolSlot(
   // used). Each conditional UPDATE re-checks eligibility atomically, so a
   // candidate another run just claimed simply fails and the next is tried.
   const free = [...enabled]
-    .filter((row) => row.state === "healthy" && (!row.activeRunId || row.activeRunId === runId
+    .filter((row) => assignable(row) && (!row.activeRunId || row.activeRunId === runId
       || (row.leaseExpiresAt !== null && row.leaseExpiresAt < now)))
     .sort(mostStaleFirst);
   for (const candidate of free) {
-    const taken = await takeLease(candidate.id);
+    const taken = await takeLease(candidate.id, true);
     if (taken) {
       await logLease(taken.slot, false, taken.leaseExpiresAt!);
       return { id: taken.id, slot: taken.slot, label: taken.label, secretRef: taken.secretRef };
     }
   }
-  throw poolExhaustedError(await db
-    .select()
-    .from(credentialPool)
-    .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId)))
-    .orderBy(asc(credentialPool.slot)));
+  throw await exhausted();
+}
+
+/**
+ * The exclusive-lease claim behind the matrix (review F8): a conditional
+ * UPDATE whose WHERE re-checks the whole eligibility — the operator's enabled
+ * switch, the lease availability, and, when a target model is given, the
+ * (slot, model) cooldown — so a cooldown writer (classifier or probe) or an
+ * operator toggle that commits between the matrix's pre-screen and this
+ * UPDATE cannot be raced into a lease. `respectCooldown: false` is the pin
+ * path only, which uses a cooling slot deliberately (warn logged upstream).
+ */
+export async function takePoolSlotLease(
+  db: Db,
+  params: {
+    companyId: string;
+    connectionId: string;
+    slotId: string;
+    runId: string;
+    agentId: string | null;
+    modelKey?: string | null;
+    now: Date;
+    respectCooldown: boolean;
+  },
+): Promise<PoolSlotRow | null> {
+  const { companyId, connectionId, slotId, runId, agentId, modelKey, now, respectCooldown } = params;
+  const cooldownRecheck = modelKey && respectCooldown
+    ? sql`not exists (select 1 from ${credentialPoolCooldowns} where ${credentialPoolCooldowns.companyId} = ${companyId} and ${credentialPoolCooldowns.connectionId} = ${connectionId} and ${credentialPoolCooldowns.slot} = ${credentialPool.slot} and ${credentialPoolCooldowns.model} = ${modelKey} and (${credentialPoolCooldowns.state} = 'daily_cooldown' or (${credentialPoolCooldowns.state} = 'rpm_cooldown' and ${gt(credentialPoolCooldowns.cooldownUntil, now)})))`
+    : undefined;
+  const [row] = await db
+    .update(credentialPool)
+    .set({
+      activeRunId: runId,
+      leaseExpiresAt: new Date(now.getTime() + POOL_LEASE_TTL_MS),
+      leaseAgentId: agentId,
+      lastAssignedAgentId: agentId,
+      lastAssignedAt: now,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(credentialPool.id, slotId),
+        eq(credentialPool.enabled, true),
+        or(
+          isNull(credentialPool.activeRunId),
+          eq(credentialPool.activeRunId, runId),
+          lt(credentialPool.leaseExpiresAt, now),
+        ),
+        cooldownRecheck,
+      ),
+    )
+    .returning();
+  return row ?? null;
 }
 
 /** Resolves the pooled key value through the same encrypted company-secret path as the grant credential. */
@@ -282,15 +413,265 @@ export async function releaseRunPoolLease(db: Db, runId: string): Promise<number
   return released.length;
 }
 
-function slotView(row: typeof credentialPool.$inferSelect): AiConnectionKeySlot {
+/**
+ * One (slot, model) cooldown write, shared by the 429 classifier and the probe
+ * worker: upserts the cooldown row and, for daily cooldowns, signals the probe
+ * queue in the same transaction so the worker learns a deadline that may be
+ * the table's first. Callers add their own activity log with their specific
+ * evidence (classification vs probe outcome).
+ */
+export async function recordSlotCooldown(
+  db: Db,
+  input: {
+    companyId: string;
+    connectionId: string;
+    slot: number;
+    model: string;
+    state: "rpm_cooldown" | "daily_cooldown";
+    cooldownUntil: Date;
+    cooldownReason: string;
+    runId?: string | null;
+  },
+): Promise<void> {
+  const now = new Date();
+  await db.transaction(async (tx) => {
+    await tx
+      .insert(credentialPoolCooldowns)
+      .values({
+        companyId: input.companyId,
+        connectionId: input.connectionId,
+        slot: input.slot,
+        model: input.model,
+        state: input.state,
+        cooldownUntil: input.cooldownUntil,
+        cooldownReason: input.cooldownReason,
+        lastRunId: input.runId ?? null,
+      })
+      .onConflictDoUpdate({
+        target: [
+          credentialPoolCooldowns.companyId,
+          credentialPoolCooldowns.connectionId,
+          credentialPoolCooldowns.slot,
+          credentialPoolCooldowns.model,
+        ],
+        set: {
+          state: input.state,
+          cooldownUntil: input.cooldownUntil,
+          cooldownReason: input.cooldownReason,
+          lastRunId: input.runId ?? null,
+          updatedAt: now,
+        },
+      });
+    if (input.state === "daily_cooldown") await notifyDeliveryWork(tx, DELIVERY_QUEUES.keyPoolCooldown);
+  });
+}
+
+/** Counted shape of a 429 classification's evidence for the activity log. */
+export interface KeySlot429Classification {
+  state: "rpm_cooldown" | "daily_cooldown";
+  cooldownUntil: Date;
+  windowCount: number;
+  retryAfterSeconds: number | null;
+}
+
+/**
+ * The 429 classification hook (ticket 03), invoked by recordForRun after a
+ * 429 usage row lands. NIM quota is counted per key × model, so the pair is
+ * classified from its own 60s window: >= 2 requests (real traffic, any
+ * status — including this row) that still ends in 429 means an RPM limit;
+ * a 429 with an empty window means the daily limit. The window counts usage
+ * rows carrying `metadata.keySlot` for the pair (ticket 04 populates it; rows
+ * without it cannot be attributed and stay uncounted), matched by the model
+ * form the row stores: `ctx.model` is the routed string the usage row itself
+ * records (`paperclip/<model>` for managed gateway traffic), while the
+ * cooldown row stores the bare upstream id for the probe (review F1).
+ *
+ * The cooldown row is found through the run's exclusive lease: usage rows do
+ * not carry connection identity (ticket 04 adds keySlot only), and a run
+ * leases at most one slot of one pool. A 429 whose run no longer matches its
+ * lease (TTL reclaimed, terminal sweep after release) stays unclassified —
+ * the next 429 on the pair reclassifies.
+ */
+export async function classifyKeySlot429(
+  db: Db,
+  ctx: {
+    companyId: string;
+    runId: string;
+    keySlot: number;
+    model: string;
+    retryAfterSeconds?: number | null;
+    now?: Date;
+  },
+): Promise<KeySlot429Classification | null> {
+  const now = ctx.now ?? new Date();
+  // The cooldown row keeps the bare upstream id (the probe needs it); the
+  // window count below uses the usage row's stored model form.
+  const model = cooldownModelKey(ctx.model);
+  if (!model) return null;
+  const [leaseRow] = await db
+    .select()
+    .from(credentialPool)
+    .where(and(
+      eq(credentialPool.companyId, ctx.companyId),
+      eq(credentialPool.activeRunId, ctx.runId),
+      eq(credentialPool.slot, ctx.keySlot),
+    ))
+    .limit(1);
+  if (!leaseRow) return null;
+  const [counted] = await db
+    .select({ total: sql<number>`count(*)::int` })
+    .from(usageRequestLogs)
+    .where(and(
+      eq(usageRequestLogs.companyId, ctx.companyId),
+      // Review F1: count by the model form the usage row stores. Usage rows
+      // record the full routed model string the capture sink saw
+      // (`paperclip/<model>` for managed gateway traffic — production 429
+      // rows are 24/24 prefixed), and `ctx.model` is that same string handed
+      // over by recordForRun, so this equality is the storage's own identity.
+      eq(usageRequestLogs.model, ctx.model),
+      gte(usageRequestLogs.occurredAt, new Date(now.getTime() - COOLDOWN_WINDOW_MS)),
+      sql`${usageRequestLogs.metadata}->>'keySlot' = ${String(ctx.keySlot)}`,
+    ));
+  const windowCount = counted?.total ?? 0;
+  if (windowCount >= COOLDOWN_WINDOW_THRESHOLD) {
+    // max(90s, retry-after): the header wins only when it asks for longer.
+    const retryAfterSeconds = ctx.retryAfterSeconds != null && ctx.retryAfterSeconds > 0
+      ? ctx.retryAfterSeconds
+      : null;
+    const durationMs = Math.max(RPM_COOLDOWN_MIN_MS, (retryAfterSeconds ?? 0) * 1000);
+    const classification: KeySlot429Classification = {
+      state: "rpm_cooldown",
+      cooldownUntil: new Date(now.getTime() + durationMs),
+      windowCount,
+      retryAfterSeconds,
+    };
+    await recordSlotCooldown(db, {
+      companyId: ctx.companyId,
+      connectionId: leaseRow.connectionId,
+      slot: ctx.keySlot,
+      model,
+      state: classification.state,
+      cooldownUntil: classification.cooldownUntil,
+      cooldownReason: "rpm",
+      runId: ctx.runId,
+    });
+    await logClassification(db, ctx, leaseRow.connectionId, model, classification);
+    return classification;
+  }
+  const classification: KeySlot429Classification = {
+    state: "daily_cooldown",
+    cooldownUntil: new Date(now.getTime() + DAILY_COOLDOWN_MS),
+    windowCount,
+    retryAfterSeconds: null,
+  };
+  await recordSlotCooldown(db, {
+    companyId: ctx.companyId,
+    connectionId: leaseRow.connectionId,
+    slot: ctx.keySlot,
+    model,
+    state: classification.state,
+    cooldownUntil: classification.cooldownUntil,
+    cooldownReason: "daily",
+    runId: ctx.runId,
+  });
+  await logClassification(db, ctx, leaseRow.connectionId, model, classification);
+  return classification;
+}
+
+/** The classification's evidence: keySlot, model, window count, retry-after. */
+function logClassification(
+  db: Db,
+  ctx: { companyId: string; runId: string; keySlot: number },
+  connectionId: string,
+  model: string,
+  classification: KeySlot429Classification,
+) {
+  return logActivity(db, {
+    companyId: ctx.companyId,
+    ...poolLeaseActor,
+    action: "ai_connection.key_slot_cooldown",
+    entityType: "tool_connection",
+    entityId: connectionId,
+    runId: ctx.runId,
+    details: {
+      slot: ctx.keySlot,
+      model,
+      state: classification.state,
+      cooldownUntil: classification.cooldownUntil.toISOString(),
+      windowCount: classification.windowCount,
+      retryAfterSeconds: classification.retryAfterSeconds,
+    },
+  }).catch((error) => logger.warn({ err: error, connectionId, model }, "Key slot cooldown activity log pending"));
+}
+
+/**
+ * The probe worker's deadline: the earliest `daily_cooldown` deadline that is
+ * within the probe lead window (or already due). rpm_cooldown rows never
+ * appear — they recover by eligibility alone; released (healthy) rows have no
+ * deadline. Null means the worker has no obligation.
+ */
+export async function nextCooldownProbeDeadline(db: Db, now: Date = new Date()): Promise<number | null> {
+  const [row] = await db
+    .select({ until: credentialPoolCooldowns.cooldownUntil })
+    .from(credentialPoolCooldowns)
+    .where(and(
+      eq(credentialPoolCooldowns.state, "daily_cooldown"),
+      lte(credentialPoolCooldowns.cooldownUntil, new Date(now.getTime() + PROBE_LEAD_MS)),
+    ))
+    .orderBy(asc(credentialPoolCooldowns.cooldownUntil))
+    .limit(1);
+  return row?.until?.getTime() ?? null;
+}
+
+/**
+ * The probe worker's coordinator wake time: the earliest daily cooldown's
+ * deadline in absolute terms — future-dated rows included, so a fresh 24h
+ * cooldown is learned once and wakes the worker at its deadline instead of
+ * sleeping through it (deadline-work probes only re-run on wake signals).
+ */
+export async function nextCooldownProbeWakeAt(db: Db): Promise<number | null> {
+  const [row] = await db
+    .select({ until: credentialPoolCooldowns.cooldownUntil })
+    .from(credentialPoolCooldowns)
+    .where(eq(credentialPoolCooldowns.state, "daily_cooldown"))
+    .orderBy(asc(credentialPoolCooldowns.cooldownUntil))
+    .limit(1);
+  return row?.until?.getTime() ?? null;
+}
+
+/** Display cooldown of one slot, derived from its (slot, model) cooldown rows:
+ * the most severe active cooldown wins (daily over rpm), ties go to the
+ * earliest deadline. No active cooldown displays as healthy. */
+function deriveSlotCooldown(
+  cooldownRows: PoolCooldownRow[],
+  slot: number,
+  now: Date,
+): { state: CredentialPoolSlotState; cooldownUntil: string | null; cooldownReason: string | null } {
+  const active = cooldownRows
+    .filter((row) => row.slot === slot && slotCooldownActive(row, now))
+    .sort((a, b) => rankCooldownState(b.state) - rankCooldownState(a.state)
+      || (a.cooldownUntil?.getTime() ?? 0) - (b.cooldownUntil?.getTime() ?? 0)
+      || a.model.localeCompare(b.model));
+  const cooldown = active[0];
+  return cooldown
+    ? { state: cooldown.state, cooldownUntil: cooldown.cooldownUntil?.toISOString() ?? null, cooldownReason: cooldown.cooldownReason }
+    : { state: "healthy", cooldownUntil: null, cooldownReason: null };
+}
+
+function rankCooldownState(state: CredentialPoolSlotState): number {
+  return state === "daily_cooldown" ? 2 : state === "rpm_cooldown" ? 1 : 0;
+}
+
+function slotView(row: typeof credentialPool.$inferSelect, cooldownRows: PoolCooldownRow[], now: Date): AiConnectionKeySlot {
+  const cooldown = deriveSlotCooldown(cooldownRows, row.slot, now);
   return {
     id: row.id,
     slot: row.slot,
     label: row.label,
     enabled: row.enabled,
-    state: row.state,
-    cooldownUntil: row.cooldownUntil?.toISOString() ?? null,
-    cooldownReason: row.cooldownReason,
+    state: cooldown.state,
+    cooldownUntil: cooldown.cooldownUntil,
+    cooldownReason: cooldown.cooldownReason,
     activeRunId: row.activeRunId,
     leaseExpiresAt: row.leaseExpiresAt?.toISOString() ?? null,
     leaseAgentId: row.leaseAgentId,
@@ -371,14 +752,23 @@ export function aiCredentialPoolService(db: Db) {
     return row;
   }
 
+  /** Cooldown rows of the connection feed the per-slot display state. */
+  const cooldownRows = async (connectionId: string) =>
+    db
+      .select()
+      .from(credentialPoolCooldowns)
+      .where(eq(credentialPoolCooldowns.connectionId, connectionId));
+
   async function listSlots(companyId: string, connectionId: string): Promise<AiConnectionKeySlotList> {
     await connectionRow(companyId, connectionId);
+    const now = new Date();
     const rows = await db
       .select()
       .from(credentialPool)
       .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId)))
       .orderBy(asc(credentialPool.slot));
-    return { connectionId, slots: rows.map(slotView) };
+    const cooldowns = await cooldownRows(connectionId);
+    return { connectionId, slots: rows.map((row) => slotView(row, cooldowns, now)) };
   }
 
   async function addSlot(companyId: string, connectionId: string, input: AiConnectionKeySlotCreate, actor: PoolSlotActor) {
@@ -409,7 +799,7 @@ export function aiCredentialPoolService(db: Db) {
           entityId: connectionId,
           details: { slot: input.slot, secretId: secret.id },
         });
-        return slotView(row!);
+        return slotView(row!, [], new Date());
       });
     } catch (error) {
       // A concurrent add for the same slot loses the unique constraint race.
@@ -443,7 +833,16 @@ export function aiCredentialPoolService(db: Db) {
         .set(patch)
         .where(eq(credentialPool.id, row.id))
         .returning();
-      if (input.keyValue !== undefined) await bindSlotSecret(tx, companyId, connectionId, input.slot, patch.secretRef!);
+      if (input.keyValue !== undefined) {
+        // A new key is a new account with fresh quota: its (slot, model)
+        // cooldown rows describe the previous key and are discarded.
+        await tx.delete(credentialPoolCooldowns).where(and(
+          eq(credentialPoolCooldowns.companyId, companyId),
+          eq(credentialPoolCooldowns.connectionId, connectionId),
+          eq(credentialPoolCooldowns.slot, input.slot),
+        ));
+        await bindSlotSecret(tx, companyId, connectionId, input.slot, patch.secretRef!);
+      }
       await logActivity(tx as unknown as Db, {
         companyId,
         actorType: actor.actorType,
@@ -458,7 +857,7 @@ export function aiCredentialPoolService(db: Db) {
           keyRotated: input.keyValue !== undefined,
         },
       });
-      return slotView(next!);
+      return slotView(next!, await cooldownRows(connectionId), new Date());
     });
     if (replacedSecretRef) {
       await secretService(db)
@@ -476,6 +875,12 @@ export function aiCredentialPoolService(db: Db) {
       if (row.activeRunId) throw conflict("Key slot is in use by an active run");
       removedSecretRef = row.secretRef;
       await tx.delete(credentialPool).where(eq(credentialPool.id, row.id));
+      // The slot's (slot, model) cooldowns belong to its removed key.
+      await tx.delete(credentialPoolCooldowns).where(and(
+        eq(credentialPoolCooldowns.companyId, companyId),
+        eq(credentialPoolCooldowns.connectionId, connectionId),
+        eq(credentialPoolCooldowns.slot, slot),
+      ));
       await tx.delete(companySecretBindings).where(and(
         eq(companySecretBindings.companyId, companyId),
         eq(companySecretBindings.targetType, "tool_connection"),
