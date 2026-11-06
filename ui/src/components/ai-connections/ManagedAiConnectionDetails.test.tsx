@@ -153,4 +153,18 @@ it("shows the key slot pool for keyed connections and hides it for subscriptions
   });
   await act(async () => { await vi.advanceTimersByTimeAsync(0); });
   expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/keys"))).toBe(false);
+
+  // Keyed connections without an upstream key (auth: none) pool nothing either.
+  const noAuth = { ...keyed, routing: { auth: "none", kind: "openai", protocol: "chat_completions", models: [] } as unknown as AiManagedConnectionSummary["routing"] };
+  fetchMock.mockClear();
+  fetchMock.mockImplementation((url: string) => {
+    if (url.endsWith("/active-runs")) return Promise.resolve(Response.json([]));
+    const kind = url.endsWith("/grants") ? "grants" : "accounts";
+    return Promise.resolve(Response.json(kind === "grants" ? grants : { ...accounts, connections: [{ ...noAuth }] }));
+  });
+  await act(async () => {
+    root.render(<QueryClientProvider client={client}><ManagedAiConnectionDetails connection={connection} /></QueryClientProvider>);
+  });
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/keys"))).toBe(false);
 });

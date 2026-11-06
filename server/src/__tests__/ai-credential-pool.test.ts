@@ -199,18 +199,18 @@ describe("key slot API", () => {
     expect(oldSecret).toBeUndefined(); // the replaced generation is cleaned up
     expect(JSON.stringify(rotated.body)).not.toContain("fixture-nvapi-key-api-3b");
 
-    // Activity log covers every mutation, never the key value.
-    const actions = (await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, account.connectionId)))).map((row) => row.action);
-    expect(actions).toEqual(expect.arrayContaining(["ai_connection.key_slot_added", "ai_connection.key_slot_updated", "ai_connection.key_slot_updated"]));
-    const details = (await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, account.connectionId)))).flatMap((row) => JSON.stringify(row.details ?? {}));
-    expect(details.join("\n")).not.toContain("fixture-nvapi-key-api-3");
-
     const removed = await request(app).delete(base).send({ slot: 3 });
     expect(removed.status).toBe(200);
     expect((await request(app).get(base)).body.slots).toEqual([]);
     // The slot's secret is removed with it.
     const remaining = await db.select().from(companySecrets).where(and(eq(companySecrets.companyId, companyId), eq(companySecrets.name, "ai-pool-fixture-slot-1")));
     expect(remaining).toHaveLength(1); // unrelated fixture secret untouched
+
+    // Activity log covers every mutation, never the key value.
+    const actions = (await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, account.connectionId)))).map((row) => row.action);
+    expect(actions).toEqual(expect.arrayContaining(["ai_connection.key_slot_added", "ai_connection.key_slot_updated", "ai_connection.key_slot_updated", "ai_connection.key_slot_removed"]));
+    const details = (await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, account.connectionId)))).flatMap((row) => JSON.stringify(row.details ?? {}));
+    expect(details.join("\n")).not.toContain("fixture-nvapi-key-api-3");
   });
 
   it("rejects invalid slots and enforces connection-manager permissions", async () => {
