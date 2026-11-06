@@ -179,7 +179,11 @@ async function probeOnce(
     httpStatus: response.status,
     requestId,
     occurredAt: now,
-    metadata: { probe: true, keySlot: row.slot },
+    // Pool attribution (ticket 04): the probe is real upstream traffic on a
+    // pooled slot, so it records the same (keySlot, connectionId) pair the
+    // driver stamps on agent rows — a keySlot without a connectionId would be
+    // ambiguous when two pools share a slot number.
+    metadata: { probe: true, keySlot: row.slot, connectionId: row.connectionId },
   }).onConflictDoNothing();
   return response.status;
 }

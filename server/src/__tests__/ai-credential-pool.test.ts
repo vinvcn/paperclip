@@ -867,10 +867,12 @@ describe("key pool probe worker (ticket 03)", () => {
     // Review F3: provider/biller derive from the model form the usage log
     // stores — normal rows record `paperclip/<model>` (biller "paperclip"), so the
     // probe's row must not split the same model into a second billing group.
+    // The row carries the pool attribution (ticket 04) with the same
+    // "keySlot implies connectionId" contract as agent-traffic rows.
     expect(usage[0]).toMatchObject({
       runId, httpStatus: 200, model: MODEL_A, inputTokens: 1, outputTokens: 1,
       provider: "paperclip", biller: "paperclip",
-      metadata: { probe: true, keySlot: 1 },
+      metadata: { probe: true, keySlot: 1, connectionId },
     });
     expect(usage[0]!.requestId).toMatch(/^keypool-probe-/);
     expect((await activityActions()).map((entry) => entry.action)).toContain("ai_connection.key_slot_probe_released");
