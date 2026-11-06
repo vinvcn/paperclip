@@ -104,7 +104,10 @@ export interface TaskInterruptionPresentation {
   state: "working" | "retry_scheduled" | "failed" | "waiting_for_user" | "resolved";
   nextRetryAt: string | null;
   canRetry: boolean;
-  userAction: "approval" | "reconnect" | "assign_agent" | "choose_model" | "resume" | "budget" | "project_access" | null;
+  userAction: "approval" | "reconnect" | "assign_agent" | "choose_model" | "resume" | "budget" | "project_access" | "rate_limited" | null;
+  /** Pooled-key evidence for the rate_limited user action; the UI renders the
+   * interruption copy from it. Absent for other actions and old failures. */
+  keyPool?: import("../key-pool-failure.js").KeyPoolFailureSnapshot;
   /** Only the task's own project id is exposed. Other source projects stay unnamed. */
   projectAccess?: { agentId: string; projectId: string | null; ready: boolean };
   sourceRunIds: string[];
