@@ -609,6 +609,22 @@ export async function nextCooldownProbeDeadline(db: Db, now: Date = new Date()):
   return row?.until?.getTime() ?? null;
 }
 
+/**
+ * The probe worker's coordinator wake time: the earliest daily cooldown's
+ * deadline in absolute terms — future-dated rows included, so a fresh 24h
+ * cooldown is learned once and wakes the worker at its deadline instead of
+ * sleeping through it (deadline-work probes only re-run on wake signals).
+ */
+export async function nextCooldownProbeWakeAt(db: Db): Promise<number | null> {
+  const [row] = await db
+    .select({ until: credentialPoolCooldowns.cooldownUntil })
+    .from(credentialPoolCooldowns)
+    .where(eq(credentialPoolCooldowns.state, "daily_cooldown"))
+    .orderBy(asc(credentialPoolCooldowns.cooldownUntil))
+    .limit(1);
+  return row?.until?.getTime() ?? null;
+}
+
 /** Display cooldown of one slot, derived from its (slot, model) cooldown rows:
  * the most severe active cooldown wins (daily over rpm), ties go to the
  * earliest deadline. No active cooldown displays as healthy. */

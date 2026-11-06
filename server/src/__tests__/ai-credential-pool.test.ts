@@ -25,11 +25,13 @@ import {
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { aiConnectionService } from "../services/ai-connections.js";
 import {
+  PROBE_DEFER_MS,
   classifyKeySlot429,
   nextCooldownProbeDeadline,
   releaseRunPoolLease,
   takePoolSlotLease,
 } from "../services/ai-credential-pool.js";
+import { probeDueSlotCooldowns } from "../services/key-pool-cooldown-work.js";
 import { secretService } from "../services/secrets.js";
 import { prepareManagedAiRuntime } from "../services/ai-connection-runtime.js";
 import { credentialPoolSlotConfigPath, syncConnectionCredentialBindings } from "../services/connection-credential-bindings.js";
@@ -695,6 +697,148 @@ describe("key pool cooldown state machine (ticket 03)", () => {
     expect(await nextCooldownProbeDeadline(db)).toBe(near.getTime());
     // Outside the lead window: no obligation yet.
     expect(await nextCooldownProbeDeadline(db, new Date(Date.now() - 10 * 60 * 1000))).toBeNull();
+  });
+});
+
+describe("key pool probe worker (ticket 03)", () => {
+  let connectionId: string;
+  let agentId: string;
+  const owner = "keypool-probe-user";
+  const slotKeyValue = "fixture-nvapi-probe-1";
+
+  beforeAll(async () => {
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const account = await createGatewayConnectionForUser(owner, "Probe NIM gateway", "fixture-connection-probe-key");
+    connectionId = account.connectionId;
+    const secret = await secretService(db).create(companyId, { name: `ai-pool-probe-${connectionId.slice(0, 8)}-slot-1`, provider: "local_encrypted", value: slotKeyValue }, { userId: owner });
+    await db.insert(credentialPool).values({ companyId, connectionId, slot: 1, secretRef: secret.id });
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connectionId));
+    await syncConnectionCredentialBindings(db, connection);
+    const [inserted] = await db.insert(agents).values({ companyId, name: "Probe agent" }).returning({ id: agents.id });
+    agentId = inserted!.id;
+  }, 60000);
+
+  const newRun = async () => (await db.insert(heartbeatRuns).values({ companyId, agentId }).returning({ id: heartbeatRuns.id }))[0]!.id;
+  const insertDueCooldown = async (model: string, lastRunId: string | null) => {
+    const [row] = await db.insert(credentialPoolCooldowns).values({
+      companyId, connectionId, slot: 1, model, state: "daily_cooldown",
+      cooldownUntil: new Date(Date.now() - 1_000), cooldownReason: "daily", lastRunId,
+    }).returning({ id: credentialPoolCooldowns.id });
+    return row!.id;
+  };
+  const cooldownState = async (model: string) => (await db.select().from(credentialPoolCooldowns)
+    .where(and(
+      eq(credentialPoolCooldowns.companyId, companyId),
+      eq(credentialPoolCooldowns.connectionId, connectionId),
+      eq(credentialPoolCooldowns.model, model),
+    )))[0]!;
+  const probeUsageRows = async () => (await db.select().from(usageRequestLogs)
+    .where(and(eq(usageRequestLogs.companyId, companyId), eq(usageRequestLogs.app, "key_pool_probe"))));
+  const activityActions = async () => (await db.select().from(activityLog)
+    .where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, connectionId))))
+    .filter((entry) => entry.action.startsWith("ai_connection.key_slot_probe"));
+
+  afterEach(async () => {
+    await db.delete(credentialPoolCooldowns).where(and(eq(credentialPoolCooldowns.companyId, companyId), eq(credentialPoolCooldowns.connectionId, connectionId)));
+    await db.delete(usageRequestLogs).where(and(eq(usageRequestLogs.companyId, companyId)));
+    await db.delete(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, connectionId)));
+  });
+
+  it("releases a due daily cooldown on a 200 probe and records the probe's real usage", async () => {
+    const runId = await newRun();
+    await insertDueCooldown(MODEL_A, runId);
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fetchImpl: typeof fetch = async (url, init) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ usage: { prompt_tokens: 1, completion_tokens: 1 } }), { status: 200 });
+    };
+    const now = new Date();
+    expect(await probeDueSlotCooldowns(db, now, { fetchImpl })).toBe(1);
+    // The probe hits the same (slot, model) pair's gateway with a minimal body.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("https://integrate.api.nvidia.example/v1/chat/completions");
+    const body = JSON.parse(String(calls[0]!.init.body));
+    expect(body).toMatchObject({ model: MODEL_A, max_tokens: 1 });
+    expect((calls[0]!.init.headers as Record<string, string>).authorization).toBe(`Bearer ${slotKeyValue}`);
+    // 200 = proof of recovery: the pair is healthy and assignable again.
+    expect(await cooldownState(MODEL_A)).toMatchObject({ state: "healthy", cooldownUntil: null, cooldownReason: null });
+    // The probe consumed real quota, so the usage log records it against the
+    // run whose 429 started the cooldown, flagged as a probe.
+    const usage = await probeUsageRows();
+    expect(usage).toHaveLength(1);
+    expect(usage[0]).toMatchObject({
+      runId, httpStatus: 200, model: MODEL_A, inputTokens: 1, outputTokens: 1,
+      metadata: { probe: true, keySlot: 1 },
+    });
+    expect(usage[0]!.requestId).toMatch(/^keypool-probe-/);
+    expect((await activityActions()).map((entry) => entry.action)).toContain("ai_connection.key_slot_probe_released");
+  });
+
+  it("defers a due daily cooldown by the probe defer window on a 429 probe", async () => {
+    const runId = await newRun();
+    await insertDueCooldown(MODEL_A, runId);
+    const fetchImpl: typeof fetch = async () => new Response(JSON.stringify({ error: "rate limited" }), { status: 429 });
+    const now = new Date();
+    expect(await probeDueSlotCooldowns(db, now, { fetchImpl })).toBe(1);
+    const row = await cooldownState(MODEL_A);
+    expect(row.state).toBe("daily_cooldown");
+    // Nothing shortens a daily cooldown but a 200: the next probe waits one
+    // defer window from the sweep.
+    expect(row.cooldownUntil!.getTime()).toBe(now.getTime() + PROBE_DEFER_MS);
+    const usage = await probeUsageRows();
+    expect(usage).toHaveLength(1);
+    expect(usage[0]).toMatchObject({ runId, httpStatus: 429 });
+    expect((await activityActions()).map((entry) => entry.action)).toContain("ai_connection.key_slot_probe_deferred");
+  });
+
+  it("defers on any other answered status and leaves the row untouched when transport fails", async () => {
+    const runId = await newRun();
+    await insertDueCooldown(MODEL_A, runId);
+    const fetchImpl: typeof fetch = async () => {
+      throw new Error("connection refused");
+    };
+    const before = await cooldownState(MODEL_A);
+    expect(await probeDueSlotCooldowns(db, new Date(), { fetchImpl })).toBe(0);
+    // A network failure is not evidence about quota: no state change, no
+    // usage row, the worker's retry re-probes the same deadline.
+    const after = await cooldownState(MODEL_A);
+    expect(after.state).toBe("daily_cooldown");
+    expect(after.cooldownUntil!.getTime()).toBe(before.cooldownUntil!.getTime());
+    expect(await probeUsageRows()).toHaveLength(0);
+    expect(await activityActions()).toHaveLength(0);
+  });
+
+  it("skips rows without run attribution and rows whose connection is not an api-key gateway", async () => {
+    const runId = await newRun();
+    // Row 1: no lastRunId — the probe's usage cannot be attributed honestly.
+    await insertDueCooldown(MODEL_A, null);
+    // Row 2: attributed and due — the only pair this sweep probes.
+    await insertDueCooldown(MODEL_B, runId);
+    const calls: string[] = [];
+    const fetchImpl: typeof fetch = async (url) => {
+      calls.push(String(url));
+      return new Response("{}", { status: 200 });
+    };
+    expect(await probeDueSlotCooldowns(db, new Date(), { fetchImpl })).toBe(1);
+    expect(calls).toHaveLength(1);
+    // The unattributed pair stays cooling untouched.
+    expect(await cooldownState(MODEL_A)).toMatchObject({ state: "daily_cooldown", lastProbeAt: null });
+
+    // A non-gateway (or non-api-key) connection cannot be probed at all:
+    // the pair stays cooling and no request leaves the building.
+    const other = await createGatewayConnectionForUser(owner, "Probe NIM gateway 2", "fixture-connection-probe-2-key");
+    const otherSecret = await secretService(db).create(companyId, { name: `ai-pool-probe-2-${other.connectionId.slice(0, 8)}-slot-1`, provider: "local_encrypted", value: "fixture-nvapi-probe-2" }, { userId: owner });
+    await db.insert(credentialPool).values({ companyId, connectionId: other.connectionId, slot: 1, secretRef: otherSecret.id });
+    const [otherConnection] = await db.select().from(toolConnections).where(eq(toolConnections.id, other.connectionId));
+    await syncConnectionCredentialBindings(db, otherConnection);
+    await db.update(toolConnections).set({ config: {} as never }).where(eq(toolConnections.id, other.connectionId));
+    await db.insert(credentialPoolCooldowns).values({
+      companyId, connectionId: other.connectionId, slot: 1, model: MODEL_A, state: "daily_cooldown",
+      cooldownUntil: new Date(Date.now() - 1_000), cooldownReason: "daily", lastRunId: runId,
+    });
+    const beforeCount = calls.length;
+    await probeDueSlotCooldowns(db, new Date(), { fetchImpl });
+    expect(calls).toHaveLength(beforeCount);
   });
 });
 
