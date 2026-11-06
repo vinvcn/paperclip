@@ -179,28 +179,35 @@ export function aiCredentialPoolService(db: Db) {
       .from(credentialPool)
       .where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, connectionId), eq(credentialPool.slot, input.slot)));
     if (existing.length) throw conflict(`Key slot ${input.slot} already exists for this connection`);
-    return db.transaction(async (tx) => {
-      const secret = await secretService(tx).create(
-        companyId,
-        { name: slotSecretName(connectionId, input.slot), provider: "local_encrypted", value: input.keyValue },
-        { userId: actor.actorType === "user" ? actor.actorId : null },
-      );
-      const [row] = await tx
-        .insert(credentialPool)
-        .values({ companyId, connectionId, slot: input.slot, label: input.label ?? null, secretRef: secret.id })
-        .returning();
-      await bindSlotSecret(tx, companyId, connectionId, input.slot, secret.id);
-      await logActivity(tx as unknown as Db, {
-        companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        action: "ai_connection.key_slot_added",
-        entityType: "tool_connection",
-        entityId: connectionId,
-        details: { slot: input.slot, secretId: secret.id },
+    try {
+      return await db.transaction(async (tx) => {
+        const secret = await secretService(tx).create(
+          companyId,
+          { name: slotSecretName(connectionId, input.slot), provider: "local_encrypted", value: input.keyValue },
+          { userId: actor.actorType === "user" ? actor.actorId : null },
+        );
+        const [row] = await tx
+          .insert(credentialPool)
+          .values({ companyId, connectionId, slot: input.slot, label: input.label ?? null, secretRef: secret.id })
+          .returning();
+        await bindSlotSecret(tx, companyId, connectionId, input.slot, secret.id);
+        await logActivity(tx as unknown as Db, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          action: "ai_connection.key_slot_added",
+          entityType: "tool_connection",
+          entityId: connectionId,
+          details: { slot: input.slot, secretId: secret.id },
+        });
+        return slotView(row!);
       });
-      return slotView(row!);
-    });
+    } catch (error) {
+      // A concurrent add for the same slot loses the unique constraint race.
+      if ((error as { cause?: { code?: string } })?.cause?.code === "23505")
+        throw conflict(`Key slot ${input.slot} already exists for this connection`);
+      throw error;
+    }
   }
 
   async function updateSlot(companyId: string, connectionId: string, input: AiConnectionKeySlotUpdate, actor: PoolSlotActor) {
