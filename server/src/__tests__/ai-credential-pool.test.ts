@@ -21,6 +21,8 @@ import {
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { secretService } from "../services/secrets.js";
+import { prepareManagedAiRuntime } from "../services/ai-connection-runtime.js";
+import { syncConnectionCredentialBindings } from "../services/connection-credential-bindings.js";
 
 let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
 let db: ReturnType<typeof createDb>;
@@ -39,11 +41,12 @@ beforeAll(async () => {
 }, 90000);
 afterAll(async () => { await database?.cleanup(); vi.unstubAllEnvs(); if (home) await rm(home, { recursive: true, force: true }); });
 
-/** A gateway connection like the NVIDIA NIM preset: custom HTTPS base URL + a bearer key. */
-async function createGatewayConnection(name: string, key: string) {
+/** A gateway connection like the NVIDIA NIM preset: OpenAI-compatible custom
+ * HTTPS base URL + a bearer key (the wizard's "Chat Completions API" preset). */
+async function createGatewayConnectionForUser(owner: string, name: string, key: string) {
   const service = aiConnectionService(db);
-  return service.save(companyId, userId, {
-    provider: "gateway" as never, method: "api_key", ownership: "shared", name,
+  return service.save(companyId, owner, {
+    provider: "openai", method: "api_key", ownership: "shared", name,
     apiKey: key, agentIds: [], allAgents: true,
     routing: { kind: "gateway", protocol: "chat", baseUrl: "https://integrate.api.nvidia.example/v1", auth: "bearer", models: [] },
   } as never, key);
@@ -51,7 +54,7 @@ async function createGatewayConnection(name: string, key: string) {
 
 describe("credential_pool schema", () => {
   it("stores pool slots for an AI connection and enforces the unique slot constraint", async () => {
-    const account = await createGatewayConnection("NIM gateway", "fixture-connection-key");
+    const account = await createGatewayConnectionForUser(userId, "NIM gateway", "fixture-connection-key");
     const [secret, secret2] = await Promise.all([
       secretService(db).create(companyId, { name: `ai-pool-fixture-slot-1`, provider: "local_encrypted", value: "fixture-nvapi-key-1" }, { userId }),
       secretService(db).create(companyId, { name: `ai-pool-fixture-slot-2`, provider: "local_encrypted", value: "fixture-nvapi-key-2" }, { userId }),
@@ -80,5 +83,68 @@ describe("credential_pool schema", () => {
     expect(version).toBeDefined();
     const stored = JSON.stringify(version?.material ?? version ?? {});
     expect(stored).not.toContain(plaintext);
+  });
+});
+
+describe("runtimeCredential pool assignment", () => {
+  it("resolves a pooled connection's key from its lowest healthy slot and falls back when the pool cannot serve", async () => {
+    const owner = "keypool-runtime-user";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const service = aiConnectionService(db);
+    const connectionKey = "fixture-connection-single-key";
+    const account = await createGatewayConnectionForUser(owner, "Pooled NIM gateway", connectionKey);
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, account.grantId));
+    const row = { connection, grant };
+
+    // No pool: the original single-credential path is untouched.
+    await expect(service.runtimeCredential(row)).resolves.toBe(connectionKey);
+
+    // Pool with slots 2 and 1 (inserted out of order): assignment is slot-ascending.
+    const slotSecrets = new Map<number, string>();
+    for (const [slot, value] of [[2, "fixture-nvapi-key-b"], [1, "fixture-nvapi-key-a"]] as const) {
+      const secret = await secretService(db).create(companyId, { name: `ai-pool-runtime-${account.connectionId.slice(0, 8)}-slot-${slot}`, provider: "local_encrypted", value }, { userId });
+      await db.insert(credentialPool).values({ companyId, connectionId: account.connectionId, slot, secretRef: secret.id });
+      slotSecrets.set(slot, value);
+    }
+    // Directly inserted rows still resolve after the connection's binding sync
+    // (reconnects and metadata edits recreate pool slot bindings from this path).
+    await syncConnectionCredentialBindings(db, connection);
+    await expect(service.runtimeCredential(row)).resolves.toBe(slotSecrets.get(1));
+
+    // Disabling the assigned slot moves assignment to the next healthy slot.
+    await db.update(credentialPool).set({ enabled: false }).where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, account.connectionId), eq(credentialPool.slot, 1)));
+    await expect(service.runtimeCredential(row)).resolves.toBe(slotSecrets.get(2));
+
+    // No assignable slot at all: fall back to the connection's own credential.
+    await db.update(credentialPool).set({ enabled: false }).where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, account.connectionId), eq(credentialPool.slot, 2)));
+    await expect(service.runtimeCredential(row)).resolves.toBe(connectionKey);
+  });
+
+  it("projects the pool-resolved key into the existing managed routing projection", async () => {
+    const owner = "keypool-projection-user";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const service = aiConnectionService(db);
+    const account = await service.save(companyId, owner, {
+      provider: "openai", method: "api_key", ownership: "shared", name: "Projected NIM gateway",
+      apiKey: "fixture-connection-projected", agentIds: [], allAgents: true,
+      routing: { kind: "gateway", protocol: "chat", baseUrl: "https://integrate.api.nvidia.example/v1", auth: "bearer", models: [{ id: "meta/llama-3.3-70b-instruct" }] },
+    } as never, "fixture-connection-projected");
+    const pooledKey = "fixture-nvapi-key-projected";
+    const secret = await secretService(db).create(companyId, { name: `ai-pool-projected-slot-1`, provider: "local_encrypted", value: pooledKey }, { userId });
+    await db.insert(credentialPool).values({ companyId, connectionId: account.connectionId, slot: 1, secretRef: secret.id });
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
+    await syncConnectionCredentialBindings(db, connection);
+    const runtime = await prepareManagedAiRuntime(db, {
+      companyId, agentId: randomUUID(), responsibleUserId: owner, adapterType: "paperclip_runner",
+      binding: { provider: "openai", method: "api_key", mode: "shared", connectionId: account.connectionId, grantId: account.grantId },
+      config: { provider: "opencode", model: "paperclip/meta/llama-3.3-70b-instruct" },
+    });
+    try {
+      const env = runtime.config.env as Record<string, string>;
+      expect(env.PAPERCLIP_AI_PROVIDER_KEY).toBe(pooledKey);
+      expect(env.PAPERCLIP_AI_PROVIDER_URL).toBe("https://integrate.api.nvidia.example/v1");
+      expect(env.PAPERCLIP_AI_PROVIDER_KEY).not.toContain("fixture-connection-projected");
+    } finally { await runtime.cleanup(); }
   });
 });
