@@ -12,6 +12,7 @@ export function managedProviderRouting(
   credential: string,
   model: string,
   keySlot?: number | null,
+  connectionId?: string | null,
 ) {
   const env: Record<string, string> = {};
   const config: Record<string, unknown> = {};
@@ -21,8 +22,14 @@ export function managedProviderRouting(
   const openrouter = isOpenRouterUrl(baseUrl);
   // Key-pool slot provenance beside the gateway key projection: the runner's
   // usage capture reads it for per-key usage attribution (ticket 04). This is
-  // an additive env key only — routing decisions are unchanged.
-  if (typeof keySlot === "number") env.PAPERCLIP_AI_PROVIDER_KEY_SLOT = String(keySlot);
+  // an additive env key only — routing decisions are unchanged. The pool's
+  // owning connection rides the same channel so a usage row attributes itself
+  // to the connection (review F2: per-pool 429 window accounting and Usage
+  // key filtering); without a pooled slot neither marker is projected.
+  if (typeof keySlot === "number") {
+    env.PAPERCLIP_AI_PROVIDER_KEY_SLOT = String(keySlot);
+    if (connectionId) env.PAPERCLIP_AI_PROVIDER_CONNECTION_ID = connectionId;
+  }
   if (route.kind === "bedrock") {
     env.CLAUDE_CODE_USE_BEDROCK = "1";
     env.AWS_REGION = route.region!;

@@ -225,6 +225,8 @@ describe("runtimeCredential pool assignment", () => {
       expect(env.PAPERCLIP_AI_PROVIDER_KEY).not.toContain("fixture-connection-projected");
       // The selected slot travels with the credential for usage attribution.
       expect(env.PAPERCLIP_AI_PROVIDER_KEY_SLOT).toBe("1");
+      // The pool's owning connection rides the same channel (ticket 04 review F2).
+      expect(env.PAPERCLIP_AI_PROVIDER_CONNECTION_ID).toBe(account.connectionId);
       expect(runtime.keySlot).toBe(1);
       // The warm-session identity binds the slot: a different slot on a later
       // run invalidates the stored session instead of reusing its captured key.

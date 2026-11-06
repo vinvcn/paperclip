@@ -148,6 +148,19 @@ describe("provider routing", () => {
       "openrouter/anthropic/claude-sonnet-4.6",
     );
   });
+  it("projects the pooled key slot and its owning connection beside the gateway key (ticket 04)", () => {
+    const routing = aiProviderRoutingSchema.parse({ kind: "gateway", protocol: "chat", baseUrl: "https://gateway.example/v1" });
+    // A pooled resolution projects both markers on the same env channel, so
+    // usage records can attribute rows to the pool's connection (review F2).
+    const pooled = managedProviderRouting(routing, "opencode_local", "selected-key", "paperclip/meta/model", 3, "conn-uuid-1");
+    expect(pooled.env.PAPERCLIP_AI_PROVIDER_KEY_SLOT).toBe("3");
+    expect(pooled.env.PAPERCLIP_AI_PROVIDER_CONNECTION_ID).toBe("conn-uuid-1");
+    // Without a pool slot there is no connection marker either — non-pool
+    // credentials, probes and direct traffic stay unattributed.
+    const unpooled = managedProviderRouting(routing, "opencode_local", "selected-key", "paperclip/meta/model");
+    expect(unpooled.env).not.toHaveProperty("PAPERCLIP_AI_PROVIDER_KEY_SLOT");
+    expect(unpooled.env).not.toHaveProperty("PAPERCLIP_AI_PROVIDER_CONNECTION_ID");
+  });
   it("projects only a Bedrock API key and rejects general AWS access keys", () => {
     const routing = aiProviderRoutingSchema.parse({
       kind: "bedrock",
