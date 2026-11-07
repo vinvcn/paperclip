@@ -51,7 +51,10 @@ export interface PoolSlotAssignmentContext {
    * pooled key asks the matrix to skip that slot — the wake carries the failed
    * slot and every assignment of the resulting run filters it out (sticky and
    * lease lanes; the pin outranks it). The avoid lives in the run's own wake
-   * context, so the assignment after that run sees the normal matrix again. */
+   * context, so a later manual assignment sees the normal matrix again; the
+   * bounded auto-retry lineage rebuilds its snapshot from this one and
+   * inherits the avoid (harmless: the failed slot is cooling anyway, and the
+   * 429/exhausted codes are outside the auto-retry lists). */
   avoidSlot?: number | null;
   /** Target model of the resolution. Cooldowns are tracked per (slot, model)
    * because NIM quota is counted per key × model (plan §10): the matrix checks

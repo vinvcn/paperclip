@@ -48,6 +48,7 @@ export function AgentKeySlotPin({
           {rows.map((slot) => (
             <option key={slot.slot} value={slot.slot}>
               Slot {slot.slot}{slot.label ? ` · ${slot.label}` : ""}
+              {slot.enabled === false ? " · Disabled" : ""}
               {slot.state !== "healthy" ? ` · ${KEY_SLOT_STATE_LABELS[slot.state]}` : ""}
             </option>
           ))}
