@@ -4125,6 +4125,13 @@ const runnerExplicitProviderEnvironmentKeys = [
   ...CLAUDE_ROUTING_ENV_KEYS,
   "PAPERCLIP_AI_PROVIDER_KEY",
   "PAPERCLIP_AI_PROVIDER_URL",
+  // Key-pool slot provenance (ticket 04): beside the gateway key the launcher
+  // must carry the pooled slot and its owning connection so the runnerd-side
+  // usage capture can attribute records (driving per-key usage and the ticket-03
+  // 429 cooldown classifier). The per-session OpenCode sanitizer already
+  // permits both; without them here they never reach runnerd's environment.
+  "PAPERCLIP_AI_PROVIDER_KEY_SLOT",
+  "PAPERCLIP_AI_PROVIDER_CONNECTION_ID",
   "PAPERCLIP_AGENT_KEY_ID",
   "PAPERCLIP_AGENT_PUBLIC_KEY",
   "PAPERCLIP_AGENT_PRIVATE_KEY",

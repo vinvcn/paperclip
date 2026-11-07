@@ -1550,6 +1550,8 @@ it("preserves an explicit OpenCode permission mode at the runner spawn boundary"
       PAPERCLIP_AGENT_PRIVATE_KEY: "private-pem",
       OPENROUTER_API_KEY: "provider-key",
       PAPERCLIP_AI_PROVIDER_KEY: "managed-provider-key",
+      PAPERCLIP_AI_PROVIDER_KEY_SLOT: "3",
+      PAPERCLIP_AI_PROVIDER_CONNECTION_ID: "0c0ffee0-0000-4000-8000-000000000000",
       ANTHROPIC_AUTH_TOKEN: "managed-claude-key",
       ANTHROPIC_BASE_URL: "https://gateway.example",
       PAPERCLIP_OPENCODE_PERMISSION_MODE: "deny",
@@ -1587,6 +1589,8 @@ it("preserves an explicit OpenCode permission mode at the runner spawn boundary"
     PAPERCLIP_AGENT_PRIVATE_KEY: "private-pem",
     OPENROUTER_API_KEY: "provider-key",
     PAPERCLIP_AI_PROVIDER_KEY: "managed-provider-key",
+    PAPERCLIP_AI_PROVIDER_KEY_SLOT: "3",
+    PAPERCLIP_AI_PROVIDER_CONNECTION_ID: "0c0ffee0-0000-4000-8000-000000000000",
     ANTHROPIC_AUTH_TOKEN: "managed-claude-key",
     ANTHROPIC_BASE_URL: "https://gateway.example",
     PAPERCLIP_OPENCODE_PERMISSION_MODE: "deny",
@@ -1658,6 +1662,9 @@ it("preserves only bounded GitHub credential projection at the runner spawn boun
   expect(launches[0]!.environment.GIT_CONFIG_KEY_1).toBeUndefined();
   expect(launches[0]!.environment.GIT_CONFIG_VALUE_1).toBeUndefined();
   expect(launches[0]!.environment.DATABASE_URL).toBeUndefined();
+  // Unprojected key-pool attributes must not conjure themselves from ambient env.
+  expect(launches[0]!.environment.PAPERCLIP_AI_PROVIDER_KEY_SLOT).toBeUndefined();
+  expect(launches[0]!.environment.PAPERCLIP_AI_PROVIDER_CONNECTION_ID).toBeUndefined();
 });
 
 it("passes structured inputs to an external owner and preserves its replacement veto", () => {
