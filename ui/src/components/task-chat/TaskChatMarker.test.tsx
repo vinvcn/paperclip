@@ -228,4 +228,91 @@ describe("TaskChatMarker", () => {
     await Promise.resolve();
     expect(onRetryFailedRun).toHaveBeenCalledWith("run-1");
   });
+
+  // Ticket 06: pooled-key failure markers mount the dedicated recovery actions
+  // the host supplies; the generic Try-again chain stays untouched for other
+  // failures, and a key-pool marker never grows the generic button back.
+  it("renders the supplied key-pool actions beneath a pooled-key failure marker", () => {
+    flushSync(() =>
+      root!.render(
+        <ThemeProvider>
+          <TaskChatMarker
+            item={{
+              id: "run-1:failure",
+              kind: "marker",
+              variant: "interrupted",
+              label: "Rate limited",
+              detail: "key 3 × z-ai/glm-5.3-flash hit the RPM rate limit.",
+              retryable: false,
+              collapsible: true,
+              runId: "run-1",
+              keyPool: { reason: "rate_limited", slot: 3, model: "z-ai/glm-5.3-flash", state: "rpm_cooldown", cooldownUntil: null, connectionId: "conn-1" },
+            }}
+            keyPoolActions={<button type="button" data-testid="key-pool-switch-key">Switch key</button>}
+          />
+        </ThemeProvider>,
+      ),
+    );
+    expect(container.querySelector('[data-testid="key-pool-switch-key"]')).not.toBeNull();
+    // The generic retry stays suppressed on key-pool markers (retryable: false).
+    expect(container.querySelector('[data-testid="task-chat-run-failed-try-again"]')).toBeNull();
+  });
+
+  it("passes pooled-key markers through the thread's key-pool action renderer", () => {
+    const renderKeyPoolActions = vi.fn().mockReturnValue(
+      <button type="button" data-testid="key-pool-switch-key">Switch key</button>,
+    );
+    flushSync(() =>
+      root!.render(
+        <ThemeProvider>
+          <TaskChatThreadView
+            scroll={false}
+            items={[
+              {
+                id: "run-1:failure",
+                kind: "marker",
+                variant: "interrupted",
+                label: "Rate limited",
+                detail: "key 3 hit the RPM rate limit.",
+                retryable: false,
+                runId: "run-1",
+                keyPool: { reason: "rate_limited", slot: 3, model: "z-ai/glm-5.3-flash", state: "rpm_cooldown", cooldownUntil: null, connectionId: "conn-1" },
+              },
+            ]}
+            renderKeyPoolActions={renderKeyPoolActions}
+          />
+        </ThemeProvider>,
+      ),
+    );
+    expect(renderKeyPoolActions).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ id: "run-1:failure", runId: "run-1" }),
+    );
+    expect(container.querySelector('[data-testid="key-pool-switch-key"]')).not.toBeNull();
+  });
+
+  it("does not invoke the key-pool action renderer for ordinary failure markers", () => {
+    const renderKeyPoolActions = vi.fn();
+    flushSync(() =>
+      root!.render(
+        <ThemeProvider>
+          <TaskChatThreadView
+            scroll={false}
+            items={[
+              {
+                id: "run-2:failure",
+                kind: "marker",
+                variant: "interrupted",
+                label: "Run failed",
+                detail: "The runner stopped before returning an answer.",
+                collapsible: true,
+                runId: "run-2",
+              },
+            ]}
+            renderKeyPoolActions={renderKeyPoolActions}
+          />
+        </ThemeProvider>,
+      ),
+    );
+    expect(renderKeyPoolActions).not.toHaveBeenCalled();
+  });
 });

@@ -9,6 +9,7 @@ import { useStreamlinedTaskChatPresentation } from "./presentation-mode";
 import type {
   TaskChatInteractionItem,
   TaskChatItem,
+  TaskChatMarkerItem,
   TaskChatMessageItem,
   TaskChatRuntimeRequestDecision,
   TaskChatRuntimeRequestItem,
@@ -72,6 +73,12 @@ interface TaskChatThreadViewProps {
   tryAgainNoLiveExecutionPathPending?: boolean;
   onRetryFailedRun?: (runId: string) => Promise<void> | void;
   retryFailedRunId?: string | null;
+  /**
+   * Renders the dedicated pooled-key recovery actions (ticket 06) beneath a
+   * key-pool failure marker. The thread view only forwards the marker; the
+   * host builds the actions from the marker's keyPool snapshot and runId.
+   */
+  renderKeyPoolActions?: (item: TaskChatMarkerItem) => ReactNode;
   /** Content appended inside the transcript scroller after the settled thread. */
   tail?: ReactNode;
   /** Optional streaming-aware key when `tail` changes without changing `items`. */
@@ -104,6 +111,7 @@ function renderItem(
   attachments: IssueAttachment[] = [],
   onOpenSkill?: (skillId: string, name: string) => void,
   onOpenBrowser?: (browserId: string) => void,
+  renderKeyPoolActions?: (item: TaskChatMarkerItem) => ReactNode,
 ) {
   switch (item.kind) {
     case "pending_question": return <CoordinatorChatPendingQuestion item={item.question} />;
@@ -198,6 +206,7 @@ function renderItem(
               ? retryFailedRunId === item.runId
               : tryAgainNoLiveExecutionPathPending
           }
+          keyPoolActions={item.keyPool && renderKeyPoolActions ? renderKeyPoolActions(item) : undefined}
         />
       );
     case "thinking":
@@ -258,6 +267,7 @@ function renderItem(
               attachments,
               onOpenSkill,
               onOpenBrowser,
+              renderKeyPoolActions,
             )
           }
         />
@@ -319,6 +329,7 @@ export function TaskChatThreadView({
   tryAgainNoLiveExecutionPathPending = false,
   onRetryFailedRun,
   retryFailedRunId = null,
+  renderKeyPoolActions,
   tail,
   contentKey,
   className,
@@ -355,6 +366,7 @@ export function TaskChatThreadView({
         runRetry ?? onTryAgainNoLiveExecutionPath,
         runRetry ? retryFailedRunId === runId : tryAgainNoLiveExecutionPathPending,
         retryableMarkerId, onRetryFailedRun, retryFailedRunId, attachments, onOpenSkill, onOpenBrowser,
+        renderKeyPoolActions,
       );
     };
     const renderedItems = streamlined
@@ -412,6 +424,7 @@ export function TaskChatThreadView({
     renderInteraction, renderBrief, renderMessageActions, renderQueuedAction,
     onTryAgainNoLiveExecutionPath, tryAgainNoLiveExecutionPathPending,
     retryableMarkerId, onRetryFailedRun, retryFailedRunId, attachments, onOpenSkill, onOpenBrowser,
+    renderKeyPoolActions,
   ]);
   const body = (
     <div

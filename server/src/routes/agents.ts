@@ -6100,6 +6100,14 @@ export function agentRoutes(
     let wakePayload = req.body.payload ?? null;
     let retryConversationContext: Record<string, unknown> = {};
     let retryNativeReviewContext: NativeReviewAssignmentContext | null = null;
+    // The one-shot pooled-key avoid (ticket 06) only rides an exact failed-run
+    // retry: any other wake may not steer assignment, mirroring the execution-
+    // context guard below.
+    if (req.body.keyPoolAvoidSlot !== undefined && !req.body.failedRunId) {
+      throw badRequest(
+        "The key-pool avoid slot applies only to an exact failed-run retry.",
+      );
+    }
     if (req.body.failedRunId) {
       assertBoard(req);
       if (
@@ -6278,6 +6286,13 @@ export function agentRoutes(
         // Only the selected server-owned run can carry review authority into
         // an exact retry. Dispatch revalidates the current review assignment.
         ...retryNativeReviewContext,
+        // The retry board action's one-shot pooled-key avoid (ticket 06): the
+        // next attempt's pool assignment skips this slot once. Validated by
+        // the wake schema; only ever set beside failedRunId (guarded above).
+        ...(typeof req.body.keyPoolAvoidSlot === "number" &&
+        Number.isInteger(req.body.keyPoolAvoidSlot) && req.body.keyPoolAvoidSlot >= 1
+          ? { keyPoolAvoidSlot: req.body.keyPoolAvoidSlot }
+          : {}),
         triggeredBy: req.actor.type,
         originIdentityContextId: req.actor.identityContextId ?? null,
         responsibleUserId: req.actor.type === "agent" ? req.actor.onBehalfOfUserId ?? null : req.actor.userId ?? null,

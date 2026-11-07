@@ -47,6 +47,15 @@ export interface PoolSlotAssignmentContext {
    * uses this slot unconditionally — cooldown included (warn logged) — but a
    * disabled slot stays off and a missing slot fails the run. */
   pinnedSlot?: number | null;
+  /** One-shot avoid (ticket 06): the retry wake of a run that failed on a
+   * pooled key asks the matrix to skip that slot — the wake carries the failed
+   * slot and every assignment of the resulting run filters it out (sticky and
+   * lease lanes; the pin outranks it). The avoid lives in the run's own wake
+   * context, so a later manual assignment sees the normal matrix again; the
+   * bounded auto-retry lineage rebuilds its snapshot from this one and
+   * inherits the avoid (harmless: the failed slot is cooling anyway, and the
+   * 429/exhausted codes are outside the auto-retry lists). */
+  avoidSlot?: number | null;
   /** Target model of the resolution. Cooldowns are tracked per (slot, model)
    * because NIM quota is counted per key × model (plan §10): the matrix checks
    * the target model's cooldown instead of the deprecated slot-level column.
@@ -243,6 +252,11 @@ export async function selectAssignablePoolSlot(
   if (!enabled.length) return null;
   const runId = lease?.heartbeatRunId ?? null;
   const modelKey = cooldownModelKey(lease?.model);
+  // The one-shot avoid: a pinned slot outranks it, every other lane filters it.
+  const avoidSlot = lease?.avoidSlot != null && Number.isInteger(lease.avoidSlot) && lease.avoidSlot >= 1
+    ? lease.avoidSlot
+    : null;
+  const notAvoided = (row: PoolSlotRow) => row.slot !== avoidSlot;
   const now = new Date();
   const cooldowns = modelKey
     ? await db
@@ -264,7 +278,7 @@ export async function selectAssignablePoolSlot(
     // Ephemeral selection for a resolution outside a run: pin, then sticky,
     // then least-recently-used — no lease is taken and stickiness stays put.
     const pinned = lease?.pinnedSlot != null ? enabled.find((row) => row.slot === lease.pinnedSlot) : undefined;
-    const healthy = enabled.filter(assignable);
+    const healthy = enabled.filter((row) => assignable(row) && notAvoided(row));
     const sticky = lease?.agentId
       ? [...healthy].sort((a, b) => (b.lastAssignedAt?.getTime() ?? 0) - (a.lastAssignedAt?.getTime() ?? 0))
         .find((row) => row.lastAssignedAgentId === lease.agentId)
@@ -290,7 +304,7 @@ export async function selectAssignablePoolSlot(
       entityId: connectionId,
       runId,
       agentId,
-      details: { slot, model: modelKey, pinned, leaseExpiresAt: expiresAt.toISOString() },
+      details: { slot, model: modelKey, pinned, leaseExpiresAt: expiresAt.toISOString(), ...(avoidSlot != null ? { avoidedSlot: avoidSlot } : {}) },
     }).catch((error) => logger.warn({ err: error, companyId, connectionId, runId }, "Key slot lease activity log pending"));
   if (lease?.pinnedSlot != null) {
     const pinned = rows.find((row) => row.slot === lease.pinnedSlot);
@@ -341,7 +355,7 @@ export async function selectAssignablePoolSlot(
   // the same slot.
   if (agentId) {
     const sticky = [...enabled]
-      .filter((row) => assignable(row) && row.lastAssignedAgentId === agentId)
+      .filter((row) => assignable(row) && notAvoided(row) && row.lastAssignedAgentId === agentId)
       .sort((a, b) => (b.lastAssignedAt?.getTime() ?? Number.NEGATIVE_INFINITY) - (a.lastAssignedAt?.getTime() ?? Number.NEGATIVE_INFINITY) || a.slot - b.slot);
     for (const candidate of sticky) {
       const taken = await takeLease(candidate.id, true);
@@ -355,7 +369,7 @@ export async function selectAssignablePoolSlot(
   // used). Each conditional UPDATE re-checks eligibility atomically, so a
   // candidate another run just claimed simply fails and the next is tried.
   const free = [...enabled]
-    .filter((row) => assignable(row) && (!row.activeRunId || row.activeRunId === runId
+    .filter((row) => assignable(row) && notAvoided(row) && (!row.activeRunId || row.activeRunId === runId
       || (row.leaseExpiresAt !== null && row.leaseExpiresAt < now)))
     .sort(mostStaleFirst);
   for (const candidate of free) {

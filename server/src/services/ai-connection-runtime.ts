@@ -256,6 +256,9 @@ export async function prepareManagedAiRuntime(
     /** Resolved key-slot pin (task override, else agent adapterConfig.keySlot).
      * Assignment uses the pinned slot unconditionally — cooldown included. */
     pinnedKeySlot?: number | null;
+    /** One-shot pooled-key avoid from a failed-run retry wake (ticket 06):
+     * this run's pool assignment skips the just-failed slot once. */
+    avoidKeySlot?: number | null;
   },
 ) {
   const configuredEnv =
@@ -338,6 +341,7 @@ export async function prepareManagedAiRuntime(
             agentId: input.agentId,
             heartbeatRunId: input.heartbeatRunId ?? null,
             pinnedSlot: input.pinnedKeySlot ?? null,
+            avoidSlot: input.avoidKeySlot ?? null,
             model: typeof input.config.model === "string" ? input.config.model : null,
           },
         });

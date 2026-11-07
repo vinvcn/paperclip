@@ -2183,7 +2183,7 @@ describe("TaskChatComposer", () => {
       });
       typeText("Please outline the launch.");
       await act(async () => sendButton().click());
-      expect(onAdd).toHaveBeenCalledWith("Please outline the launch.", undefined, undefined, undefined, expect.any(String), { model: "gpt-6-astra", effort: "high", fast: false });
+      expect(onAdd).toHaveBeenCalledWith("Please outline the launch.", undefined, undefined, undefined, expect.any(String), { model: "gpt-6-astra", effort: "high", fast: false, keySlot: null });
     } finally {
       render(<></>); client.clear(); catalog.mockRestore(); vi.unstubAllGlobals();
     }

@@ -72,7 +72,7 @@ describe("composer assignee picker", () => {
     expect(document.querySelector('input[aria-label="Effort"]')).not.toBeNull();
     await click("Choose exact model");
     await click("GPT-6 Astra");
-    expect(onSettingsChange).toHaveBeenLastCalledWith({ model: "gpt-6-astra", effort: "high", fast: false });
+    expect(onSettingsChange).toHaveBeenLastCalledWith({ model: "gpt-6-astra", effort: "high", fast: false, keySlot: null });
     expect(onAssigneeChange).not.toHaveBeenCalled();
   });
 
@@ -188,7 +188,7 @@ describe("composer assignee picker", () => {
     rememberComposerEffort("company-1", remembered);
     const onSettingsChange = vi.fn();
     render(vi.fn(), onSettingsChange, false, { settings, overrides });
-    if (restored) expect(onSettingsChange).toHaveBeenCalledWith({ model: null, effort: restored, fast: false });
+    if (restored) expect(onSettingsChange).toHaveBeenCalledWith({ model: null, effort: restored, fast: false, keySlot: null });
     else expect(onSettingsChange).not.toHaveBeenCalled();
   });
 
@@ -205,7 +205,7 @@ describe("composer assignee picker", () => {
     expect(getLastComposerEffort("company-1")).toBe("low");
     await click("Choose exact model");
     await click("GPT-6 Astra");
-    expect(onSettingsChange).toHaveBeenLastCalledWith({ model: "gpt-6-astra", effort: "high", fast: false });
+    expect(onSettingsChange).toHaveBeenLastCalledWith({ model: "gpt-6-astra", effort: "high", fast: false, keySlot: null });
     await click("Reset to agent default");
     expect(getLastComposerEffort("company-1")).toBeNull();
   });
@@ -433,5 +433,144 @@ describe("composer assignee picker", () => {
     expect(document.querySelector('[data-testid="composer-mobile-dialog"]')).not.toBeNull();
     expect(document.querySelector('[aria-label="Search assignees"]')).not.toBeNull();
     expect(document.querySelector('[aria-label="Choose exact model"]')).toBeNull();
+  });
+});
+
+// Ticket 06: the task-level key-slot pin and the connection-catalog alignment.
+describe("composer key slot and connection catalog", () => {
+  const connectionId = "11111111-1111-4111-8111-111111111111";
+  const grantId = "33333333-3333-4333-8333-333333333333";
+  const pooledAgent = {
+    ...agent, adapterType: "opencode_local", adapterConfig: {},
+    runtimeConfig: { aiConnection: { mode: "shared", provider: "openai", method: "api_key", connectionId, grantId } },
+  } as unknown as Agent;
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  const pooledRender = (props: Partial<ComponentProps<typeof ComposerRunSettingsPicker>> = {}) => {
+    fetchMock.mockImplementation((url: string | URL) => {
+      const target = String(url);
+      if (target.endsWith("/ai-connections")) {
+        return Promise.resolve(Response.json({
+          connections: [{
+            id: connectionId, grantId, provider: "openai", name: "NIM gateway", ownership: "shared",
+            isDefault: false, ownerUserId: null, status: "connected", method: "api_key",
+            routing: { kind: "gateway", protocol: "chat", baseUrl: "https://integrate.api.nvidia.example/v1", auth: "bearer",
+              models: [{ id: "z-ai/glm-5.3-flash", label: "GLM 5.3 Flash" }] },
+          }],
+          currentUserId: "user-1",
+        }));
+      }
+      if (target.endsWith("/keys")) {
+        return Promise.resolve(Response.json({
+          connectionId,
+          slots: [
+            { id: "slot-1", slot: 1, label: "nim-account-1", enabled: true, state: "healthy", cooldownUntil: null, cooldownReason: null,
+              activeRunId: null, leaseExpiresAt: null, leaseAgentId: null, lastAssignedAgentId: null,
+              createdAt: "2026-11-06T00:00:00.000Z", updatedAt: "2026-11-06T00:00:00.000Z" },
+            { id: "slot-3", slot: 3, label: "nim-account-3", enabled: true, state: "rpm_cooldown", cooldownUntil: "2026-11-06T12:30:00.000Z", cooldownReason: "rpm",
+              activeRunId: null, leaseExpiresAt: null, leaseAgentId: null, lastAssignedAgentId: null,
+              createdAt: "2026-11-06T00:00:00.000Z", updatedAt: "2026-11-06T00:00:00.000Z" },
+          ],
+        }));
+      }
+      return Promise.reject(new Error(`Unexpected fetch: ${target}`));
+    });
+    // The draft lives in real state, like the composer does: choosing a slot
+    // must be visible in the settings row immediately after the view returns.
+    function StatefulPicker() {
+      const [settings, setSettings] = useState<ComposerRunSettings | null>(props.settings ?? null);
+      return <ComposerRunSettingsPicker {...props} companyId="company-1" assigneeValue="agent:a1" currentAssigneeValue="agent:a1"
+        options={options} agents={new Map([[agent.id, pooledAgent]])} settings={settings}
+        onSettingsChange={(next) => { props.onSettingsChange?.(next); setSettings(next); }}
+        onAssigneeChange={vi.fn()} />;
+    }
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    flushSync(() => root!.render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><StatefulPicker /></QueryClientProvider>));
+  };
+
+  const flush = async () => {
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+  };
+
+  it("lists the pooled slots with health badges and pins one for this task", async () => {
+    const onSettingsChange = vi.fn();
+    pooledRender({ onSettingsChange });
+    await click("Select model and effort");
+    await flush();
+    // The popover portals its content into document.body.
+    const keyRow = document.querySelector('[data-testid="composer-key-slot"]');
+    expect(keyRow?.textContent).toContain("Auto (recommended)");
+    await click("Choose key slot");
+    expect(document.querySelector('[data-testid="composer-key-slot-view"]')).not.toBeNull();
+    expect(document.querySelector('[data-testid="composer-key-slot-auto"]')).not.toBeNull();
+    expect(document.querySelector('[data-testid="composer-key-slot-1"]')?.textContent).toContain("Healthy");
+    expect(document.querySelector('[data-testid="composer-key-slot-3"]')?.textContent).toContain("RPM cooldown");
+    await click("Slot 3");
+    expect(onSettingsChange).toHaveBeenLastCalledWith({ model: null, effort: null, fast: false, keySlot: 3 });
+    // Back in the settings view the row names the pinned slot with its badge.
+    expect(document.querySelector('[data-testid="composer-key-slot"]')?.textContent).toContain("Slot 3");
+    expect(document.querySelector('[data-testid="composer-key-slot"]')?.textContent).toContain("RPM cooldown");
+  });
+
+  it("warns that a pinned slot is used even while it cools down", async () => {
+    const onSettingsChange = vi.fn();
+    pooledRender({ onSettingsChange, overrides: { keySlot: 3 } });
+    await click("Select model and effort");
+    await flush();
+    await click("Choose key slot");
+    expect(document.querySelector('[data-testid="composer-key-slot-warning"]')?.textContent)
+      .toContain("pinned tasks still use it");
+    // Auto clears the pin and the warning goes with it.
+    await click("Auto (recommended)");
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ keySlot: null }));
+    await click("Choose key slot");
+    expect(document.querySelector('[data-testid="composer-key-slot-warning"]')).toBeNull();
+  });
+
+  it("hides the key slot setting for agents without a pooled connection", async () => {
+    const onSettingsChange = vi.fn();
+    render(onSettingsChange, onSettingsChange, false, { settings: null });
+    await flush();
+    await click("Select model and effort");
+    expect(container!.querySelector('[data-testid="composer-key-slot"]')).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("takes the model catalog from the bound connection instead of host discovery", async () => {
+    const loadModels = vi.spyOn(agentsApi, "adapterModels");
+    const onSettingsChange = vi.fn();
+    pooledRender({ onSettingsChange });
+    await click("Select model and effort");
+    await flush();
+    await click("Choose exact model");
+    // The routed catalog arrives paperclip/-prefixed for the opencode harness;
+    // the host's `opencode models` discovery never participates.
+    expect(loadModels).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("GLM 5.3 Flash");
+    expect(document.body.textContent).toContain("paperclip/z-ai/glm-5.3-flash");
+    await click("GLM 5.3 Flash");
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ model: "paperclip/z-ai/glm-5.3-flash" }));
+  });
+
+  it("keeps adapter discovery for agents without a routed connection", async () => {
+    const loadModels = vi.spyOn(agentsApi, "adapterModels").mockResolvedValue([{ id: "gpt-6-sol", label: "GPT-6 Sol" }]);
+    const onSettingsChange = vi.fn();
+    render(onSettingsChange, onSettingsChange, true, { settings: null });
+    await flush();
+    await click("Select model and effort");
+    await click("Choose exact model");
+    expect(loadModels).toHaveBeenCalledExactlyOnceWith("company-1", "codex_local", {
+      environmentId: null, provider: undefined, poolId: undefined, acpxAgent: undefined,
+    });
+    expect(document.body.textContent).toContain("GPT-6 Sol");
   });
 });

@@ -293,6 +293,7 @@ export const agentsApi = {
     id: string,
     failedRunId: string,
     companyId: string,
+    options: { avoidKeySlot?: number | null } = {},
   ) => {
     const result = await api.post<
       AgentWakeupResponse | ChatFailedRunRetryResponse
@@ -301,6 +302,10 @@ export const agentsApi = {
       triggerDetail: "manual",
       reason: "retry_failed_run",
       failedRunId,
+      // Ticket 06: a pooled-key "try again" avoids the failed slot once
+      // (server-side matrix change, one wakeup). Undefined keeps the exact
+      // generic payload; null is the explicit switch-key retry.
+      ...(options.avoidKeySlot ? { keyPoolAvoidSlot: options.avoidKeySlot } : {}),
     });
     if ("id" in result) {
       // Exact retries are idempotent: a repeated click can return a successor

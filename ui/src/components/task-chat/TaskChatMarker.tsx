@@ -22,10 +22,14 @@ export function TaskChatMarker({
   item,
   onTryAgain,
   tryAgainPending = false,
+  keyPoolActions,
 }: {
   item: TaskChatMarkerItem;
   onTryAgain?: () => Promise<void> | void;
   tryAgainPending?: boolean;
+  /** Ticket 06: the dedicated pooled-key recovery actions, built by the host
+   * from `item.keyPool` and mounted beneath the marker row. */
+  keyPoolActions?: React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
   const detailsId = useId();
@@ -59,6 +63,23 @@ export function TaskChatMarker({
             {item.runHref && <Button asChild variant="ghost" size="sm"><Link to={item.runHref}>View run</Link></Button>}
           </div>
         </div>
+      </div>
+    );
+  }
+
+  if (keyPoolActions) {
+    return (
+      <div
+        className="tc-enter-marker flex flex-col items-start gap-1 py-1 text-xs text-muted-foreground"
+        data-testid="task-chat-key-pool-marker"
+      >
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+          <OctagonX className="h-3.5 w-3.5 shrink-0 text-destructive" aria-hidden />
+          <span className="font-medium text-destructive">{item.label}</span>
+          {item.detail ? <span className="min-w-0 text-muted-foreground">· {item.detail}</span> : null}
+          {relative ? <span className="shrink-0">{relative}</span> : null}
+        </div>
+        {keyPoolActions}
       </div>
     );
   }

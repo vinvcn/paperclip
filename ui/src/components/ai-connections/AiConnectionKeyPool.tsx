@@ -3,21 +3,9 @@ import { useState } from "react";
 import type { AiConnectionKeySlot, AiConnectionKeySlotCreate, AiConnectionKeySlotUpdate } from "@paperclipai/shared";
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { describeError } from "@/api/errors";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-
-const STATE_LABELS: Record<AiConnectionKeySlot["state"], string> = {
-  healthy: "Healthy",
-  rpm_cooldown: "RPM cooldown",
-  daily_cooldown: "Daily cooldown",
-};
-
-function stateBadgeVariant(slot: AiConnectionKeySlot): "secondary" | "destructive" | "outline" {
-  if (!slot.enabled) return "outline";
-  if (slot.state === "healthy") return "secondary";
-  return "destructive";
-}
+import { KeyPoolSlotSummary } from "./KeyPoolSlotList";
 
 /** The key slots of one AI connection. Key values are write-only here: the API
  * never returns them and this block never displays them. */
@@ -118,20 +106,7 @@ export function AiConnectionKeyPool({
               className="flex flex-wrap items-center gap-2 rounded-lg border border-border p-3"
               data-slot-row={slot.slot}
             >
-              <span className="text-sm font-medium">Slot {slot.slot}</span>
-              {slot.label && <span className="text-sm text-muted-foreground">{slot.label}</span>}
-              <Badge variant={stateBadgeVariant(slot)}>
-                {STATE_LABELS[slot.state]}
-                {!slot.enabled ? " · Disabled" : ""}
-              </Badge>
-              {slot.state !== "healthy" && slot.cooldownUntil && (
-                <span className="text-xs text-muted-foreground">
-                  Until {new Date(slot.cooldownUntil).toLocaleString()}
-                </span>
-              )}
-              {slot.activeRunId && (
-                <span className="text-xs text-muted-foreground">In use by a run</span>
-              )}
+              <KeyPoolSlotSummary slot={slot} />
               <span className="grow" />
               {editing === slot.slot ? (
                 <div className="flex w-full flex-wrap items-center gap-2">

@@ -24,6 +24,8 @@ import { WorkspaceExportRecovery } from "../components/WorkspaceExportRecovery";
 import { DispositionRecoveryProvider } from "../components/DispositionRecoveryNotice";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import { mergeComposerRunSettings, type ComposerRunSettings } from "@/components/task-chat/composer-run-settings";
+import { useKeyPoolFailureRecovery } from "@/components/task-chat/use-key-pool-failure-recovery";
+import type { TaskChatMarkerItem } from "@/components/task-chat/task-chat-model";
 import { AgentIdentity } from "@/components/AgentIdentity";
 import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
 import { agentChatDraft } from "@/lib/agent-chat-draft";
@@ -1678,44 +1680,23 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   useEffect(() => {
     recordIssueDetailReadiness({ activity: !activityPending, "linked-runs": !linkedRunsPending, runtime: runtimeSelectionKnown });
   }, [issueId, issueQueryRef, activityPending, linkedRunsPending, runtimeSelectionKnown]);
-  const retryFailedRun = useMutation({
-    mutationFn: async (runId: string) => {
+  // Ticket 06: the pooled-key recovery actions beneath a key-pool failure
+  // marker share the banner's machinery (useKeyPoolFailureRecovery). Markers
+  // resolve their failed run through the linked runs.
+  const keyPoolRecovery = useKeyPoolFailureRecovery({
+    companyId,
+    issueId,
+    runsQueryRef: issueQueryRef,
+    assigneeAdapterOverrides,
+    resolveFailedRun: useCallback((runId: string) => {
       const failedRun = resolvedLinkedRuns.find((run) => run.runId === runId);
-      if (!failedRun) throw new Error("Failed run is no longer available.");
-      return agentsApi.retryFailedRun(
-        failedRun.agentId,
-        failedRun.runId,
-        companyId,
-      );
-    },
-    onSuccess: (result) => {
-      if (!result.runId) {
-        pushToast({
-          title: "Retry queued",
-          body: "The exact request will retry when this task is ready.",
-          tone: "success",
-        });
-      }
-    },
-    onSettled: () => {
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.issues.runs(issueQueryRef),
-      });
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.issues.liveRuns(issueQueryRef),
-      });
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.issues.activeRun(issueQueryRef),
-      });
-    },
-    onError: (error) => {
-      pushToast({
-        title: "Run retry failed",
-        body: error instanceof Error ? error.message : "Unable to retry run",
-        tone: "error",
-      });
-    },
+      return failedRun ? { agentId: failedRun.agentId, agent: agentMap.get(failedRun.agentId) } : undefined;
+    }, [agentMap, resolvedLinkedRuns]),
   });
+  const { retryFailedRun, renderActions: renderResolvedKeyPoolActions } = keyPoolRecovery;
+  const renderKeyPoolActions = useCallback((item: TaskChatMarkerItem) =>
+    renderResolvedKeyPoolActions({ snapshot: item.keyPool, runId: item.runId }),
+  [renderResolvedKeyPoolActions]);
 
   const interruptibleIssueRun = useMemo(
     () => resolveInterruptibleIssueRun(resolvedActiveRun, resolvedLiveRuns),
@@ -2685,11 +2666,12 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             feedbackTermsUrl={feedbackTermsUrl}
             linkedRuns={timelineRuns}
             onRetryFailedRun={(runId) =>
-              retryFailedRun.mutateAsync(runId).then(() => undefined)
+              retryFailedRun.mutateAsync({ runId }).then(() => undefined)
             }
             retryFailedRunId={
-              retryFailedRun.isPending ? retryFailedRun.variables : null
+              retryFailedRun.isPending ? retryFailedRun.variables.runId : null
             }
+            renderKeyPoolActions={renderKeyPoolActions}
             timelineEvents={timelineEvents}
             workModeChanges={workModeChanges}
             liveRuns={resolvedLiveRuns}
@@ -3200,6 +3182,28 @@ function IssueDetailActivityTab({
 }
 
 export function IssueDetail({ tasksTab }: { tasksTab?: TaskSidePanelProps["tasksTab"] }) { return <TaskDetailSurface tasksTab={tasksTab} />; }
+
+/** Ticket 06: the interruption banner's pooled-key recovery actions — the
+ * same row the thread's failure marker mounts, driven by the banner's own
+ * inputs. The failed run is the interruption's observed run; under the
+ * single-assignee model its agent is the assignee, and the wake route
+ * revalidates that pairing server-side. */
+function KeyPoolBannerActions({ issue, runsQueryRef, agentMap }: {
+  issue: Issue;
+  runsQueryRef: string;
+  agentMap: Map<string, Agent>;
+}) {
+  const { renderActions } = useKeyPoolFailureRecovery({
+    companyId: issue.companyId,
+    issueId: issue.id,
+    runsQueryRef,
+    assigneeAdapterOverrides: issue.assigneeAdapterOverrides,
+    resolveFailedRun: (runId) => issue.assigneeAgentId
+      ? { agentId: issue.assigneeAgentId, agent: agentMap.get(issue.assigneeAgentId) }
+      : undefined,
+  });
+  return <>{renderActions({ snapshot: issue.interruption?.keyPool, runId: issue.interruption?.observedRunId })}</>;
+}
 
 /** One controller and surface for both task URLs and agent conversations. */
 export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskSidePanelProps["tasksTab"]; conversation?: {
@@ -8119,7 +8123,10 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
             <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption}
               issueId={issue.id} agentName={agentMap.get(issue.assigneeAgentId ?? "")?.name} projectName={issue.project?.name}
               canRetry={canResolveBoardRecoveryAction} onRetry={taskRetry.retry}
-              optimistic={taskRetry.optimistic} takingLonger={taskRetry.takingLonger} error={taskRetry.error} />
+              optimistic={taskRetry.optimistic} takingLonger={taskRetry.takingLonger} error={taskRetry.error}
+              keyPoolActions={issue.interruption?.userAction === "rate_limited"
+                ? <KeyPoolBannerActions issue={issue} runsQueryRef={issueId ?? issue.id} agentMap={agentMap} />
+                : undefined} />
           )}
 
           {issue.status === "in_review" && issue.externalConversationState === "waiting" && (

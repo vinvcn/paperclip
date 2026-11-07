@@ -1,13 +1,17 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type Ref } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, Check, ChevronDown, Plus, RotateCcw, Search, X, Zap } from "lucide-react";
-import { aiRuntimeConnectionBindingSchema, agentHarnessType, type Agent, type IssueAssigneeAdapterOverrides } from "@paperclipai/shared";
+import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, agentHarnessType, type Agent, type IssueAssigneeAdapterOverrides } from "@paperclipai/shared";
 import { agentsApi, type AdapterModel } from "@/api/agents";
+import { aiConnectionsApi } from "@/api/ai-connections";
 import { queryKeys } from "@/lib/queryKeys";
 import { ACCOUNT_BOUND_MODEL_DISCOVERY_QUERY_OPTIONS, nativeTaskModelCatalogOptions } from "@/lib/native-model-catalog";
 import { cn } from "@/lib/utils";
 import { useMobileEntityPickerViewportStyle } from "@/hooks/useMobileEntityPickerViewportStyle";
 import { getLastComposerEffort, rememberComposerEffort } from "@/lib/recent-composer-effort";
+import { Badge } from "@/components/ui/badge";
+import { KEY_SLOT_STATE_LABELS, keySlotBadgeVariant } from "@/components/ai-connections/KeyPoolSlotList";
+import { useConnectionModelsState } from "@/components/ai-connections/useConnectionModels";
 import type { InlineEntityOption } from "@/components/InlineEntitySelector";
 import { Dialog, DialogClose, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -90,7 +94,7 @@ export function ComposerRunSettingsPicker({
   initialOpen = false, initialView = "settings", initialModelSearch = "", initialAssigneeSearch = "",
 }: Props) {
   const [open, setOpen] = useState(initialOpen);
-  const [requestedView, setView] = useState<"settings" | "agents" | "models">(initialView);
+  const [requestedView, setView] = useState<"settings" | "agents" | "models" | "keys">(initialView);
   const [modelSearch, setModelSearch] = useState(initialModelSearch);
   const [assigneeSearch, setAssigneeSearch] = useState(initialAssigneeSearch);
   const [highlightedAssignee, setHighlightedAssignee] = useState(0);
@@ -107,7 +111,22 @@ export function ComposerRunSettingsPicker({
   const agentId = assigneeValue.startsWith("agent:") ? assigneeValue.slice(6) : "";
   const agent = agents.get(agentId);
   const modelSupported = supportsComposerModel(agent);
+  // Ticket 06: the task-level key-slot pin targets the agent's pooled
+  // connection. Only a shared/delegated connection carries a credential pool;
+  // responsible-user and router bindings rotate accounts elsewhere.
+  const keyBinding = aiConnectionBindingSchema.safeParse(agent?.runtimeConfig?.aiConnection).data;
+  const keyConnectionId = keyBinding && keyBinding.mode !== "responsible_user"
+    ? keyBinding.connectionId
+    : null;
+  const keySlots = useQuery({
+    queryKey: ["ai-connection-key-slots", keyConnectionId],
+    queryFn: ({ signal }) => aiConnectionsApi.keySlots(companyId, keyConnectionId!, { signal }),
+    enabled: Boolean(open && keyConnectionId),
+  });
+  const poolSlots = keyConnectionId ? keySlots.data?.slots ?? [] : [];
+  const keySlotAvailable = poolSlots.length > 0;
   const view = (requestedView === "models" && !modelSupported) || (requestedView === "agents" && !allowAssigneeChange)
+    || (requestedView === "keys" && !keySlotAvailable)
     ? "settings"
     : requestedView;
   const provider = composerCatalogProvider(agent);
@@ -119,6 +138,16 @@ export function ComposerRunSettingsPicker({
   const poolId = binding?.mode === "router" ? binding.connectionId : undefined;
   const nativeCatalog = nativeTaskModelCatalogOptions(agent);
   const acpxAgent = agent?.adapterType === "paperclip_runner" && provider === "acpx" && typeof agent.adapterConfig.acpxAgent === "string" ? agent.adapterConfig.acpxAgent : undefined;
+  // Ticket 06: an agent bound to a routed connection lists that connection's
+  // catalog — the single model source — instead of the host's `opencode
+  // models` discovery. OpenRouter keeps discovering through the same public
+  // catalog; connections without routing (or unbound agents) keep discovery.
+  // While the binding's routing is still unknown, discovery holds off so a
+  // routed connection never flashes the host list first.
+  const routedState = useConnectionModelsState(companyId, keyBinding, agent ? agentHarnessType(agent.adapterType, agent.adapterConfig) : "");
+  const routedCatalog = routedState.connectionModels;
+  const routedPending = Boolean(keyBinding) && routedState.loading;
+  const routedModels = routedCatalog?.models.length ? routedCatalog.models : undefined;
   const nativeCatalogScope = JSON.stringify(nativeCatalog ?? null);
   const requestNativeModels = Boolean(nativeCatalog && open && view !== "agents" && !modelOptionsOverride);
   const { data: fetchedModels = [], isPending: modelsPending, refetch: refreshModels } = useQuery({
@@ -129,7 +158,7 @@ export function ComposerRunSettingsPicker({
       environmentId: agent!.defaultEnvironmentId ?? null, provider, poolId, acpxAgent, ...nativeCatalog,
     }),
     ...(nativeCatalog ? ACCOUNT_BOUND_MODEL_DISCOVERY_QUERY_OPTIONS : {}),
-    enabled: Boolean(agent && modelSupported && !modelOptionsOverride && (!nativeCatalog || requestNativeModels)),
+    enabled: Boolean(agent && modelSupported && !modelOptionsOverride && !routedPending && !routedCatalog && (!nativeCatalog || requestNativeModels)),
   });
   useEffect(() => {
     if (requestNativeModels) void refreshModels();
@@ -137,12 +166,16 @@ export function ComposerRunSettingsPicker({
   // The server resolves instance-declared models first and otherwise returns the
   // adapter's curated catalog. Do not replace a declared Codex list locally.
   const models: readonly (AdapterModel & { detail?: string })[] = modelOptionsOverride
+    ?? routedModels
     ?? fetchedModels;
-  const catalogPending = modelsPending && !modelOptionsOverride;
+  const catalogPending = modelsPending && !modelOptionsOverride && !routedCatalog;
   const base = assigneeValue === currentAssigneeValue
     ? readComposerRunSettings(overrides, agent?.adapterType)
     : DEFAULT_COMPOSER_RUN_SETTINGS;
   const selected = settings ?? base;
+  const pinnedSlot = selected.keySlot != null
+    ? poolSlots.find((slot) => slot.slot === selected.keySlot) ?? null
+    : null;
   const configuredModel = composerDefaultModel(agent);
   const model = selected.model ?? configuredModel;
   const modelName = models.find((item) => item.id === model)?.label ?? model ?? "";
@@ -160,7 +193,7 @@ export function ComposerRunSettingsPicker({
       onSettingsChange({ ...base, effort: remembered });
     }
   }, [companyId, agentId, model, modelSupported, settings, base.model, base.effort, base.fast, effortChoicesKey, onSettingsChange]);
-  const changed = Boolean(selected.model || selected.effort || selected.fast);
+  const changed = Boolean(selected.model || selected.effort || selected.fast || selected.keySlot != null);
   const assigneeOptions = [{ id: "", label: "No assignee", searchText: "Unassigned" }, ...options.filter((item) => item.id !== "")];
   const filteredAgents = assigneeOptions.filter((item) => {
     const optionAgent = agents.get(item.id.startsWith("agent:") ? item.id.slice(6) : "");
@@ -197,9 +230,16 @@ export function ComposerRunSettingsPicker({
   const chooseModel = (value: string | null) => {
     const nextChoices = composerEfforts(agent, value ?? configuredModel, models.map((item) => item.id));
     const preferred = selected.effort ?? getLastComposerEffort(companyId);
-    onSettingsChange({ model: value, effort: preferred && nextChoices.includes(preferred) ? preferred : null, fast: false });
+    onSettingsChange({ model: value, effort: preferred && nextChoices.includes(preferred) ? preferred : null, fast: false, keySlot: selected.keySlot ?? null });
     setView("settings");
     setModelSearch("");
+  };
+  // Ticket 06: pin the task to one pooled key slot (null = the pool assigns).
+  // The pin is applied unconditionally by the assignment matrix, cooldowns
+  // included — the keys view warns before a cooling slot is pinned.
+  const chooseKeySlot = (value: number | null) => {
+    onSettingsChange({ ...selected, keySlot: value });
+    setView("settings");
   };
   const reset = () => {
     rememberComposerEffort(companyId, null);
@@ -257,6 +297,27 @@ export function ComposerRunSettingsPicker({
           className="composer-run-effort-range mt-3 w-full" style={{ "--fill": `${effortIndex / choices.length * 100}%` } as CSSProperties} />
       </div> : null}
     </> : agent ? <div className="mt-3 rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground" data-testid="model-unavailable">{unavailableModelReason(agent)}</div> : null}
+    {keySlotAvailable ? <button type="button" aria-label="Choose key slot" data-testid="composer-key-slot" onClick={() => setView("keys")} className="mt-3 flex w-full items-center gap-2 rounded-md px-1 py-1 text-left hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+      <span className="min-w-0 flex-1"><span className="block text-xs text-muted-foreground">Key slot</span><span className="block truncate text-sm font-medium">{pinnedSlot ? `Slot ${pinnedSlot.slot}` : "Auto (recommended)"}</span></span>
+      {pinnedSlot && pinnedSlot.state !== "healthy" ? <Badge variant="destructive">{KEY_SLOT_STATE_LABELS[pinnedSlot.state]}</Badge> : null}
+      <ChevronDown className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+    </button> : null}
+  </div> : view === "keys" ? <div className="composer-run-settings-list-view p-2" data-testid="composer-key-slot-view">
+    <div className="flex items-center gap-2 px-1 py-1.5"><button type="button" aria-label="Back to selection" onClick={() => setView("settings")} className="grid size-7 place-items-center rounded-md hover:bg-accent"><ArrowLeft className="size-4" /></button><span className="min-w-0 flex-1"><span className="block text-xs font-semibold">Choose key slot</span><span className="block truncate text-xs text-muted-foreground">{harnessLabel(agent)}</span></span>{closeButton}</div>
+    <div className="mt-2 min-h-0 max-h-60 overflow-y-auto overscroll-contain touch-pan-y" role="listbox" aria-label="Key slots">
+      <button type="button" role="option" aria-selected={selected.keySlot == null} data-testid="composer-key-slot-auto" onClick={() => chooseKeySlot(null)} className="flex w-full items-center gap-3 rounded-md px-2.5 py-2 text-left hover:bg-accent focus-visible:bg-accent focus-visible:outline-none">
+        <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">Auto (recommended)</span><span className="block truncate text-xs text-muted-foreground">The pool assigns a healthy key to each run</span></span>
+        {selected.keySlot == null ? <Check className="composer-run-settings-accent size-4 shrink-0" /> : null}
+      </button>
+      {poolSlots.map((slot) => <button type="button" role="option" aria-selected={selected.keySlot === slot.slot} key={slot.slot} data-testid={`composer-key-slot-${slot.slot}`} onClick={() => chooseKeySlot(slot.slot)} className="flex w-full items-center gap-3 rounded-md px-2.5 py-2 text-left text-sm transition-colors hover:bg-accent focus-visible:bg-accent focus-visible:outline-none">
+        <span className="min-w-0 flex-1"><span className="block truncate font-medium">Slot {slot.slot}{slot.label ? ` · ${slot.label}` : ""}</span><span className="block truncate font-mono text-xs text-muted-foreground">{slot.activeRunId ? "In use by a run" : "Free"}</span></span>
+        <Badge variant={keySlotBadgeVariant(slot)}>{KEY_SLOT_STATE_LABELS[slot.state]}{!slot.enabled ? " · Disabled" : ""}</Badge>
+        {selected.keySlot === slot.slot ? <Check className="composer-run-settings-accent size-4 shrink-0" /> : null}
+      </button>)}
+    </div>
+    {pinnedSlot && pinnedSlot.state !== "healthy" ? <p role="note" data-testid="composer-key-slot-warning" className="px-2.5 pb-1 pt-2 text-xs text-destructive">
+      Slot {pinnedSlot.slot} is in {KEY_SLOT_STATE_LABELS[pinnedSlot.state]?.toLowerCase() ?? "cooldown"} — pinned tasks still use it while it recovers.
+    </p> : <p className="px-2.5 pb-1 pt-2 text-xs text-muted-foreground">A pinned slot is used unconditionally, cooldowns included. Auto keeps cache-friendly stickiness.</p>}
   </div> : view === "agents" ? <div className="composer-run-settings-list-view p-2">
     <div className="flex items-center gap-2 px-1 py-1.5"><span className="min-w-0 flex-1 text-xs font-semibold">Choose assignee</span>{closeButton}</div>
     <div className="relative mt-2"><Search className="pointer-events-none absolute left-2.5 top-2.5 size-4 text-muted-foreground" aria-hidden /><input autoFocus type="search" aria-label="Search assignees" placeholder="Search assignees…" value={assigneeSearch} onChange={(event) => { setAssigneeSearch(event.target.value); setHighlightedAssignee(0); }} onKeyDown={(event) => {
@@ -282,6 +343,6 @@ export function ComposerRunSettingsPicker({
 
   const onOpenChange = (next: boolean) => { setOpen(next); if (!next) { setView("settings"); setModelSearch(""); setAssigneeSearch(""); } };
   // The desktop portal needs its own scroll lock inside the new-task dialog.
-  return mobile ? <Dialog open={open} onOpenChange={onOpenChange}>{triggers}<DialogContent aria-describedby={undefined} showCloseButton={false} style={mobileViewportStyle} className="composer-mobile-dialog gap-0 overflow-hidden p-0" data-testid="composer-mobile-dialog"><DialogTitle className="sr-only">{view === "agents" ? "Select assignee" : modelSupported ? "Select model and effort" : "Agent run settings"}</DialogTitle><AnimatedBody>{body}</AnimatedBody></DialogContent></Dialog>
+  return mobile ? <Dialog open={open} onOpenChange={onOpenChange}>{triggers}<DialogContent aria-describedby={undefined} showCloseButton={false} style={mobileViewportStyle} className="composer-mobile-dialog gap-0 overflow-hidden p-0" data-testid="composer-mobile-dialog"><DialogTitle className="sr-only">{view === "agents" ? "Select assignee" : view === "keys" ? "Select key slot" : modelSupported ? "Select model and effort" : "Agent run settings"}</DialogTitle><AnimatedBody>{body}</AnimatedBody></DialogContent></Dialog>
     : <Popover modal open={open} onOpenChange={onOpenChange}><PopoverAnchor asChild>{triggers}</PopoverAnchor><PopoverContent side="top" align="end" sideOffset={8} className="w-80 max-w-full p-0 shadow-sm" data-testid="composer-model-popover"><AnimatedBody>{body}</AnimatedBody></PopoverContent></Popover>;
 }

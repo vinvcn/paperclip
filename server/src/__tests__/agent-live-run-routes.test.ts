@@ -1613,6 +1613,54 @@ describe("agent live run routes", () => {
         mockChatRunRetries.prepareFailedChatRunRetry,
       ).not.toHaveBeenCalled();
     });
+
+    it("carries the one-shot pooled-key avoid slot into the retry run's context", async () => {
+      const fixture = createFailedChatRetryDb(false);
+      mockHeartbeatService.getRun.mockResolvedValue({
+        ...selectedRun,
+        contextSnapshot: { ...selectedRun.contextSnapshot, source: "board" },
+      });
+      const res = await requestApp(
+        await createApp(fixture.db, undefined, {
+          chatRunRetries: mockChatRunRetries,
+        }),
+        (url) =>
+          request(url)
+            .post(`/api/agents/${routeAgentId}/wakeup`)
+            .send({ ...retryBody, keyPoolAvoidSlot: 3 }),
+      );
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledExactlyOnceWith(
+        routeAgentId,
+        expect.objectContaining({
+          reason: "retry_failed_run",
+          contextSnapshot: expect.objectContaining({ keyPoolAvoidSlot: 3 }),
+        }),
+      );
+    });
+
+    it.each([
+      ["without a failed-run retry", { keyPoolAvoidSlot: 3 }, 400],
+      ["with a non-integer slot", { ...retryBody, keyPoolAvoidSlot: 1.5 }, 400],
+      ["with a non-positive slot", { ...retryBody, keyPoolAvoidSlot: 0 }, 400],
+    ])("rejects an avoid slot %s", async (_name, body, status) => {
+      const fixture = createFailedChatRetryDb(false);
+      mockHeartbeatService.getRun.mockResolvedValue({
+        ...selectedRun,
+        contextSnapshot: { ...selectedRun.contextSnapshot, source: "board" },
+      });
+      const res = await requestApp(
+        await createApp(fixture.db, undefined, {
+          chatRunRetries: mockChatRunRetries,
+        }),
+        (url) =>
+          request(url)
+            .post(`/api/agents/${routeAgentId}/wakeup`)
+            .send(body),
+      );
+      expect(res.status).toBe(status);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
   });
 
   it("allows implicit local administrators to opt one manual run into raw provider tracing", async () => {
