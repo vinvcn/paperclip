@@ -88,6 +88,11 @@ const OPENCODE_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "OTEL_LOG_TOOL_CONTENT",
     "PAPERCLIP_AI_PROVIDER_KEY",
     "PAPERCLIP_AI_PROVIDER_URL",
+    // Key-pool slot provenance (ticket 04): the opencode provider bridge must
+    // pass the pooled slot and owning connection through to the capture sink,
+    // matching the node-side sanitizer and launcher allowlist.
+    "PAPERCLIP_AI_PROVIDER_KEY_SLOT",
+    "PAPERCLIP_AI_PROVIDER_CONNECTION_ID",
     "PAPERCLIP_AGENT_KEY_ID",
     "PAPERCLIP_AGENT_PUBLIC_KEY",
     "PAPERCLIP_AGENT_PRIVATE_KEY",
@@ -4980,6 +4985,14 @@ done
     #[test]
     fn does_not_forward_an_ambient_opencode_command_override() {
         assert!(!OPENCODE_PROVIDER_ENVIRONMENT_KEYS.contains(&"PAPERCLIP_OPENCODE_COMMAND"));
+    }
+
+    #[test]
+    fn key_pool_slot_provenance_crosses_the_opencode_provider_environment() {
+        // Ticket 04: the pooled slot and its owning connection must reach the
+        // runner-side usage capture the same way the gateway key and URL do.
+        assert!(OPENCODE_PROVIDER_ENVIRONMENT_KEYS.contains(&"PAPERCLIP_AI_PROVIDER_KEY_SLOT"));
+        assert!(OPENCODE_PROVIDER_ENVIRONMENT_KEYS.contains(&"PAPERCLIP_AI_PROVIDER_CONNECTION_ID"));
     }
 
     #[test]
