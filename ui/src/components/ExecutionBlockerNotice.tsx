@@ -43,9 +43,25 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
       </div>
     );
   }
+  const step = !optimistic && presentation?.responsibility === "system" && presentation.recoveryStep
+    && ["working", "retry_scheduled"].includes(presentation.state) ? recoveryStepText[presentation.recoveryStep] : null;
+  const seconds = Math.max(0, Math.ceil((Date.parse(presentation?.nextRetryAt ?? "") - Date.now()) / 1000));
+  const retryIn = `Trying again in ${seconds > 60 ? `${Math.ceil(seconds / 60)}m` : `${seconds}s`}…`;
+  if (!optimistic && !presentation?.retryWait && presentation?.providerFailure && ["failed", "retry_scheduled", "waiting_for_user"].includes(presentation.state)) {
+    // Saved-work recovery is what the task waits for, so name it over the
+    // generic automatic-retry line while keeping the provider explanation.
+    return <ProviderFailureNotice failure={presentation.providerFailure} className={className}
+      actions={canRetry && presentation.canRetry ? <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button> : undefined}>
+      {presentation.state === "retry_scheduled" && <p>{step ? `${step}. ${retryIn}` : "Paperclip will retry automatically."}</p>}
+    </ProviderFailureNotice>;
+  }
+  if (step && presentation?.state === "working") return <div role="status" aria-label="Task status"
+    className={cn("text-sm text-muted-foreground", className)}>{`${step}…`}</div>;
+  // A task that has not started yet names the admission hold it waits for.
+  if (!optimistic && presentation?.state === "working" && presentation.retryWait) return <div role="status"
+    aria-label="Task status" className={cn("text-sm text-muted-foreground", className)}>{presentation.retryWait.message}</div>;
   if (optimistic || !presentation || presentation.responsibility !== "system" ||
       !["failed", "retry_scheduled"].includes(presentation.state)) return null;
-  const seconds = Math.max(0, Math.ceil((Date.parse(presentation.nextRetryAt ?? "") - Date.now()) / 1000));
   return (
     <div className={cn(presentation.state === "failed" && "pt-4", className)}>
       <div role="status" aria-label="Task status" className={cn(
@@ -54,8 +70,11 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
       )}>
         {presentation.state === "failed" && <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />}
         <span className="min-w-0 flex-1">{presentation.state === "retry_scheduled"
-          ? `Trying again in ${seconds > 60 ? `${Math.ceil(seconds / 60)}m` : `${seconds}s`}…`
-          : "Couldn’t finish this attempt. Your message is saved."}</span>
+          ? step ? `${step}. ${retryIn}` : retryIn
+          : presentation.retryWait ? presentation.retryWait.message
+          : presentation.workspaceFailure
+            ? <>Couldn’t prepare the task folders. {presentation.workspaceFailure.message}</>
+            : "Couldn’t finish this attempt. Your message is saved."}</span>
         {canRetry && presentation.canRetry && <Button variant="outline" size="sm" className="shrink-0" onClick={onRetry}>Retry</Button>}
       </div>
     </div>

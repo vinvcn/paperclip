@@ -194,6 +194,7 @@ export interface AiManagedConnectionSummary {
   ownerUserId?: string;
   ownerName?: string;
   isDefault: boolean;
+  canSetDefault?: boolean;
   status: "connected" | "needs_attention" | "expired" | "revoked";
   unavailableReason?: string;
   usageProbeSupported?: boolean;

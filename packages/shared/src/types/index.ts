@@ -820,6 +820,7 @@ export type {
   IssueDocument,
   IssueDocumentSummary,
   DocumentRevision,
+  ExactDocumentRevision,
   DocumentFormat,
   LegacyPlanDocument,
   IssueAncestor,
@@ -827,6 +828,8 @@ export type {
   IssueAncestorGoal,
   IssueAttachment,
   IssueCreationSource,
+  IssueParentAdjustment,
+  IssueParentAdjustmentReason,
   IssueLabel,
   IssueWatchdog,
   IssueWatchdogStatus,
@@ -1135,3 +1138,4 @@ export * from "./skill-source.js";
 export * from "./agent-lifecycle.js";
 
 export * from "./task-workspace.js";
+export type { BoardBootstrap, BoardBootstrapSession } from "./board-bootstrap.js";
