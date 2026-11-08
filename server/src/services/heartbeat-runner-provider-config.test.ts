@@ -168,6 +168,18 @@ describe("Paperclip Runner native provider configuration", () => {
       .toMatchObject({ model: "grok-4.7", grokEffort: "high", grokDisableWebSearch: true });
   });
 
+  it("projects only a custom OpenCode task effort into durable provider input", () => {
+    const base = { provider: "opencode", model: "paperclip/team/model", modelReasoningEffort: "high", opencodePermissionMode: "deny" };
+    const projected = projectPaperclipRunnerTaskConfig("opencode_server", base, { modelReasoningEffort: "max" });
+    expect(projected).toEqual({ ...base, modelReasoningEffort: "max" });
+    expect(resolvePaperclipRunnerNativeProviderInput({ backend: "opencode_server", adapterConfig: projected }))
+      .toEqual({ provider: "opencode", model: "paperclip/team/model", opencodePermissionMode: "deny", opencodeReasoningEffort: "max" });
+    const changedModel = projectPaperclipRunnerTaskConfig("opencode_server", { ...base, model: "paperclip/team/model" }, { model: "other" }, "paperclip/other-model");
+    expect(resolvePaperclipRunnerNativeProviderInput({ backend: "opencode_server", adapterConfig: changedModel }))
+      .toMatchObject({ model: "paperclip/other-model" });
+    expect(resolvePaperclipRunnerNativeProviderInput({ backend: "opencode_server", adapterConfig: changedModel })).not.toHaveProperty("opencodeReasoningEffort");
+  });
+
   it("uses an OpenCode task model without changing the Runner provider", () => {
     const projected = projectPaperclipRunnerTaskConfig(
       "opencode_server",

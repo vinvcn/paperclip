@@ -209,6 +209,27 @@ describe("composer assignee picker", () => {
     await click("Reset to agent default");
     expect(getLastComposerEffort("company-1")).toBeNull();
   });
+  it("keeps model details hidden until requested and shows a task-only effort override", async () => {
+    const onSettingsChange = vi.fn();
+    render(vi.fn(), onSettingsChange, false, {
+      modelOptionsOverride: [{ id: "gpt-6-sol", label: "NIM model", connectionName: "NIM Custom gateway", limit: { context: 262144, output: 65536 }, options: { reasoningEffort: "max" } }],
+    });
+    expect(document.querySelector('[data-testid="composer-model-detail-view"]')).toBeNull();
+    expect(container!.textContent).not.toContain("262,144");
+    await click("Select model and effort");
+    expect(document.querySelector('[data-testid="composer-model-detail-view"]')).toBeNull();
+    await click("Model details");
+    const detail = document.querySelector('[data-testid="composer-model-detail-view"]')!;
+    expect(detail.textContent).toContain("NIM Custom gateway");
+    expect(detail.textContent).toContain("262,144");
+    expect(detail.textContent).toContain("65,536");
+    expect(detail.textContent).toContain("Max");
+    expect(detail.textContent).toContain("High (override)");
+    await click("Back to selection");
+    expect(document.querySelector('[data-testid="composer-model-detail-view"]')).toBeNull();
+    expect(document.querySelector('input[aria-label="Effort"]')).not.toBeNull();
+  });
+
   it("lets the assignee and model use the available composer width", () => {
     render(vi.fn(), vi.fn());
     const trigger = container!.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-assignee"]');

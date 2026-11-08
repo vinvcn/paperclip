@@ -10,6 +10,9 @@ describe("per-turn OpenCode reasoning", () => {
   it.each([undefined, "default"])("preserves provider defaults for %s", (value) => {
     expect(parseOpenCodeReasoningMode(value)).toBe("default");
   });
+  it.each(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"])("accepts custom-gateway effort %s", (value) => {
+    expect(parseOpenCodeReasoningMode(value)).toBe(value);
+  });
   it.each(["", "false", null, false, 0])("rejects malformed mode %s", (value) => {
     expect(() => parseOpenCodeReasoningMode(value)).toThrow("turn.reasoningMode");
   });
@@ -56,6 +59,42 @@ describe("per-turn OpenCode reasoning", () => {
         variants: { "paperclip-default": {}, "paperclip-no-reasoning": { reasoning: { enabled: false } } },
       });
       expect(config.provider.openrouter.models["deepseek/deepseek-v4-flash-0731"].options).toBeUndefined();
+    } finally {
+      try { await session?.close(); }
+      finally { await rm(root, { recursive: true, force: true }); }
+    }
+  });
+
+  it("selects a custom-gateway effort for a paperclip turn without changing the default turn", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-turn-effort-"));
+    const fixture = join(root, "fake-opencode-server.mjs");
+    const submitted: Array<{ variant?: string }> = [];
+    const instructions = "Unique shared custom gateway instructions.";
+    const driver = new OpenCodeServerDriver({
+      model: "paperclip/team/model",
+      runtimeDirectory: root,
+      command: fixture,
+      systemInstructions: instructions,
+      taskEnvelope: openCodeProxyTaskEnvelope({ baseInstructions: instructions,
+        completionContract: { revision: "17", criterionIds: ["objective"] } }),
+      environment: { PATH: process.env.PATH, PAPERCLIP_AI_PROVIDER_URL: "https://gateway.example/v1", PAPERCLIP_AI_PROVIDER_KEY: "fixture-key" },
+      fetch: async (input, init) => {
+        if (String(input).endsWith("/prompt_async")) submitted.push(JSON.parse(String(init?.body)));
+        return fetch(input, init);
+      },
+    });
+    let session: Awaited<ReturnType<OpenCodeServerDriver["openSession"]>> | undefined;
+    try {
+      await copyFile(resolve("test/fixtures/fake-opencode-server.mjs"), fixture);
+      await chmod(fixture, 0o755);
+      session = await driver.openSession({ runId: "turn-effort", normalizedSessionId: "effort", workingDirectory: root });
+      await session.startTurn({ message: { role: "user", text: "Reply Hi." } });
+      for await (const event of session.events()) if (event.eventType === "turn.completed") break;
+      await session.startTurn({ message: { role: "user", text: "Reply Hi again." }, reasoningMode: "max" });
+      for await (const event of session.events()) if (event.eventType === "turn.completed") break;
+      expect(submitted.map(body => body.variant)).toEqual([undefined, "max"]);
+      const config = JSON.parse(await readFile(join(root, "effort/config/opencode/opencode.json"), "utf8"));
+      expect(config.provider.paperclip.models["team/model"].variants.max).toEqual({ reasoningEffort: "max" });
     } finally {
       try { await session?.close(); }
       finally { await rm(root, { recursive: true, force: true }); }

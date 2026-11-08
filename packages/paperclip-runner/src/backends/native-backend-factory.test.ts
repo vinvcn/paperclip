@@ -812,6 +812,42 @@ describe("native backend factory", () => {
     }
   });
 
+  it("keeps the durable OpenCode effort on the transport channel instead of the Codex driver session", async () => {
+    const input = preparedExecution({
+      ...opencodeExecution(),
+      provider: { kind: "opencode", model: "paperclip/team/model", permissionMode: "allow", reasoningEffort: "high" },
+    }, "v9");
+    if (input.schema !== "paperclip.native-execution-input.v9" || input.provider.kind !== "opencode" || input.provider.reasoningEffort !== "high") throw new Error("invalid fixture");
+    const transport = new FakeCodexTransport("thread-1", "provider-session-1", {
+      kind: "opencode", normalizedSessionId: "session", backendSessionId: "fixture-backend",
+      requestedModel: input.provider.model, effectiveModel: input.provider.model, permissionMode: "allow",
+    });
+    const backend = createRunnerdNativeSessionBackend(input, {
+      transportFactory: () => transport,
+      environment: { PAPERCLIP_WORKSPACE_CWD: WORKSPACE },
+    });
+    const session = await backend.openSession({
+      identity: { companyId: "company", agentId: "agent", runId: "run", sessionId: "session" },
+      workingDirectory: WORKSPACE,
+    });
+    try {
+      transport.turnStartResponse = Promise.resolve({ turn: { id: "turn-1", status: "inProgress", items: [] } });
+      const turn = await session.startTurn({ message: { role: "user", text: JSON.stringify(buildNativeModelEnvelope(input)) } });
+      transport.push("turn/completed", { threadId: "thread-1", turn: { id: turn.turnId, status: "completed", items: [] } });
+      for await (const event of session.events()) {
+        if (["turn.completed", "turn.failed", "turn.cancelled"].includes(event.eventType)) break;
+      }
+      const start = transport.calls.find((call) => call.method === "turn/start")?.params;
+      // The durable custom-gateway effort rides the runnerd transport options
+      // (opencodeReasoningEffort), never the Codex driver session: the
+      // transport rejects a per-turn reasoningMode that duplicates it.
+      expect(start?.effort).toBeUndefined();
+      expect(start?.reasoningMode).toBeUndefined();
+    } finally {
+      await session.close({ reason: "test-completed" });
+    }
+  });
+
   it.each(["v5", "v7", "v9"] as const)("projects %s OpenCode constraints to the prepared runtime boundary", version => {
     const input = preparedExecution(opencodeExecution(), version);
     const backend = createOpenCodeNativeSessionBackend(input, {

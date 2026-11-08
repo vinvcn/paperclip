@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type Ref } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, Check, ChevronDown, Plus, RotateCcw, Search, X, Zap } from "lucide-react";
+import { ArrowLeft, Check, ChevronDown, Info, Plus, RotateCcw, Search, X, Zap } from "lucide-react";
 import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, agentHarnessType, type Agent, type IssueAssigneeAdapterOverrides } from "@paperclipai/shared";
 import { agentsApi, type AdapterModel } from "@/api/agents";
 import { aiConnectionsApi } from "@/api/ai-connections";
@@ -42,7 +42,7 @@ interface Props {
   renderAssigneeIdentity?: (value: string, label: string, placement: "trigger" | "option") => ReactNode;
   /** Initial presentation state for embedded examples; ordinary composers start closed. */
   initialOpen?: boolean;
-  initialView?: "settings" | "agents" | "models";
+  initialView?: "settings" | "agents" | "models" | "keys" | "model-detail";
   initialModelSearch?: string;
   initialAssigneeSearch?: string;
 }
@@ -94,7 +94,7 @@ export function ComposerRunSettingsPicker({
   initialOpen = false, initialView = "settings", initialModelSearch = "", initialAssigneeSearch = "",
 }: Props) {
   const [open, setOpen] = useState(initialOpen);
-  const [requestedView, setView] = useState<"settings" | "agents" | "models" | "keys">(initialView);
+  const [requestedView, setView] = useState<"settings" | "agents" | "models" | "keys" | "model-detail">(initialView);
   const [modelSearch, setModelSearch] = useState(initialModelSearch);
   const [assigneeSearch, setAssigneeSearch] = useState(initialAssigneeSearch);
   const [highlightedAssignee, setHighlightedAssignee] = useState(0);
@@ -179,6 +179,7 @@ export function ComposerRunSettingsPicker({
   const configuredModel = composerDefaultModel(agent);
   const model = selected.model ?? configuredModel;
   const modelName = models.find((item) => item.id === model)?.label ?? model ?? "";
+  const modelDetails = models.find((item) => item.id === model);
   const choices = composerEfforts(agent, model, models.map((item) => item.id));
   const effort = selected.effort && choices.includes(selected.effort) ? selected.effort : null;
   const effortIndex = effort ? choices.indexOf(effort) + 1 : 0;
@@ -279,9 +280,12 @@ export function ComposerRunSettingsPicker({
       {closeButton}
     </div>
     {modelSupported ? <>
-      <button type="button" aria-label="Choose exact model" onClick={() => setView("models")} className="mt-3 flex w-full items-center gap-2 rounded-md px-1 py-1 text-left hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+      <div className="mt-3 flex items-center gap-1">
+      <button type="button" aria-label="Choose exact model" onClick={() => setView("models")} className="flex w-full items-center gap-2 rounded-md px-1 py-1 text-left hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
         <span className="min-w-0 flex-1"><span className="block text-xs text-muted-foreground">Model</span><span className="block truncate text-sm font-medium">{modelName || "Default"}</span></span><ChevronDown className="size-4 shrink-0 text-muted-foreground" aria-hidden />
       </button>
+      <button type="button" aria-label="Model details" onClick={() => setView("model-detail")} className="grid size-8 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-accent"><Info className="size-4" /></button>
+      </div>
       {choices.length ? <div className="mt-3">
         <div className="flex items-center gap-2">
           {fastAvailable ? <button type="button" aria-label="Fast mode" aria-pressed={selected.fast} title="Fast mode" onClick={() => onSettingsChange({ ...selected, fast: !selected.fast })} className={cn("grid size-8 shrink-0 place-items-center rounded-md hover:bg-accent", selected.fast ? "composer-run-settings-accent bg-accent" : "text-muted-foreground")}><Zap className="size-4" /></button> : <span className="size-8 shrink-0" aria-hidden />}
@@ -302,6 +306,17 @@ export function ComposerRunSettingsPicker({
       {pinnedSlot && pinnedSlot.state !== "healthy" ? <Badge variant="destructive">{KEY_SLOT_STATE_LABELS[pinnedSlot.state]}</Badge> : null}
       <ChevronDown className="size-4 shrink-0 text-muted-foreground" aria-hidden />
     </button> : null}
+  </div> : view === "model-detail" ? <div className="composer-run-settings-list-view p-3" data-testid="composer-model-detail-view">
+    <div className="flex items-center gap-2 py-1"><button type="button" aria-label="Back to selection" onClick={() => setView("settings")} className="grid size-7 place-items-center rounded-md hover:bg-accent"><ArrowLeft className="size-4" /></button><span className="min-w-0 flex-1 text-xs font-semibold">Model details</span>{closeButton}</div>
+    <div className="mt-2 min-w-0"><span className="block truncate text-sm font-medium">{modelName || "Agent default"}</span><span className="block break-all font-mono text-xs text-muted-foreground">{model || "Provider default"}</span></div>
+    <dl className="mt-3 grid grid-cols-2 gap-3 text-xs">
+      <dt className="text-muted-foreground">Connection</dt><dd className="min-w-0 break-words text-right">{modelDetails?.connectionName ?? "Not connection-managed"}</dd>
+      <dt className="text-muted-foreground">Context limit</dt><dd>{modelDetails?.limit?.context?.toLocaleString() ?? "Provider default"}</dd>
+      <dt className="text-muted-foreground">Output limit</dt><dd>{modelDetails?.limit?.output?.toLocaleString() ?? "Provider default"}</dd>
+      <dt className="text-muted-foreground">Connection effort</dt><dd>{modelDetails?.options?.reasoningEffort ? EFFORT_LABELS[modelDetails.options.reasoningEffort] : "Provider default"}</dd>
+      <dt className="text-muted-foreground">This task</dt><dd>{effort ? `${EFFORT_LABELS[effort] ?? effort} (override)` : "Connection default"}</dd>
+    </dl>
+    <p className="mt-3 text-xs text-muted-foreground">Task effort applies to the next run and does not change the Connection default.</p>
   </div> : view === "keys" ? <div className="composer-run-settings-list-view p-2" data-testid="composer-key-slot-view">
     <div className="flex items-center gap-2 px-1 py-1.5"><button type="button" aria-label="Back to selection" onClick={() => setView("settings")} className="grid size-7 place-items-center rounded-md hover:bg-accent"><ArrowLeft className="size-4" /></button><span className="min-w-0 flex-1"><span className="block text-xs font-semibold">Choose key slot</span><span className="block truncate text-xs text-muted-foreground">{harnessLabel(agent)}</span></span>{closeButton}</div>
     <div className="mt-2 min-h-0 max-h-60 overflow-y-auto overscroll-contain touch-pan-y" role="listbox" aria-label="Key slots">

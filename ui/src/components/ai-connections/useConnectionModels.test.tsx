@@ -60,19 +60,19 @@ it.each(["opencode_local", "pi_local", "codex_local", "claude_local", "hermes_lo
 
 it("also discovers models for legacy OpenRouter connections without routing metadata", async () => {
   await mount([{ ...account, routing: undefined }]);
-  await vi.waitFor(() => expect(result?.models).toEqual(catalog));
+  await vi.waitFor(() => expect(result?.models).toEqual(catalog.map(model => ({ ...model, connectionName: "Company OpenRouter" }))));
 });
 
 it("preserves an explicit connection model list instead of replacing it with the public catalog", async () => {
   await mount([{ ...account, routing: { ...account.routing!, models: [{ id: "company/model", label: "Approved model" }] } }]);
-  expect(result?.models).toEqual([{ id: "openrouter/company/model", label: "Approved model" }]);
+  expect(result?.models).toEqual([{ id: "openrouter/company/model", label: "Approved model", connectionName: "Company OpenRouter" }]);
   expect(agentsApi.adapterModels).not.toHaveBeenCalled();
 });
 
 it("does not reuse public OpenRouter models after switching to a custom gateway", async () => {
   const gateway: AiManagedConnectionSummary = { ...account, id: "gateway", grantId: "gateway-grant", provider: "openai", routing: { kind: "gateway", protocol: "chat", auth: "bearer", baseUrl: "https://example.com/v1", models: [] } };
   await mount([account, gateway]);
-  await vi.waitFor(() => expect(result?.models).toEqual(catalog));
+  await vi.waitFor(() => expect(result?.models).toEqual(catalog.map(model => ({ ...model, connectionName: "Company OpenRouter" }))));
   await render({ provider: "openai", method: "api_key", mode: "shared", connectionId: gateway.id, grantId: gateway.grantId });
   expect(result?.models).toEqual([]);
   expect(result?.resolveModel("private-model")).toBe("paperclip/private-model");
@@ -90,7 +90,7 @@ it("only uses the current person's default connection models", async () => {
     { ...account, ownership: "personal", ownerUserId: "someone-else", isDefault: true, routing: { ...account.routing!, models: [{ id: "other/private-model" }] } },
     { ...account, ownership: "personal", ownerUserId: "you", isDefault: true },
   ], "opencode_local", { provider: "openrouter", method: "api_key", mode: "responsible_user" });
-  await vi.waitFor(() => expect(result?.models).toEqual(catalog));
+  await vi.waitFor(() => expect(result?.models).toEqual(catalog.map(model => ({ ...model, connectionName: "Company OpenRouter" }))));
 });
 
 it("exposes loading and allows retry after a catalog failure", async () => {
@@ -103,6 +103,6 @@ it("exposes loading and allows retry after a catalog failure", async () => {
   expect(result?.isLoading).toBe(false);
   expect(result?.resolveModel("manual/model")).toBe("openrouter/manual/model");
   await act(async () => { await result?.refreshModels?.(); });
-  await vi.waitFor(() => expect(result?.models).toEqual(catalog));
+  await vi.waitFor(() => expect(result?.models).toEqual(catalog.map(model => ({ ...model, connectionName: "Company OpenRouter" }))));
   expect(result?.error).toBeNull();
 });

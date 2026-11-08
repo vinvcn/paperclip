@@ -171,7 +171,7 @@ export class CodexHarnessSession
     continuation?: true;
     requestedCollaborationMode?: "default" | "plan";
     /** OpenCode/OpenRouter only. Applies to this turn, never subsequent turns. */
-    reasoningMode?: "default" | "disabled";
+    reasoningMode?: "default" | "disabled" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   }): Promise<{
     turnId: string;
     effectiveCollaborationMode: "default" | "plan";
@@ -249,7 +249,9 @@ export class CodexHarnessSession
     try {
       response = await this.transport.request("turn/start", {
         threadId: this.opened.threadId,
-        ...(input.reasoningMode === undefined ? {} : { reasoningMode: input.reasoningMode }),
+        ...(this.reasoningEffort && this.supportsTurnReasoning()
+          ? { reasoningMode: this.reasoningEffort as "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" }
+          : this.reasoningEffort || input.reasoningMode === undefined ? {} : { reasoningMode: input.reasoningMode }),
         ...(this.reasoningEffort ? { effort: this.reasoningEffort } : {}),
         cwd: this.opened.context.workingDirectory,
         permissions:

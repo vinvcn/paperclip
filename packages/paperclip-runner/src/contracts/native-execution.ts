@@ -166,8 +166,9 @@ export type NativeProviderConfigV4 =
     };
 
 export type NativeProviderConfigV5 =
-  | Exclude<NativeProviderConfigV4, { kind: "codex" }>
-  | (Extract<NativeProviderConfigV4, { kind: "codex" }> & { reasoningEffort?: string; webSearch?: "disabled" });
+  | Exclude<NativeProviderConfigV4, { kind: "codex" | "opencode" }>
+  | (Extract<NativeProviderConfigV4, { kind: "codex" }> & { reasoningEffort?: string; webSearch?: "disabled" })
+  | (Extract<NativeProviderConfigV4, { kind: "opencode" }> & { reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" });
 
 export interface NativeExecutionInputV1 {
   schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V1;
@@ -588,7 +589,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       : provider.kind === "codex" && isV4
         ? ["kind", "model", "approvalPolicy", ...(isV5 ? ["reasoningEffort", "webSearch"] : [])]
         : provider.kind === "opencode" && isV4
-          ? ["kind", "model", "permissionMode"]
+          ? ["kind", "model", "permissionMode", ...(isV5 ? ["reasoningEffort"] : [])]
           : ["kind", "model"],
     "input.provider",
   );
@@ -785,11 +786,17 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     if (isV4 && provider.permissionMode !== "allow" && provider.permissionMode !== "ask" && provider.permissionMode !== "deny") {
       throw new NativeExecutionInputError("input.provider.permissionMode must be allow, ask, or deny");
     }
+    if (isV5 && provider.reasoningEffort !== undefined && !["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(String(provider.reasoningEffort))) {
+      throw new NativeExecutionInputError("input.provider.reasoningEffort is unsupported");
+    }
     parsedProvider = {
       kind: "opencode",
       model: providerModel!,
       ...(isV4
         ? { permissionMode: provider.permissionMode as NativeOpenCodePermissionMode }
+        : {}),
+      ...(isV5 && provider.reasoningEffort !== undefined
+        ? { reasoningEffort: text(provider.reasoningEffort, "input.provider.reasoningEffort") as "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" }
         : {}),
     };
   } else {

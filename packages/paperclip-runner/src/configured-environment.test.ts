@@ -80,6 +80,16 @@ describe('controller-configured environment across native runner boundaries', ()
     const rustAllowlist = readFileSync(new URL('../runner/crates/runner-core/src/configured_environment.rs', import.meta.url), 'utf8');
     expect(rustAllowlist).toContain('"PAPERCLIP_AI_PROVIDER_CONNECTION_ID"');
   });
+  it("admits the selected model's value-free OpenCode settings at every runner boundary", async () => {
+    const readFileSync = (await import('node:fs')).readFileSync;
+    const modelConfig = JSON.stringify({ limit: { context: 262144, output: 65536 }, options: { reasoningEffort: "max" } });
+    const modelEnv = { PAPERCLIP_OPENCODE_MODEL_CONFIG: modelConfig };
+    expect(createCapabilityRunnerdProviderEnvironment({ provider: 'opencode', options: { environment: { ...source, ...modelEnv } }, identity, codexHome: '/isolated/codex-home', runtimeContextPath: '/isolated/runtime-context.json', hasRuntimeContext: false }).PAPERCLIP_OPENCODE_MODEL_CONFIG).toBe(modelEnv.PAPERCLIP_OPENCODE_MODEL_CONFIG);
+    expect(GENERATED_RUNTIME_ENVIRONMENT_KEYS.has('PAPERCLIP_OPENCODE_MODEL_CONFIG')).toBe(true);
+    const rustAllowlist = readFileSync(new URL('../runner/crates/runner-core/src/codex_provider.rs', import.meta.url), 'utf8');
+    expect(rustAllowlist).toContain('"PAPERCLIP_OPENCODE_MODEL_CONFIG"');
+    expect(createCapabilityRunnerdProviderEnvironment({ provider: 'codex', options: { environment: { ...source, ...modelEnv } }, identity, codexHome: '/isolated/codex-home', runtimeContextPath: '/isolated/runtime-context.json', hasRuntimeContext: false }).PAPERCLIP_OPENCODE_MODEL_CONFIG).toBeUndefined();
+  });
 });
 
 

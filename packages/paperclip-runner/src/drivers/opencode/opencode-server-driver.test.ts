@@ -686,14 +686,14 @@ describe("OpenCodeServerDriver", () => {
       model: "paperclip/team/model-alias",
       runtimeDirectory: root,
       command: fixture,
-      environment: { PATH: process.env.PATH, PAPERCLIP_AI_PROVIDER_URL: "https://gateway.example/v1", PAPERCLIP_AI_PROVIDER_KEY: "selected-gateway-key" },
+      environment: { PATH: process.env.PATH, PAPERCLIP_AI_PROVIDER_URL: "https://gateway.example/v1", PAPERCLIP_AI_PROVIDER_KEY: "selected-gateway-key", PAPERCLIP_OPENCODE_MODEL_CONFIG: JSON.stringify({ limit: { context: 262144, output: 65536 }, options: { reasoningEffort: "max" } }) },
     });
     const session = await driver.openSession({ runId: "routing", normalizedSessionId: "routing", workingDirectory: root });
     try {
       const configPath = join(root, "routing", "config", "opencode", "opencode.json");
       expect(JSON.parse(await readFile(configPath, "utf8"))).toMatchObject({
         model: "paperclip/team/model-alias", small_model: "paperclip/team/model-alias", plugin: [],
-        provider: { paperclip: { npm: "@ai-sdk/openai-compatible", options: { baseURL: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/v1$/), apiKey: expect.any(String) }, models: { "team/model-alias": { name: "team/model-alias" } } } },
+        provider: { paperclip: { npm: "@ai-sdk/openai-compatible", options: { baseURL: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/v1$/), apiKey: expect.any(String) }, models: { "team/model-alias": { name: "team/model-alias", limit: { context: 262144, output: 65536 }, options: { reasoningEffort: "max" } } } } },
       });
       expect((await stat(configPath)).mode & 0o777).toBe(0o600);
       const shell = await promisify(execFile)("sh", ["-c", 'cat "$1"', "sh", configPath]);

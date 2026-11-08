@@ -58,6 +58,17 @@ describe("Codex app-server Codex driver", () => {
     await session.close({ reason: "fixture complete" });
   });
 
+  it("selects the durable OpenCode task effort for the requested turn", async () => {
+    const transport = new FakeCodexTransport();
+    transport.supportsTurnReasoning = () => true;
+    const session = await makeDriver([transport], { model: "paperclip/team/model", reasoningEffort: "max" }).openSession({
+      runId: "run-opencode-effort", normalizedSessionId: "normalized-opencode-effort", workingDirectory: WORKSPACE,
+    });
+    await session.startTurn({ message: { role: "user", text: "Use the task effort." } });
+    expect(transport.calls.find(call => call.method === "turn/start")?.params).toMatchObject({ reasoningMode: "max", effort: "max" });
+    await session.close({ reason: "fixture complete" });
+  });
+
   it("retains one correlation-bound steering acknowledgement after the rehydrated runnerd echo", async () => {
     const transport = new FakeCodexTransport("thread-root");
     const session = await makeDriver([transport]).openSession({

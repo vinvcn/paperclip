@@ -518,7 +518,7 @@ export interface HarnessSession {
     continuation?: true;
     requestedCollaborationMode?: "default" | "plan";
     /** OpenCode/OpenRouter only. Applies to this turn, never subsequent turns. */
-    reasoningMode?: "default" | "disabled";
+    reasoningMode?: "default" | "disabled" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   }): Promise<{
     turnId: string;
     effectiveCollaborationMode?: "default" | "plan";

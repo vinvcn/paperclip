@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -7,8 +9,8 @@ use paperclip_runner_core::codex_provider::{
     CodexProvider, CodexProviderConfig, CodexProviderEvent,
 };
 use paperclip_runner_core::durable::{
-    Command, CommandExecutor, DurableRunnerConfig, DurableRunnerError, PolledEvent,
-    TerminalDeliveryReconciliation,
+    Command, CommandExecutor, DurableRunnerConfig, DurableRunnerError, OpenCodeLaunchProfile,
+    PolledEvent, QualifiedLaunchArtifact, TerminalDeliveryReconciliation,
 };
 use paperclip_runner_core::native_provider_backend::NativeProviderCommandExecutor;
 use paperclip_runner_core::provider_backend::CodexCommandExecutor;
@@ -18,6 +20,7 @@ use paperclip_runner_core::provider_bridge::{
 };
 use paperclip_runner_core::provider_events::normalize_codex_notification;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 #[path = "support/codex_assigned_tool_validation.rs"]
 mod assigned_tool_validation;
@@ -74,6 +77,83 @@ fn provider_config(directory: &Path, switches: &[&str]) -> CodexProviderConfig {
         include_skill_instructions: None,
         conversation_mode: None,
     }
+}
+
+fn qualified_artifact(path: PathBuf) -> QualifiedLaunchArtifact {
+    QualifiedLaunchArtifact {
+        sha256: format!("sha256:{:x}", Sha256::digest(fs::read(&path).unwrap())),
+        path,
+    }
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "verified launch is not supported on Windows yet")]
+fn opencode_turn_start_accepts_a_supported_custom_effort() {
+    let directory = temporary_directory("opencode-custom-effort");
+
+    let proxy_command = directory.join("qualified-opencode-proxy-command");
+    fs::write(
+        &proxy_command,
+        "#!/bin/sh\nproxy=\"$1\"\nshift\nexec /bin/sh \"$proxy\" \"$@\"\n",
+    )
+    .unwrap();
+    let proxy_script = directory.join("qualified-opencode-proxy-script");
+    fs::write(
+        &proxy_script,
+        format!(
+            "#!/bin/sh\nexec '{}' --state-file '{}' --call-log '{}'\n",
+            env!("CARGO_BIN_EXE_fake-codex-app-server"),
+            directory.join("fake-state.json").display(),
+            directory.join("calls.log").display(),
+        ),
+    )
+    .unwrap();
+    let executable = directory.join("qualified-opencode-executable");
+    fs::write(&executable, "qualified OpenCode test executable\n").unwrap();
+    #[cfg(unix)]
+    for path in [&proxy_command, &proxy_script, &executable] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o500)).unwrap();
+    }
+    let profile = OpenCodeLaunchProfile {
+        command: qualified_artifact(proxy_command),
+        proxy_script: qualified_artifact(proxy_script),
+        executable: qualified_artifact(executable),
+    };
+
+    let mut config = provider_config(&directory, &[]);
+    config.provider = "opencode".to_owned();
+    config.driver = "opencode_server".to_owned();
+    config.provider_version = "1.18.34".to_owned();
+    config.model = Some("paperclip/team/model".to_owned());
+    config.command = profile.command.path.clone();
+    config.args = vec![profile.proxy_script.path.to_string_lossy().into_owned()];
+
+    let mut runner_config = durable_config(&directory);
+    runner_config.opencode_launch_profile = Some(profile);
+
+    let mut executor = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .unwrap();
+    executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .unwrap();
+    executor
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Use the selected custom gateway effort.", "reasoningMode": "max"}),
+        ))
+        .unwrap();
+    executor.shutdown().unwrap();
+    assert_eq!(call_count(&directory, "turn/start"), 1);
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

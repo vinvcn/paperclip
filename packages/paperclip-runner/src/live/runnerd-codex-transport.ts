@@ -8,6 +8,7 @@ export { createRunnerdCodexAppServerArgs, resolveRunnerdAcpxPermissionMode, trus
 import { applyProviderObservabilityEnvironment, redactObservabilityDiagnostic } from "../drivers/agent-observability.js";
 import type { RunnerExecutionDriver } from "../control-plane/runner-execution-driver.js";
 import { resolvePinnedOpenCodeCommand } from "../drivers/opencode/opencode-server-driver.js";
+import { OPEN_CODE_REASONING_EFFORTS } from "../drivers/opencode/reasoning-mode.js";
 import { bindAcpxCandidateAdmission, parseAcpxCandidateAdmission, type AcpxCandidateAdmission, type AcpxCandidateStartupAdmission } from "../drivers/acpx/candidate-admission.js";
 import { ACPX_CAPABILITY_PROFILES } from "../drivers/acpx/capability-profiles.js";
 import { resolveClaudeEffort, admittedClaudeEffort } from "../drivers/acpx/claude-effort.js";
@@ -1247,6 +1248,8 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   recoverSemanticToolInput?: DurablePrpControlPlaneOptions["recoverSemanticToolInput"];
   recoveryPurpose?: "execution" | "stop_cleanup";
   opencodePermissionMode?: NativeOpenCodePermissionMode;
+  /** Durable task effort; only custom gateway models accept this field. */
+  opencodeReasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   acpxAgent?: QualifiedAcpxAgent;
   /** Explicit evaluation-only candidate selection, never derived from persisted session input. */
   acpxCandidateProfile?: "pi" | "cursor" | "copilot" | "kimi";
@@ -3443,7 +3446,7 @@ const OPEN_CODE_RUNNER_ENVIRONMENT_KEYS = new Set([
   "PAPERCLIP_AI_PROVIDER_KEY",
   "PAPERCLIP_AI_PROVIDER_URL",
   "PAPERCLIP_AI_PROVIDER_KEY_SLOT",
-  "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY",
+  "PAPERCLIP_OPENCODE_MODEL_CONFIG", "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY",
   "PATH",
   "LANG",
   "LANGUAGE",
@@ -3595,7 +3598,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         && record(command.payload).provider !== undefined,
       )?.payload;
     const model = record(record(template).provider).model;
-    return typeof model === "string" && model.startsWith("openrouter/");
+    return typeof model === "string" && (model.startsWith("openrouter/") || model.startsWith("paperclip/"));
   }
 
   turnControlCapabilities(): NativeTurnControlCapabilities | null {
@@ -6445,8 +6448,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const reasoningMode = params.reasoningMode;
     if (reasoningMode !== undefined && (
       !this.supportsTurnReasoning()
-      || (reasoningMode !== "default" && reasoningMode !== "disabled")
-    )) throw new Error("turn.reasoningMode requires an OpenCode/OpenRouter model and must be default or disabled");
+      || !["default", "disabled", ...OPEN_CODE_REASONING_EFFORTS].includes(String(reasoningMode))
+    )) throw new Error("turn.reasoningMode requires an OpenCode/OpenRouter model and must be default, disabled, or a supported effort");
+    if (this.options.opencodeReasoningEffort !== undefined && (
+      reasoningMode !== undefined || !this.supportsTurnReasoning()
+      || !OPEN_CODE_REASONING_EFFORTS.includes(this.options.opencodeReasoningEffort)
+    )) throw new Error("turn.reasoningMode requires a durable custom-gateway effort");
     const skills = resolveRunnerdCodexSkillInputs(
       input.filter((item) => item.type === "skill"),
       this.options.runtimeContext ?? null,
@@ -6485,8 +6492,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         {
           text: message,
           ...(this.options.recordTimingReceipt ? {performance:true} : {}),
-          ...((this.options.provider ?? "codex") === "codex" && params.effort !== undefined ? { effort: params.effort } : {}),
-          ...(reasoningMode === undefined ? {} : { reasoningMode }),
+          ...(this.options.provider === "codex" && params.effort !== undefined ? { effort: params.effort } : {}),
+          ...(this.options.provider === "opencode" && (reasoningMode ?? this.options.opencodeReasoningEffort) !== undefined ? { reasoningMode: reasoningMode ?? this.options.opencodeReasoningEffort } : {}),
           ...(skills.length ? { skills } : {}),
           turnId: pendingTurnId,
         },

@@ -35,6 +35,7 @@ import {
   type AiConnectionBinding,
   type AiConnectionAttribution,
   type AiConnectionMetadata,
+  type AiProviderRoutingModel,
   type AiManagedConnectionSummary,
   type AiConnectionAccountIdentity,
   type AiConnectionUsage,
@@ -176,6 +177,32 @@ export function aiConnectionService(db: Db) {
                   : ("connected" as const),
         },
       ];
+    });
+  }
+  async function updateModels(
+    companyId: string,
+    connectionId: string,
+    models: AiProviderRoutingModel[],
+    managementContext?: ConnectionManagementContext,
+  ) {
+    await db.transaction(async (tx) => {
+      const [current] = await tx.select().from(toolConnections).where(and(
+        eq(toolConnections.id, connectionId), eq(toolConnections.companyId, companyId),
+      )).for("update");
+      if (!current) throw notFound("AI connection not found");
+      const metadata = aiConnectionMetadataSchema.parse(current.config.ai);
+      if (!metadata.routing) throw unprocessable("This connection does not have a model catalog");
+      await tx.update(toolConnections).set({
+        config: { ...current.config, ai: { ...metadata, routing: { ...metadata.routing, models } } },
+        updatedAt: new Date(),
+      }).where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, companyId)));
+      await logActivity(tx as unknown as Db, {
+        companyId,
+        ...(managementContext?.audit ?? { actorType: "user" as const, actorId: "system" }),
+        action: "ai_connection.models_updated",
+        entityType: "tool_connection",
+        entityId: connectionId,
+      });
     });
   }
   async function setDefault(
@@ -1273,5 +1300,5 @@ export function aiConnectionService(db: Db) {
       return [{ ...row, summary }];
     });
   }
-  return { list, selectDecision, selectFastResponse, selectPromptInjectionPrevention, quotaAccounts, subscriptionAccounts: (companyId: string, userId: string) => quotaAccounts(companyId, userId, true), refreshQuotaCredential, select, credential, runtimeCredential, probeUsage, accountIdentity, save, setDefault, membership, markAuthenticationFailed };
+  return { list, selectDecision, selectFastResponse, selectPromptInjectionPrevention, quotaAccounts, subscriptionAccounts: (companyId: string, userId: string) => quotaAccounts(companyId, userId, true), refreshQuotaCredential, select, credential, runtimeCredential, probeUsage, accountIdentity, save, updateModels, setDefault, membership, markAuthenticationFailed };
 }

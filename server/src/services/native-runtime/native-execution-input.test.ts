@@ -32,6 +32,24 @@ describe("LCA-05 explicit native work mode", () => {
       expect(input.task.title).toBe(text);
     }
   });
+  it("projects a custom OpenCode task effort into durable provider input", () => {
+    const input = buildNativeExecutionInput({
+      companyId: "10000000-0000-4000-8000-000000000001",
+      runId: "50000000-0000-4000-8000-000000000005",
+      agentId: "30000000-0000-4000-8000-000000000003",
+      issue: { id: "20000000-0000-4000-8000-000000000002", identifier: "MODE-1", title: "Use the selected effort", description: null, workMode: "standard" },
+      taskPrompt: "Use the selected effort",
+      workspace: { id: "50000000-0000-4000-8000-000000000005", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      normalizedSessionId: null,
+      provider: "opencode",
+      model: "paperclip/team/model",
+      opencodePermissionMode: "deny",
+      opencodeReasoningEffort: "max",
+      completionContract: { id: "70000000-0000-4000-8000-000000000007", sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Deliver the requested work", criteria: [{ id: "output", requirement: "Deliver the requested work" }] } },
+      runtimeContext: nativeRuntimeContextFixture(),
+    });
+    expect(input.provider).toEqual({ kind: "opencode", model: "paperclip/team/model", permissionMode: "deny", reasoningEffort: "max" });
+  });
 });
 
 describe("native execution input external-chat framing", () => {

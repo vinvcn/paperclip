@@ -14339,6 +14339,9 @@ async function createRunnerdBackendWithinSessionClaim(
         ...(input.execution.provider.kind === "opencode"
           ? {
               opencodePermissionMode: input.execution.provider.permissionMode,
+              ...("reasoningEffort" in input.execution.provider && input.execution.provider.reasoningEffort
+                ? { opencodeReasoningEffort: input.execution.provider.reasoningEffort }
+                : {}),
             }
           : {}),
         ...(input.execution.provider.kind === "claude_managed"

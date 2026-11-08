@@ -9,6 +9,10 @@ import {
 import { managedProviderRouting } from "../services/ai-provider-routing.js";
 
 describe("provider routing", () => {
+  it("keeps optional model limits and default reasoning effort in routing", () => {
+    const routing = aiProviderRoutingSchema.parse({ kind: "gateway", protocol: "chat", baseUrl: "https://gateway.example/v1", models: [{ id: "nim/model", limit: { context: 262144, output: 65536 }, options: { reasoningEffort: "max" } }] });
+    expect(routing.models).toEqual([{ id: "nim/model", limit: { context: 262144, output: 65536 }, options: { reasoningEffort: "max" } }]);
+  });
   it("routes managed OpenRouter accounts to direct and native Pi without OpenCode configuration", () => {
     const routing = aiProviderRoutingSchema.parse({ kind: "openrouter", protocol: "chat" });
     expect(aiRoutingHarness("paperclip_runner", "acpx", "pi")).toBe("pi_local");
