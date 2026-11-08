@@ -193,6 +193,16 @@ describe("NativeExecutionInputV1", () => {
     });
     expect(withEffort.provider).toMatchObject({ kind: "codex", reasoningEffort: "ultra" });
     expect(parseNativeExecutionInput(withEffort)).toEqual(withEffort);
+    const customOpenCode = parseNativeExecutionInput({
+      ...withEffort,
+      session: { ...withEffort.session, driverKind: "opencode_server" },
+      provider: { kind: "opencode", model: "paperclip/team/model", permissionMode: "allow", reasoningEffort: "max" },
+    });
+    expect(customOpenCode.provider).toEqual({ kind: "opencode", model: "paperclip/team/model", permissionMode: "allow", reasoningEffort: "max" });
+    expect(parseNativeExecutionInput(customOpenCode)).toEqual(customOpenCode);
+    for (const effort of ["off", "disabled", "", "maximum", 3]) {
+      expect(() => parseNativeExecutionInput({ ...customOpenCode, provider: { ...customOpenCode.provider, reasoningEffort: effort } })).toThrow("reasoningEffort");
+    }
     const disabledSearch = parseNativeExecutionInput({ ...withEffort, provider: { ...withEffort.provider, webSearch: "disabled" } });
     expect(disabledSearch.provider).toHaveProperty("webSearch", "disabled");
     expect(parseNativeExecutionInput(JSON.parse(JSON.stringify(disabledSearch)))).toEqual(disabledSearch);

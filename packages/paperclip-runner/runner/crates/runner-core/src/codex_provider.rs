@@ -93,6 +93,7 @@ const OPENCODE_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     // matching the node-side sanitizer and launcher allowlist.
     "PAPERCLIP_AI_PROVIDER_KEY_SLOT",
     "PAPERCLIP_AI_PROVIDER_CONNECTION_ID",
+    "PAPERCLIP_OPENCODE_MODEL_CONFIG",
     "PAPERCLIP_AGENT_KEY_ID",
     "PAPERCLIP_AGENT_PUBLIC_KEY",
     "PAPERCLIP_AGENT_PRIVATE_KEY",
@@ -1871,10 +1872,22 @@ impl CodexProvider {
             reasoning_mode,
         } = options;
         if reasoning_mode.is_some_and(|mode| {
-            self.config.provider != "opencode" || !matches!(mode, "default" | "disabled")
+            self.config.provider != "opencode"
+                || !matches!(
+                    mode,
+                    "default"
+                        | "disabled"
+                        | "minimal"
+                        | "low"
+                        | "medium"
+                        | "high"
+                        | "xhigh"
+                        | "max"
+                        | "ultra"
+                )
         }) {
             return Err(LocalRunnerError::invalid(
-                "turn.reasoningMode requires OpenCode and must be default or disabled",
+                "turn.reasoningMode requires OpenCode and must be default, disabled, or a supported effort",
             ));
         }
         if skills.len() > 64 || (self.config.provider != "codex" && !skills.is_empty()) {

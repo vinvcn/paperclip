@@ -3191,7 +3191,20 @@ impl CodexCommandExecutor {
         }
         let reasoning_mode = match payload.get("reasoningMode") {
             None => None,
-            Some(Value::String(mode)) if matches!(mode.as_str(), "default" | "disabled") => {
+            Some(Value::String(mode))
+                if matches!(
+                    mode.as_str(),
+                    "default"
+                        | "disabled"
+                        | "minimal"
+                        | "low"
+                        | "medium"
+                        | "high"
+                        | "xhigh"
+                        | "max"
+                        | "ultra"
+                ) =>
+            {
                 Some(mode.as_str())
             }
             Some(_) => return Err(DurableRunnerError::invalid("invalid turn.reasoningMode")),
@@ -6769,6 +6782,7 @@ mod tests {
             json!("bad"),
             json!("disabled"),
             json!("default"),
+            json!("max"),
         ] {
             let error = executor
                 .start_turn(&json!({"text": "must not reach the provider", "reasoningMode": mode}))

@@ -97,8 +97,25 @@ import {
   releaseMaterializedNativeRuntimeSkills,
 } from "../runtime-context-materializer.js";
 
-export const OPENCODE_SERVER_DRIVER_KIND = "opencode_server" as const;
 export const QUALIFIED_OPENCODE_VERSION = "1.18.34" as const;
+export const OPENCODE_SERVER_DRIVER_KIND = "opencode_server" as const;
+function openCodeModelConfig(value: unknown): { limit?: { context?: number; output?: number }; options?: { reasoningEffort?: string } } {
+  if (typeof value !== "string" || value.trim() === "") return {};
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { return {}; }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  const candidate = parsed as Record<string, unknown>;
+  const rawLimit = candidate.limit && typeof candidate.limit === "object" && !Array.isArray(candidate.limit) ? candidate.limit as Record<string, unknown> : {};
+  const options = candidate.options && typeof candidate.options === "object" && !Array.isArray(candidate.options) ? candidate.options as Record<string, unknown> : {};
+  const limit = Object.fromEntries(["context", "output"].flatMap((key) => {
+    const value = rawLimit[key];
+    return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? [[key, value]] : [];
+  }));
+  const effort = typeof options.reasoningEffort === "string" && ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(options.reasoningEffort)
+    ? options.reasoningEffort : undefined;
+  return { ...(Object.keys(limit).length ? { limit } : {}), ...(effort ? { options: { reasoningEffort: effort } } : {}) };
+}
+
 export const QUALIFIED_OPENCODE_MODEL =
   "openrouter/deepseek/deepseek-v4-flash-0731" as const;
 
@@ -685,7 +702,7 @@ class OpenCodeHarnessSession implements HarnessSession {
   }
 
   supportsTurnReasoning(): boolean {
-    return this.#model.startsWith("openrouter/");
+    return this.#model.startsWith("openrouter/") || this.#model.startsWith("paperclip/");
   }
 
   async startTurn(input: {
@@ -695,8 +712,11 @@ class OpenCodeHarnessSession implements HarnessSession {
     if (this.#activeTurnId !== null)
       throw new Error("OpenCode session already has an active turn");
     const reasoningMode = parseOpenCodeReasoningMode(input.reasoningMode);
-    if (input.reasoningMode !== undefined && !this.#model.startsWith("openrouter/")) {
-      throw new Error("Per-turn OpenCode reasoning is supported only for OpenRouter models");
+    if (input.reasoningMode !== undefined && !this.#model.startsWith("openrouter/") && !this.#model.startsWith("paperclip/")) {
+      throw new Error("Per-turn OpenCode reasoning is supported only for OpenRouter or custom-gateway models");
+    }
+    if (input.reasoningMode === "disabled" && this.#model.startsWith("paperclip/")) {
+      throw new Error("Disabled reasoning is supported only for OpenRouter models");
     }
     const turnId = `turn-${randomBytes(12).toString("hex")}`;
     this.#streamingParts.clear();
@@ -749,7 +769,9 @@ class OpenCodeHarnessSession implements HarnessSession {
           // previous disabled turn cannot change this turn's provider defaults.
           ...(providerID === "openrouter"
             ? { variant: this.#turnReasoningMode === "disabled" ? "paperclip-no-reasoning" : "paperclip-default" }
-            : {}),
+            : providerID === "paperclip" && this.#turnReasoningMode !== "default"
+              ? { variant: this.#turnReasoningMode }
+              : {}),
           // Keep question enabled in the isolated config. OpenCode 1.18.32
           // turns a prompt's deprecated `tools` map into replacement session
           // permissions, so a sparse override here discards the session policy.
@@ -2464,12 +2486,13 @@ async function startRuntime(input: {
           models: {
             [providerModelId]: {
               name: providerModelId,
+              ...(modelProvider === "paperclip" ? openCodeModelConfig(input.options.environment?.PAPERCLIP_OPENCODE_MODEL_CONFIG) : {}),
               ...(modelProvider === "openrouter"
                 ? { variants: {
                     "paperclip-default": {},
                     "paperclip-no-reasoning": { reasoning: { enabled: false } },
                   } }
-                : {}),
+                : { variants: Object.fromEntries(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].map((effort) => [effort, { reasoningEffort: effort }])) }),
             },
           },
         },
