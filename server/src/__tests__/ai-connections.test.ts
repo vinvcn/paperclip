@@ -17,7 +17,7 @@ import { mkdtemp, realpath, rm, access, readFile, writeFile, stat } from "node:f
 import os from "node:os";
 import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
-import { createDb, companies, agents, agentTaskSessions, heartbeatRuns, companyMemberships, connectionGrants, toolApplications, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environments, plugins, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, companySecretVersions, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
+import { createDb, companies, agents, agentTaskSessions, heartbeatRuns, companyMemberships, connectionGrants, toolApplications, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environments, plugins, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, companySecretVersions, userSecretDefinitions, principalPermissionGrants, activityLog } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { fetchCompanyQuotaWindows } from "../services/quota-windows.js";
 import { quotaCredentialRecoveryPath, quotaCredentialRecovery, quotaCredentialHash } from "../services/quota-credential-recovery.js";
@@ -1642,6 +1642,74 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     const row = await service.select({ ...input, binding: selected, userId: "alice", adapterType: "opencode_local", model: "qwen" });
     expect(row.grant.credentialSecretRefs).toEqual([]);
     expect(await service.credential(row)).toBe("");
+  });
+
+  it("updates only the routing model catalog and preserves legacy connection fields", async () => {
+    const owner = "catalog-owner";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const routing = { kind: "gateway", protocol: "responses", auth: "bearer", baseUrl: "https://catalog.example/v1", models: [{ id: "before" }] } as const;
+    const account = await service.save(companyId, owner, { provider: "openai", method: "api_key", name: "Catalog owner", ownership: "personal", allAgents: false, agentIds: [], routing: { ...routing, models: [...routing.models] } }, "catalog-credential");
+    const [before] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
+    await db.update(toolConnections).set({ config: { ...before.config, ai: { provider: "openai", method: "api_key", routing: { kind: "gateway", protocol: "responses", auth: "bearer", baseUrl: "https://catalog.example/v1" } } } as never }).where(eq(toolConnections.id, account.connectionId));
+    const [legacy] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
+    expect(legacy.config.ai).not.toHaveProperty("models");
+    expect(legacy.config.ai.routing).not.toHaveProperty("models");
+    const models = [{ id: "new-model", label: "New model", limit: { context: 8192, output: 1024 } }];
+    await service.updateModels(companyId, account.connectionId, models);
+    const [after] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
+    expect(after.config.ai).toMatchObject({ provider: "openai", method: "api_key", routing: { kind: "gateway", protocol: "responses", auth: "bearer", baseUrl: "https://catalog.example/v1", models: models.map(m => ({ id: m.id, label: m.label, limit: m.limit })) } });
+    expect(after.config.ai).not.toHaveProperty("models");
+    expect(after.transportConfig).toEqual(legacy.transportConfig);
+    expect(after.config.credential).toEqual(before.config.credential);
+  });
+
+  it("rejects model updates for non-routed and cross-company connections", async () => {
+    const owner = "catalog-scope-owner";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const unrouted = await create(owner, "Unrouted catalog guard");
+    await expect(service.updateModels(companyId, unrouted.connectionId, [])).rejects.toMatchObject({ status: 422 });
+    const routed = await service.save(companyId, "alice", { provider: "openrouter", method: "api_key", name: "Scope guard", ownership: "personal", allAgents: true, agentIds: [], routing: { kind: "openrouter", protocol: "chat", auth: "bearer", models: [] } }, "scoped-credential");
+    await expect(service.updateModels(otherCompanyId, routed.connectionId, [])).rejects.toMatchObject({ status: 404 });
+    const [unchanged] = await db.select().from(toolConnections).where(eq(toolConnections.id, routed.connectionId));
+    expect(unchanged.config.ai.routing.models).toEqual([]);
+  });
+
+  it("records model changes and rolls back when activity logging fails", async () => {
+    const routing = { kind: "openrouter", protocol: "chat", auth: "bearer", models: [{ id: "before-catalog" }] } as const;
+    const account = await service.save(companyId, "alice", { provider: "openrouter", method: "api_key", name: "Audited catalog", ownership: "personal", allAgents: true, agentIds: [], routing: { ...routing, models: [...routing.models] } }, "catalog-audit-credential");
+    await service.updateModels(companyId, account.connectionId, [{ id: "after-model" }], { audit: { actorType: "user", actorId: "alice" } } as never);
+    const [updated] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
+    expect(updated.config.ai.routing.models).toEqual([{ id: "after-model" }]);
+    const audits = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, account.connectionId), eq(activityLog.action, "ai_connection.models_updated")));
+    expect(audits).toHaveLength(1);
+    await db.execute(sql`create function ai_models_audit_failure() returns trigger language plpgsql as $$ begin raise exception 'model audit failure'; end $$`);
+    await db.execute(sql`create trigger ai_models_audit_failure before insert on activity_log for each row when (NEW.action = 'ai_connection.models_updated') execute function ai_models_audit_failure()`);
+    try {
+      await expect(service.updateModels(companyId, account.connectionId, [{ id: "rollback-model" }])).rejects.toThrow();
+      const [afterFailure] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
+      expect(afterFailure.config.ai).toMatchObject({ routing: { models: [{ id: "after-model" }] } });
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, account.connectionId), eq(activityLog.action, "ai_connection.models_updated")))).toHaveLength(1);
+    } finally {
+      await db.execute(sql`drop trigger ai_models_audit_failure on activity_log`);
+      await db.execute(sql`drop function ai_models_audit_failure()`);
+    }
+  });
+
+  it("enforces viewer and company permissions on model updates", async () => {
+    const account = await service.save(companyId, "alice", { provider: "openrouter", method: "api_key", name: "Permissioned catalog", ownership: "personal", allAgents: true, agentIds: [], routing: { kind: "openrouter", protocol: "chat", auth: "bearer", models: [] } }, "permission-credential");
+    const buildApp = (actor: Record<string, unknown>) => {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => { req.actor = actor as never; next(); });
+      app.use("/api", aiConnectionRoutes(db));
+      app.use((error: { status?: number; message: string }, _req: express.Request, res: express.Response, _next: express.NextFunction) => { res.status(error.status ?? 500).json({ error: error.message }); });
+      return app;
+    };
+    const url = `/api/companies/${companyId}/ai-connections/${account.connectionId}/models`;
+    const viewer = buildApp({ type: "board", source: "session", userId: "viewer", companyIds: [companyId], memberships: [{ companyId, status: "active", membershipRole: "viewer" }] });
+    expect((await request(viewer).patch(url).send({ models: [] })).status).toBe(403);
+    const outsider = buildApp({ type: "board", source: "session", userId: "stranger", companyIds: [randomUUID()] });
+    expect((await request(outsider).patch(`/api/companies/${otherCompanyId}/ai-connections/${account.connectionId}/models`).send({ models: [] })).status).toBe(403);
   });
 
   it.each([

@@ -67,6 +67,15 @@ export function managedProviderRouting(
     const id = model.startsWith(`${provider}/`)
       ? model.slice(provider.length + 1)
       : model;
+    if (provider === "paperclip") {
+      const modelEntry = route.models.find((entry) => entry.id === id);
+      if (modelEntry?.limit || modelEntry?.options) {
+        env.PAPERCLIP_OPENCODE_MODEL_CONFIG = JSON.stringify({
+          ...(modelEntry.limit ? { limit: modelEntry.limit } : {}),
+          ...(modelEntry.options ? { options: modelEntry.options } : {}),
+        });
+      }
+    }
     env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
       provider: {
         [provider]: {

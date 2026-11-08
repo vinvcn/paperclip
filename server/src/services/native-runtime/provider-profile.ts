@@ -201,7 +201,7 @@ export function validatePaperclipRunnerGrokConfig(config: Record<string, unknown
   return bindingId;
 }
 
-/** A task may change a local Runner model (and Codex effort), but not provider identity. */
+/** A task may change a local Runner model and supported effort, but not provider identity. */
 export function projectPaperclipRunnerTaskConfig(
   backend: "codex_app_server" | "opencode_server" | "acpx_runtime",
   agentConfig: unknown,
@@ -215,7 +215,7 @@ export function projectPaperclipRunnerTaskConfig(
   // Carry that model into durable input without allowing routing to change the harness.
   const model = optionalString(managedModel) ?? optionalString(task.model);
   const grok = backend === "acpx_runtime" && agentHarnessType("paperclip_runner", base) === "grok_local";
-  const supportsEffort = backend === "codex_app_server" || grok || (backend === "acpx_runtime" && agentHarnessType("paperclip_runner", base) === "claude_local");
+  const supportsEffort = backend === "codex_app_server" || (backend === "opencode_server" && (model ?? optionalString(base.model))?.startsWith("paperclip/")) || grok || (backend === "acpx_runtime" && agentHarnessType("paperclip_runner", base) === "claude_local");
   const effortKey = supportsEffort
     ? ["modelReasoningEffort", "reasoningEffort", "effort"].find((key) => key in task)
     : undefined;
@@ -679,6 +679,15 @@ export function resolvePaperclipRunnerNativeProviderInput(input: {
     return { provider: "openai_dot", model: null, dotBinding: input.dotBinding };
   }
   if (profile.provider === "opencode") {
+    const effort = config.modelReasoningEffort ?? config.reasoningEffort ?? config.effort;
+    if (effort !== undefined && effort !== null && (typeof effort !== "string"
+      || !["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(effort)
+      || !profile.model?.startsWith("paperclip/"))) {
+      throw new PaperclipRunnerProviderProfileError(
+        "paperclip_runner_opencode_effort_invalid",
+        "OpenCode reasoning effort must be a supported level for a custom gateway model.",
+      );
+    }
     return {
       provider: "opencode",
       model: profile.model,
@@ -686,6 +695,7 @@ export function resolvePaperclipRunnerNativeProviderInput(input: {
         "opencode",
         config.opencodePermissionMode,
       ) as "allow" | "ask" | "deny",
+      ...(typeof effort === "string" && effort ? { opencodeReasoningEffort: effort as "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" } : {}),
     };
   }
   if (profile.provider === "acpx") {

@@ -29,6 +29,7 @@ import {
   aiConnectionPoolConfigSchema,
   aiConnectionKeySlotCreateSchema,
   aiConnectionKeySlotUpdateSchema,
+  aiConnectionModelsUpdateSchema,
 } from "@paperclipai/shared";
 import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { forbidden, notFound, unprocessable } from "../errors.js";
@@ -417,6 +418,22 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
         ? "Start local sign-in for this connection before connecting."
         : "Start browser sign-in for this connection before connecting.");
       res.status(201).json(await localLogin.complete(companyId, userId, localSessionId, input, connectionRequestContext(req)));
+    },
+  );
+  router.patch(
+    "/companies/:companyId/ai-connections/:connectionId/models",
+    managementGuard("connections:configure", "PATCH /companies/:companyId/ai-connections/:connectionId/models", { personal: true }),
+    validate(aiConnectionModelsUpdateSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertBoardOrAgent(req);
+      assertCompanyAccess(req, companyId);
+      if (!(await canManageAiConnections(db, req, companyId))) throw forbidden("Manage connections permission is required");
+      const connectionId = req.params.connectionId as string;
+      if (!z.string().uuid().safeParse(connectionId).success) throw unprocessable("Invalid connection ID");
+      const input = aiConnectionModelsUpdateSchema.parse(req.body);
+      await service.updateModels(companyId, connectionId, input.models, connectionRequestContext(req));
+      res.json({ ok: true });
     },
   );
   router.put(

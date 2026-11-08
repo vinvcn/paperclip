@@ -105,6 +105,7 @@ export interface BuildNativeExecutionInput {
   codexReasoningEffort?: string;
   codexWebSearch?: "disabled";
   opencodePermissionMode?: NativeOpenCodePermissionMode;
+  opencodeReasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   acpxPermissionMode?: NativeAcpxPermissionMode;
   acpxSessionMode?: "agent" | "plan" | "ask";
   piThinkingLevel?: "off" | "low" | "high" | "max";
@@ -365,6 +366,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
             kind: "opencode",
             model: input.model,
             permissionMode: input.opencodePermissionMode ?? "allow",
+            ...(input.opencodeReasoningEffort ? { reasoningEffort: input.opencodeReasoningEffort } : {}),
           }
         : {
             kind: "codex",

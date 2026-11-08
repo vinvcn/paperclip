@@ -1,5 +1,21 @@
 import { z } from "zod";
 
+export const aiProviderRoutingModelSchema = z.object({
+  id: z.string().trim().min(1).max(256),
+  label: z.string().trim().max(160).optional(),
+  limit: z.object({
+    context: z.number().int().positive().max(100_000_000).optional(),
+    output: z.number().int().positive().optional(),
+  }).strict().optional(),
+  options: z.object({
+    reasoningEffort: z.enum(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]).optional(),
+  }).strict().optional(),
+}).strict();
+export type AiProviderRoutingModel = z.infer<typeof aiProviderRoutingModelSchema>;
+export const aiConnectionModelsUpdateSchema = z.object({
+  models: z.array(aiProviderRoutingModelSchema).max(200),
+}).strict();
+
 /** Value-free routing stored on the connection, never supplied by an agent binding. */
 export const aiProviderRoutingSchema = z
   .object({
@@ -14,14 +30,7 @@ export const aiProviderRoutingSchema = z
       .regex(/^[a-z]{2}(?:-[a-z]+)+-\d$/)
       .optional(),
     models: z
-      .array(
-        z
-          .object({
-            id: z.string().trim().min(1).max(256),
-            label: z.string().trim().max(160).optional(),
-          })
-          .strict(),
-      )
+      .array(aiProviderRoutingModelSchema)
       .max(200)
       .default([]),
   })
