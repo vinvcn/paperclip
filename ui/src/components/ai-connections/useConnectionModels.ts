@@ -43,6 +43,9 @@ export function useConnectionModelsState(
         models: modelOptions.map((m) => ({
           id: aiRoutingModel(effectiveRouting, harness, m.id),
           label: m.label ?? m.id,
+          ...(m.limit ? { limit: m.limit } : {}),
+          ...(m.options ? { options: m.options } : {}),
+          connectionName: connection?.name,
         })),
         isLoading: discover && catalog.isLoading,
         error: discover ? catalog.error : null,

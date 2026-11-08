@@ -52,6 +52,9 @@ export interface AgentKey {
 export interface AdapterModel {
   id: string;
   label: string;
+  limit?: { context?: number; output?: number };
+  options?: { reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" };
+  connectionName?: string;
 }
 
 export interface DetectedAdapterModel {
