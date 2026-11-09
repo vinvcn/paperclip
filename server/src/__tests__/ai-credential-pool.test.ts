@@ -77,6 +77,11 @@ async function createGatewayConnectionForUser(owner: string, name: string, key: 
 const MODEL_A = "meta/llama-3.3-70b-instruct";
 const MODEL_B = "meta/qwen3-coder-480b";
 
+function expectPooledResolution(resolution: string | { value: string; keySlot: number | null }) {
+  if (typeof resolution === "string") throw new Error("Expected a pooled slot resolution");
+  return resolution;
+}
+
 /** Insert one (slot, model) cooldown row — the ticket-03 cooldown store. */
 const coolSlot = async (
   connectionId: string,
@@ -311,9 +316,7 @@ describe("key pool assignment matrix (ticket 02)", () => {
   const newRun = async (agentId: string) => (await db.insert(heartbeatRuns).values({ companyId, agentId }).returning({ id: heartbeatRuns.id }))[0]!.id;
   /** Assignment inside a run: pin → sticky → exclusive lease → fast-fail. */
   const lease = async (runId: string, agentId: string, pinnedSlot?: number, model: string = MODEL_A): Promise<{ value: string; keySlot: number | null }> => {
-    const resolution = await service.runtimeCredential(await connectionRow(), { pool: { heartbeatRunId: runId, agentId, pinnedSlot, model } });
-    if (typeof resolution === "string") throw new Error("Expected a pooled slot resolution");
-    return resolution;
+    return expectPooledResolution(await service.runtimeCredential(await connectionRow(), { pool: { heartbeatRunId: runId, agentId, pinnedSlot, model } }));
   };
   /** Selection outside a run (no lease context, cooldowns still judged). */
   const select = async (model: string = MODEL_A) =>
@@ -566,11 +569,9 @@ describe("key pool one-shot avoid slot (ticket 06)", () => {
   };
   const newRun = async () => (await db.insert(heartbeatRuns).values({ companyId, agentId: agentA }).returning({ id: heartbeatRuns.id }))[0]!.id;
   const lease = async (runId: string, input: { pinnedSlot?: number | null; avoidSlot?: number | null; model?: string } = {}): Promise<{ value: string; keySlot: number | null }> => {
-    const resolution = await service.runtimeCredential(await connectionRow(), {
+    return expectPooledResolution(await service.runtimeCredential(await connectionRow(), {
       pool: { heartbeatRunId: runId, agentId: agentA, pinnedSlot: input.pinnedSlot ?? null, avoidSlot: input.avoidSlot ?? null, model: input.model ?? MODEL_A },
-    });
-    if (typeof resolution === "string") throw new Error("Expected a pooled slot resolution");
-    return resolution;
+    }));
   };
   const resetPool = async () => {
     await db.update(credentialPool).set({

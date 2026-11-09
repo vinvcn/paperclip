@@ -50,6 +50,22 @@ it("cleans empty settings and reports success without a credential field", async
   await vi.waitFor(() => expect(host.querySelector('[role="status"]')?.textContent).toBe("Model settings saved."));
 });
 
+it("prefills new model defaults without changing existing models", async () => {
+  await mount();
+  await act(async () => button("Add model").click());
+  await change([...host.querySelectorAll<HTMLInputElement>('input[aria-label="Model ID"]')][1]!, "new-model");
+  expect(host.querySelectorAll('input[aria-label="Model ID"]')).toHaveLength(2);
+  expect([...host.querySelectorAll<HTMLInputElement>('input[aria-label="Context limit"]')].map(input => input.value)).toEqual(["262144", "262144"]);
+  expect([...host.querySelectorAll<HTMLInputElement>('input[aria-label="Output limit"]')].map(input => input.value)).toEqual(["65536", "65536"]);
+  expect([...host.querySelectorAll<HTMLSelectElement>('select[aria-label="Default reasoning effort"]')].map(input => input.value)).toEqual(["max", "max"]);
+  await change([...host.querySelectorAll<HTMLInputElement>('input[aria-label="Context limit"]')][1]!, "");
+  await act(async () => button("Save models").click());
+  expect(vi.mocked(aiConnectionsApi.updateModels).mock.calls[0]?.[2]).toEqual([
+    initial[0],
+    { id: "new-model", limit: { output: 65536 }, options: { reasoningEffort: "max" } },
+  ]);
+});
+
 it("rejects duplicate IDs and resets stale success feedback on edit", async () => {
   await mount();
   await act(async () => button("Save models").click());

@@ -807,6 +807,37 @@ describe("managed AI connections", () => {
     }
   });
 
+  it("checks retained cleanup after acquiring the quota recovery mutation lock", async () => {
+    const owner = "recovery-cleanup-lock-race";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const auth = (marker: string) => JSON.stringify({ tokens: { access_token: `${marker}-access`, refresh_token: `${marker}-refresh`, account_id: owner } });
+    await service.save(companyId, owner, { provider: "openai", method: "subscription", ownership: "personal", name: owner, loginSessionId: "fixture", agentIds: [], allAgents: true }, auth("old"));
+    const [row] = await service.quotaAccounts(companyId, owner);
+    const ref = row.grant.credentialSecretRefs.find(ref => ref.configPath === "ai.credential")!;
+    await quotaCredentialRecovery(companyId, row.grant.id).write({ companyId, grantId: row.grant.id, connectionId: row.connection.id, secretId: ref.secretId, baseHash: quotaCredentialHash(auth("old")), value: auth("new") });
+    const originalLock = codexAdapter.withAccountHomeSecretMutationLock;
+    const held = deferredSignal(), release = deferredSignal();
+    const holding = originalLock(undefined, companyId, async () => {
+      held.resolve();
+      await release.promise;
+    });
+    const resolving = service.runtimeCredential(row);
+    try {
+      await held.promise;
+      retainAiCredentialCleanup({ scope: { companyId, accountKey: row.grant.id }, cleanup: async () => {} });
+      release.resolve();
+      await expect(resolving).rejects.toMatchObject({ status: 422, details: { code: "ai_credential_cleanup_pending" } });
+      expect(await quotaCredentialRecovery(companyId, row.grant.id).read()).not.toBeNull();
+      expect(await service.credential(row)).toBe(auth("old"));
+    } finally {
+      release.resolve();
+      await resolving.catch(() => {});
+      await holding;
+      await reconcileRetainedAiCleanup({ companyId, accountKey: row.grant.id });
+      await quotaCredentialRecovery(companyId, row.grant.id).clear();
+    }
+  });
+
   it.each(["company_file", "grant_row"] as const)("reads runtime credentials without an execution lock while a %s writer is active", async (kind) => {
     const owner = `runtime-lock-${kind}`;
     await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
@@ -1701,6 +1732,29 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     expect(await service.credential(row)).toBe("");
   });
 
+  it("defaults new routing models without rewriting existing model settings", async () => {
+    const owner = "model-default-owner";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const routing = { kind: "local" as const, protocol: "chat" as const, auth: "none" as const, baseUrl: "http://localhost:11434/v1", models: [{ id: "nim/model" }] };
+    const account = await service.save(companyId, owner, { provider: "openai", method: "api_key", ownership: "personal", name: owner, allAgents: true, agentIds: [], routing }, "");
+    const readModels = async () => {
+      const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
+      return (connection.config.ai as { routing: { models: unknown[] } }).routing.models;
+    };
+    expect(await readModels()).toEqual([{ id: "nim/model" }]);
+    await service.updateModels(companyId, account.connectionId, [
+      { id: "nim/model", limit: {}, options: {} },
+      { id: "custom", limit: { context: 1024 }, options: { reasoningEffort: "low" } },
+      { id: "new-model" },
+    ]);
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
+    expect((connection.config.ai as { routing: { models: unknown[] } }).routing.models).toEqual([
+      { id: "nim/model", limit: {}, options: {} },
+      { id: "custom", limit: { context: 1024, output: 65536 }, options: { reasoningEffort: "low" } },
+      { id: "new-model", limit: { context: 262144, output: 65536 }, options: { reasoningEffort: "max" } },
+    ]);
+  });
+
   it("updates only the routing model catalog and preserves legacy connection fields", async () => {
     const owner = "catalog-owner";
     await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
@@ -1714,7 +1768,7 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     const models = [{ id: "new-model", label: "New model", limit: { context: 8192, output: 1024 } }];
     await service.updateModels(companyId, account.connectionId, models);
     const [after] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
-    expect(after.config.ai).toMatchObject({ provider: "openai", method: "api_key", routing: { kind: "gateway", protocol: "responses", auth: "bearer", baseUrl: "https://catalog.example/v1", models: models.map(m => ({ id: m.id, label: m.label, limit: m.limit })) } });
+    expect(after.config.ai).toMatchObject({ provider: "openai", method: "api_key", routing: { kind: "gateway", protocol: "responses", auth: "bearer", baseUrl: "https://catalog.example/v1", models: [{ ...models[0]!, limit: { context: 8192, output: 1024 }, options: { reasoningEffort: "max" } }] } });
     expect(after.config.ai).not.toHaveProperty("models");
     expect(after.transportConfig).toEqual(legacy.transportConfig);
     expect(after.config.credential).toEqual(before.config.credential);
@@ -1736,7 +1790,7 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     const account = await service.save(companyId, "alice", { provider: "openrouter", method: "api_key", name: "Audited catalog", ownership: "personal", allAgents: true, agentIds: [], routing: { ...routing, models: [...routing.models] } }, "catalog-audit-credential");
     await service.updateModels(companyId, account.connectionId, [{ id: "after-model" }], { audit: { actorType: "user", actorId: "alice" } } as never);
     const [updated] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
-    expect((updated.config.ai as { routing: { models: unknown[] } }).routing.models).toEqual([{ id: "after-model" }]);
+    expect((updated.config.ai as { routing: { models: unknown[] } }).routing.models).toEqual([{ id: "after-model", limit: { context: 262144, output: 65536 }, options: { reasoningEffort: "max" } }]);
     const audits = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, account.connectionId), eq(activityLog.action, "ai_connection.models_updated")));
     expect(audits).toHaveLength(1);
     await db.execute(sql`create function ai_models_audit_failure() returns trigger language plpgsql as $$ begin raise exception 'model audit failure'; end $$`);

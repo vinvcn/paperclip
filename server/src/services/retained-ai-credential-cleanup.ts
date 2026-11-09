@@ -38,8 +38,6 @@ function cleaningScope(scope: RetainedAiCleanupScope) {
   return [...(active.getStore() ?? [])].some(entry => entry.executing && key(entry.scope) === key(scope));
 }
 
-/** Check without joining work that may need the mutation lock already held by
- * the caller. A cleanup's own nested journal recovery shares its ownership. */
 export function assertAiCredentialCleanupSettled(scope: RetainedAiCleanupScope): void {
   if (!cleaningScope(scope) && retained.get(key(scope))?.size) throw pending();
 }
