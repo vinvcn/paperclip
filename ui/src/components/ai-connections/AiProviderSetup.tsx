@@ -11,9 +11,12 @@ import {
 } from "@paperclipai/shared";
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { agentsApi } from "@/api/agents";
+import { describeError } from "@/api/errors";
+import { QueryErrorState, useQueryView } from "@/components/QueryView";
 import { ConnectionChoiceList } from "@/features/connections/ConnectionChoiceList";
 import { ConnectionAccessDefaults, connectionDefaultSummarySentence } from "@/features/connections/ConnectionSetupFlow";
 import { AppLogo } from "@/pages/apps/AppLogo";
+import { queryKeys } from "@/lib/queryKeys";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -126,6 +129,7 @@ export function AiProviderSetup({
     queryKey: ["ai-connections", companyId, agentId],
     queryFn: () => aiConnectionsApi.list(companyId, agentId),
   });
+  const accountsView = useQueryView(accounts);
   const canManageConnections = accounts.data?.canManageConnections ?? false;
   const ownership = reconnect?.ownership ?? ownershipChoice ?? (!agentId && canManageConnections ? "shared" : "personal");
   const allAgents = allAgentsChoice ?? (!agentId && canManageConnections);
@@ -133,6 +137,7 @@ export function AiProviderSetup({
     queryKey: ["agents", companyId, "provider-access"],
     queryFn: () => agentsApi.list(companyId),
   });
+  const agentsView = useQueryView(agents);
   const label = providerLabel ?? providers.find((p) => p.id === provider)?.name ?? (provider === "github" ? "GitHub Copilot" : "provider");
   const advanced = reconnect ? Boolean(reconnect.routing) : ["openrouter", "bedrock", "gateway", "local"].includes(provider ?? "");
   const nativeProvider: AiProvider =
@@ -162,7 +167,11 @@ export function AiProviderSetup({
     method?: "api_key" | "subscription";
   }) => {
     void client.invalidateQueries({ queryKey: ["ai-connections", companyId] });
-    void client.invalidateQueries({ queryKey: ["tools"] });
+    void Promise.all([
+      queryKeys.tools.connections(companyId),
+      queryKeys.tools.applications(companyId),
+      queryKeys.tools.gateways(companyId),
+    ].map(queryKey => client.invalidateQueries({ queryKey })));
     onComplete({
       provider: nativeProvider,
       method: result.method ?? "api_key",
@@ -272,8 +281,8 @@ export function AiProviderSetup({
     />
   ) : undefined;
   const cancel = () => reconnect || initialProvider ? onCancel() : setStep("provider");
-  if (!reconnect && accounts.isPending) return <p role="status">Loading connection permissions…</p>;
-  if (!reconnect && accounts.isError) return <p role="alert">Could not load connection permissions. <Button type="button" variant="ghost" onClick={() => void accounts.refetch()}>Retry</Button></p>;
+  if (!reconnect && (accounts.isPending || accountsView.kind === "reconnecting")) return <p role="status">Loading connection permissions…</p>;
+  if (!reconnect && accountsView.kind === "error") return <QueryErrorState error={accounts.error} action="load connection permissions" onRetry={accountsView.retry} retrying={accountsView.isFetching} />;
   return (
     <div className="mx-auto w-full max-w-2xl space-y-6" onSubmit={(event) => event.stopPropagation()}>
       <div className="space-y-2">
@@ -283,7 +292,7 @@ export function AiProviderSetup({
             : `${reconnect ? "Reconnect" : "Connect"} ${label}`}
         </h2>
       </div>
-      {agents.isError && <p role="alert" className="text-sm text-destructive">Could not load agents. <Button type="button" variant="ghost" onClick={() => void agents.refetch()}>Retry</Button></p>}
+      {agentsView.kind === "error" && <QueryErrorState size="inline" error={agents.error} action="load agents" onRetry={agentsView.retry} retrying={agentsView.isFetching} />}
       {step === "provider" ? (
         <>
           {advancedOnly ? choices(true) : <>
@@ -435,7 +444,7 @@ export function AiProviderSetup({
             <p role="alert" className="text-sm text-destructive">
               {save.error instanceof Error && save.error.name === "ZodError"
                 ? "Check the URL, API format, and authentication fields."
-                : save.error.message}
+                : describeError(save.error).body}
             </p>
           )}
           {accessDefaults}
@@ -451,7 +460,7 @@ export function AiProviderSetup({
             <Button
               type="submit"
               disabled={
-                save.isPending || accounts.isPending || accounts.isError ||
+                save.isPending || accounts.isPending || accountsView.kind === "reconnecting" || accountsView.kind === "error" ||
                 (!reconnect && ownership === "shared" && !allAgents && agentIds.size === 0) ||
                 (auth !== "none" && !apiKey.trim())
               }

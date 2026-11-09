@@ -28,7 +28,7 @@ afterEach(async () => {
 
 it("sweeps on its deadline, stays quiet between obligations, and discharges the sleep blocker", async () => {
   vi.useFakeTimers();
-  const owner = installDatabaseWorkSignals({ execute: vi.fn(async () => []) });
+  const owner = installDatabaseWorkSignals({ execute: vi.fn(async () => []), transaction: vi.fn(async () => []) });
   const onError = vi.fn();
   coordinator = createDeliveryWorkCoordinator({ owner, canRun: () => true, onError });
   state.next.mockResolvedValue(null);

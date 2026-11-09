@@ -49,6 +49,7 @@ const mockAgentService = vi.hoisted(() => ({
   activatePendingApproval: vi.fn(),
   terminate: vi.fn(),
   update: vi.fn(),
+  updateAndTransition: vi.fn(),
   rollbackConfigRevision: vi.fn(),
   updatePermissions: vi.fn(),
   getChainOfCommand: vi.fn(),
@@ -244,6 +245,7 @@ function createDbStub(options: { requireBoardApprovalForNewAgents?: boolean } = 
             Promise.resolve(resolve([{
               id: companyId,
               name: "Paperclip",
+              issuePrefix: "PAP",
               requireBoardApprovalForNewAgents: options.requireBoardApprovalForNewAgents ?? false,
             }])),
           ),
@@ -1708,6 +1710,50 @@ describe("agent permission routes", () => {
     expect(mockAgentService.terminate).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["PATCH status", (base: string) => request(base).patch(`/api/agents/${agentId}`).send({ status: "terminated" })],
+    ["POST terminate", (base: string) => request(base).post(`/api/agents/${agentId}/terminate`).send({})],
+  ])("keeps agent termination board-only through %s, even for an agent allowed to configure the target", async (_route, send) => {
+    mockAgentService.getById.mockResolvedValue({ ...baseAgent, status: "idle" });
+    const app = await createApp({
+      type: "agent",
+      agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, send);
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("only a board user can terminate an agent");
+    expect(res.body.error).toContain(`[the agent's profile](/PAP/agents/${agentId})`);
+    expect(mockAgentService.terminate).not.toHaveBeenCalled();
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelInvocationsForAgents).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("still lets a board user terminate through PATCH status", async () => {
+    mockAgentService.getById.mockResolvedValue({ ...baseAgent, status: "idle" });
+    mockAgentService.updateAndTransition.mockResolvedValue({ ...baseAgent, status: "terminated" });
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ status: "terminated" }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe("terminated");
+    expect(mockAgentService.updateAndTransition).toHaveBeenCalledWith(agentId, "terminate", expect.anything(), expect.anything());
+  });
+
   it("terminates directly when no open hire approval is linked", async () => {
     const idleAgent = { ...baseAgent, status: "idle" };
     const terminatedAgent = { ...baseAgent, status: "terminated" };
@@ -2166,6 +2212,31 @@ describe("agent permission routes", () => {
   });
 
   describe("agent configuration read gate", () => {
+    it.each(["configuration", "config-revisions", "config-revisions/55555555-5555-4555-8555-555555555555"])("allows self %s reads without peer configuration grants", async (suffix) => {
+      const plaintext = "self-config-value-must-not-leak";
+      const adapterConfig = { env: { GENERIC_NAME: { type: "plain", value: plaintext } } };
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterConfig });
+      const revision = { id: "55555555-5555-4555-8555-555555555555", beforeConfig: { adapterConfig }, afterConfig: { adapterConfig } };
+      mockAgentService.listConfigRevisions.mockResolvedValue([revision]);
+      mockAgentService.getConfigRevision.mockResolvedValue(revision);
+      mockAccessService.decide.mockImplementation(async (input) => ({
+        allowed: input.action === "agent_config:read" && input.resource.type === "agent" && input.resource.agentId === agentId,
+        reason: "allow_self",
+        explanation: "Self configuration read",
+      }));
+      const app = await createApp({ type: "agent", agentId, companyId, source: "agent_key" });
+
+      const response = await request(app).get(`/api/agents/${agentId}/${suffix}`);
+
+      expect(response.status).toBe(200);
+      expect(JSON.stringify(response.body)).not.toContain(plaintext);
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "agent", companyId, agentId },
+        scope: { targetAgentId: agentId },
+      }));
+    });
+
     it("allows a board member without agents:create to read agent configuration", async () => {
       // Board (human) users with company membership but no agents:create
       // grant should still be able to view agent configuration — this is
@@ -2297,11 +2368,12 @@ describe("agent permission routes", () => {
       expect(res.status).toBe(403);
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
         action: "agent_config:read",
-        resource: { type: "company", companyId },
+        resource: { type: "agent", companyId, agentId: peerAgentId },
+        scope: { targetAgentId: peerAgentId },
       }));
     });
 
-    it("allows an agent actor with agents:suggest-changes grant to read peer config", async () => {
+    it.each(["agents:read", "agents:configure", "agents:suggest-changes"])("allows an agent actor with %s grant to read peer config", async (permissionKey) => {
       // Suggest-tier authority implies read access so the agent can prepare a
       // consented diff without receiving direct change authority.
       const peerAgentId = "44444444-4444-4444-8444-444444444444";
@@ -2316,11 +2388,11 @@ describe("agent permission routes", () => {
       mockAccessService.decide.mockResolvedValue({
         allowed: true,
         reason: "allow_explicit_grant",
-        explanation: "Allowed by explicit grant agents:suggest-changes.",
+        explanation: `Allowed by explicit grant ${permissionKey}.`,
         grant: {
           principalType: "agent",
           principalId: agentId,
-          permissionKey: "agents:suggest-changes",
+          permissionKey,
           scope: null,
         },
       });
@@ -2338,7 +2410,8 @@ describe("agent permission routes", () => {
       expect(res.status).toBe(200);
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
         action: "agent_config:read",
-        resource: { type: "company", companyId },
+        resource: { type: "agent", companyId, agentId: peerAgentId },
+        scope: { targetAgentId: peerAgentId },
       }));
     });
   });
@@ -2373,5 +2446,6 @@ vi.mock("../services/agent-lifecycle.js", async (importOriginal) => {
     requestHire: (...args: unknown[]) => mockAgentService.create(...args),
     approveHire: (...args: unknown[]) => mockAgentService.activatePendingApproval(...args),
     terminateAgent: (...args: unknown[]) => mockAgentService.terminate(...args),
+    updateAndTransition: (...args: unknown[]) => mockAgentService.updateAndTransition(...args),
   }) };
 });

@@ -6,6 +6,7 @@ import { expect, it, vi } from "vitest";
 import { AiProviderSetup } from "./AiProviderSetup";
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { queryKeys } from "@/lib/queryKeys";
 import { aiProviderSetupPreset } from "@paperclipai/shared";
 import type { AiConnectionCredentialStep } from "./AiConnectionCredentialStep";
 
@@ -105,6 +106,7 @@ it("allows an ordinary member to save a personal gateway before the agent exists
   client.setQueryData(["agents", "company", "provider-access"], []);
   const container = document.createElement("div");
   const root = createRoot(container);
+  const invalidateQueries = vi.spyOn(client, "invalidateQueries");
   const onComplete = vi.fn();
   try {
     await act(async () => root.render(<QueryClientProvider client={client}><AiProviderSetup companyId="company" initialProvider="openrouter" onCancel={() => {}} onComplete={onComplete} /></QueryClientProvider>));
@@ -117,6 +119,9 @@ it("allows an ordinary member to save a personal gateway before the agent exists
     expect(connect.disabled).toBe(false);
     await act(async () => container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
     expect(aiConnectionsApi.create).toHaveBeenCalledWith("company", expect.objectContaining({ ownership: "personal", allAgents: false, agentIds: [], apiKey: "member-key" }));
+    for (const queryKey of [queryKeys.tools.connections("company"), queryKeys.tools.applications("company"), queryKeys.tools.gateways("company")]) {
+      expect(invalidateQueries).toHaveBeenCalledWith({ queryKey });
+    }
     expect(onComplete).toHaveBeenCalledWith(expect.objectContaining({ mode: "delegated", connectionId: "connection", grantId: "grant" }));
   } finally {
     await act(async () => root.unmount()); client.clear();

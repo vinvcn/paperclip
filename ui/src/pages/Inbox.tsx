@@ -1,3 +1,5 @@
+import { isTransientError } from "@/api/errors";
+import { useQueryView } from "@/components/QueryView";
 import { useCoordinatorPresentation } from "@/components/coordinator/CoordinatorPresentation";
 import { useWarmTaskDetailCode } from "@/hooks/useWarmTaskDetailCode";
 import { describeError } from "../api/errors";
@@ -130,7 +132,7 @@ import {
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { PageTabBar } from "../components/PageTabBar";
-import type { Approval, HeartbeatRun, Issue, JoinRequest } from "@paperclipai/shared";
+import type { Approval, HeartbeatRun, InboxMineSnapshot, Issue, JoinRequest } from "@paperclipai/shared";
 import {
   ACTIONABLE_APPROVAL_STATUSES,
   DEFAULT_INBOX_ISSUE_COLUMNS,
@@ -195,6 +197,7 @@ import {
   taskDateGroupSeparator,
   type TaskDateGroup,
 } from "../lib/task-date-groups";
+import { taskStatusIconProps } from "@/lib/task-status-presentation";
 
 const INBOX_HEARTBEAT_RUN_LIMIT = 200;
 const INBOX_ISSUE_LIST_LIMIT = 100;
@@ -402,6 +405,7 @@ export function FailedRunInboxRow({
           resume: "Work is paused", budget: "Budget limit reached",
           project_access: "Agent needs project access",
           rate_limited: "Key rate limited",
+          confirm_owner_stop: "Confirm the previous server stopped",
         }[interruption.userAction ?? "resume"]) : runFailureMessage(run);
   const retryAvailable = !interruption || interruption.canRetry;
   const showUnreadSlot = unreadState !== null;
@@ -858,8 +862,7 @@ function StreamlinedInbox({
   const { data: experimentalSettings, isLoading: isSettingsLoading } = useQuery({
     queryKey: queryKeys.instance.experimentalSettings,
     queryFn: () => instanceSettingsApi.getExperimental(),
-    retry: false,
-  });
+    });
   const experimentalSettingsLoaded = experimentalSettings !== undefined;
   const [searchQuery, setSearchQuery] = useState("");
   const normalizedSearchQuery = searchQuery.trim();
@@ -902,6 +905,10 @@ function StreamlinedInbox({
     queryKey: queryKeys.auth.session,
     queryFn: () => authApi.getSession(),
   });
+  const currentUserId = session?.user.id ?? session?.session.userId ?? null;
+  const mineContextQueryKey = [...queryKeys.issues.list(selectedCompanyId!), "mine-context", currentUserId] as const;
+  const { data: mineSnapshot } = useQuery<InboxMineSnapshot>({ queryKey: mineContextQueryKey, enabled: false });
+
 
   const { data: agents, isLoading: isAgentsLoading } = useQuery({
     queryKey: queryKeys.agents.list(selectedCompanyId!),
@@ -978,8 +985,7 @@ function StreamlinedInbox({
       }
     },
     enabled: !!selectedCompanyId,
-    retry: false,
-  });
+    });
 
   const dashboardQueryKey = queryKeys.dashboard(selectedCompanyId!);
   const sharedDashboard = useSharedPollingQuery({
@@ -995,43 +1001,37 @@ function StreamlinedInbox({
   });
   usePublishSharedQueryData(sharedDashboard, dashboard, dashboardUpdatedAt);
 
-  const {
-    data: mineIssuesRaw = [],
-    isLoading: isMineIssuesLoading,
-    error: mineIssuesError,
-    dataUpdatedAt: mineIssuesUpdatedAt,
-  } = useQuery({
-    queryKey: [...queryKeys.issues.listMineByMe(selectedCompanyId!), "index", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT] as const,
-    queryFn: () =>
-      issuesApi.listCompact(selectedCompanyId!, {
-        touchedByUserId: "me",
-        inboxArchivedByUserId: "me",
-        status: INBOX_MINE_ISSUE_STATUS_FILTER,
-        projection: "index",
-        sortField: "updated",
-        sortDir: "desc",
-        includeRoutineExecutions: true,
-        includeLiveDescendantSummary: true,
-        limit: INBOX_ISSUE_LIST_LIMIT,
-      }).then((rows) => rows as Issue[]),
-    enabled: !!selectedCompanyId && tab === "mine",
+  const mineIssuesQuery = useQuery({
+    queryKey: [...queryKeys.issues.listMineByMe(selectedCompanyId!), "index", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT, currentUserId] as const,
+    queryFn: async ({ signal }) => {
+      const snapshot = await issuesApi.inboxMine(selectedCompanyId!, { signal });
+      if (snapshot.userId !== currentUserId) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.auth.session });
+        throw new ApiError("Your account changed. Refresh the inbox.", 409, { error: "account_changed" });
+      }
+      queryClient.setQueryData(mineContextQueryKey, snapshot);
+      return snapshot.issues as Issue[];
+    },
+    enabled: !!selectedCompanyId && !!currentUserId && tab === "mine",
+    refetchOnMount: mineSnapshot ? undefined : "always",
     refetchOnWindowFocus: false,
-    staleTime: INBOX_HOT_PATH_STALE_MS,
+    staleTime: mineSnapshot ? INBOX_HOT_PATH_STALE_MS : 0,
+    // A successful aggregate can still omit a failed source. React Query's
+    // error retries do not run for that 200 response, so retry those sources.
+    refetchInterval: () => {
+      const snapshot = queryClient.getQueryData<InboxMineSnapshot>(mineContextQueryKey);
+      return [snapshot?.failureError, snapshot?.contextError].some(error =>
+        error && isTransientError(new ApiError(error.message, error.status, null))) ? 5_000 : false;
+    },
   });
-  const mineIssuesQueryKey = [...queryKeys.issues.listMineByMe(selectedCompanyId!), "index", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT] as const;
-  const sharedMineIssues = useSharedPollingQuery<Issue[]>({
-    companyId: selectedCompanyId,
-    resourceKey: "inbox:mine-issues",
-    queryKey: mineIssuesQueryKey,
-    enabled: !!selectedCompanyId && tab === "mine",
-  });
-  usePublishSharedQueryData(sharedMineIssues, mineIssuesRaw, mineIssuesUpdatedAt);
-  const {
-    data: touchedIssuesRaw = [],
-    isLoading: isTouchedIssuesLoading,
-    error: touchedIssuesError,
-    dataUpdatedAt: touchedIssuesUpdatedAt,
-  } = useQuery({
+  const { data: mineIssuesRaw = [], isLoading: isMineIssuesLoading, error: mineIssuesError } = mineIssuesQuery;
+  const mineIssuesView = useQueryView(mineIssuesQuery);
+  const mineIssuesQueryKey = [...queryKeys.issues.listMineByMe(selectedCompanyId!), "index", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT, currentUserId] as const;
+  // Mine owns one coherent response: broadcasting only its task array would
+  // refresh that array while another tab retained stale parent/failure context.
+  // Each tab uses the authenticated aggregate read; the server coalesces it.
+
+  const touchedIssuesQuery = useQuery({
     queryKey: [...queryKeys.issues.listTouchedByMe(selectedCompanyId!), "index", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT] as const,
     queryFn: () =>
       issuesApi.listCompact(selectedCompanyId!, {
@@ -1048,6 +1048,8 @@ function StreamlinedInbox({
     refetchOnWindowFocus: false,
     staleTime: INBOX_HOT_PATH_STALE_MS,
   });
+  const { data: touchedIssuesRaw = [], isLoading: isTouchedIssuesLoading, error: touchedIssuesError, dataUpdatedAt: touchedIssuesUpdatedAt } = touchedIssuesQuery;
+  const touchedIssuesView = useQueryView(touchedIssuesQuery);
   const touchedIssuesQueryKey = [...queryKeys.issues.listTouchedByMe(selectedCompanyId!), "index", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT] as const;
   const sharedTouchedIssues = useSharedPollingQuery<Issue[]>({
     companyId: selectedCompanyId,
@@ -1057,42 +1059,53 @@ function StreamlinedInbox({
   });
   usePublishSharedQueryData(sharedTouchedIssues, touchedIssuesRaw, touchedIssuesUpdatedAt);
 
-  const { data: heartbeatRuns, isLoading: isRunsLoading, error: runsError } = useQuery({
+  const { data: otherHeartbeatRuns, isLoading: isOtherRunsLoading, error: otherRunsError } = useQuery({
     queryKey: [...queryKeys.heartbeats(selectedCompanyId!), "inbox-failures", INBOX_HEARTBEAT_RUN_LIMIT],
     queryFn: () => heartbeatsApi.list(selectedCompanyId!, undefined, INBOX_HEARTBEAT_RUN_LIMIT, { summary: true, latestFailuresOnly: true }),
-    enabled: !!selectedCompanyId,
+    enabled: !!selectedCompanyId && tab !== "mine",
     refetchOnWindowFocus: false,
     staleTime: INBOX_HOT_PATH_STALE_MS,
   });
+  const heartbeatRuns = tab === "mine" ? mineSnapshot?.failureRuns : otherHeartbeatRuns;
+  const isRunsLoading = tab === "mine" ? !!currentUserId && !mineSnapshot && !mineIssuesError : isOtherRunsLoading;
+  const runsError = tab === "mine" && mineSnapshot?.failureError
+    ? new ApiError(mineSnapshot.failureError.message, mineSnapshot.failureError.status, null) : tab === "mine" ? null : otherRunsError;
+  const bundledContextIds = useMemo(() => new Set(tab === "mine" && mineSnapshot ? [
+    ...mineSnapshot.issues.map((issue) => issue.parentId).filter((id): id is string => Boolean(id)),
+    ...mineSnapshot.failureRuns.map(readIssueIdFromRun).filter((id): id is string => Boolean(id)),
+  ] : []), [tab, mineSnapshot]);
   const { parentContextIds, failureContextIds, contextIssueIds } = useMemo(() => {
     const sourceIssues = tab === "mine" ? mineIssuesRaw : touchedIssuesRaw;
     const loadedIds = new Set(sourceIssues.map((issue) => issue.id));
     // Failure cards need interruption state even when their task is already in
     // the index. Parent captions only need index metadata.
     const failureIds = new Set((heartbeatRuns ?? []).map(readIssueIdFromRun)
-      .filter((id): id is string => Boolean(id)));
+      .filter((id): id is string => Boolean(id))
+      .filter((id) => !bundledContextIds.has(id)));
     const parentIds = new Set(sourceIssues.map((issue) => issue.parentId)
       .filter((id): id is string => Boolean(id))
-      .filter((id) => !loadedIds.has(id) && !failureIds.has(id)));
+      .filter((id) => !loadedIds.has(id) && !failureIds.has(id) && !bundledContextIds.has(id)));
     return {
       parentContextIds: [...parentIds].sort(),
       failureContextIds: [...failureIds].sort(),
       contextIssueIds: new Set([...parentIds, ...failureIds]),
     };
-  }, [tab, mineIssuesRaw, touchedIssuesRaw, heartbeatRuns]);
-  const needsIssueContext = !!selectedCompanyId && contextIssueIds.size > 0 && tab !== "blocked";
+  }, [tab, mineIssuesRaw, touchedIssuesRaw, heartbeatRuns, bundledContextIds]);
+  const needsIssueContext = !!selectedCompanyId && contextIssueIds.size > 0 && tab !== "blocked"
+    && (tab !== "mine" || !!mineSnapshot || !!mineIssuesError);
   const {
     data: issueContext,
     isLoading: isContextIssuesLoading,
     isPlaceholderData: isContextIssuesPlaceholder,
-    error: contextIssuesError,
+    error: extraContextIssuesError,
   } = useQuery<{
     companyId: string | null;
+    userId: string | null;
     issues: Issue[];
     failureIssueIds: string[];
   }>({
-    queryKey: [...queryKeys.issues.list(selectedCompanyId!), "row-context", "parent-index-with-failure-state", parentContextIds, failureContextIds],
-    placeholderData: (previous) => needsIssueContext && previous?.companyId === selectedCompanyId
+    queryKey: [...queryKeys.issues.list(selectedCompanyId!), "row-context", "parent-index-with-failure-state", parentContextIds, failureContextIds, currentUserId],
+    placeholderData: (previous) => needsIssueContext && previous?.companyId === selectedCompanyId && previous.userId === currentUserId
       ? { ...previous, issues: previous.issues.filter((issue) => contextIssueIds.has(issue.id)) }
       : undefined,
     queryFn: async ({ signal }) => {
@@ -1112,12 +1125,25 @@ function StreamlinedInbox({
       ]);
       // A completed failure read also establishes absence for filtered/missing
       // tasks. Parent-only placeholders cannot supply this coverage.
-      return { companyId: selectedCompanyId, issues: [...parents, ...failures], failureIssueIds: failureContextIds };
+      return { companyId: selectedCompanyId, userId: currentUserId, issues: [...parents, ...failures], failureIssueIds: failureContextIds };
     },
     enabled: needsIssueContext,
   });
-  const contextIssues = issueContext?.issues ?? [];
-  const knownFailureContextIds = useMemo(() => new Set(issueContext?.failureIssueIds ?? []), [issueContext]);
+  const contextIssuesError = extraContextIssuesError ?? (tab === "mine" && mineSnapshot?.contextError
+    ? new ApiError(mineSnapshot.contextError.message, mineSnapshot.contextError.status, null) : null);
+  const contextIssues = useMemo(() => {
+    if (tab !== "mine" || !mineSnapshot) return issueContext?.issues ?? [];
+    const sourceIds = new Set(mineIssuesRaw.map((issue) => issue.id));
+    const parentIds = new Set(mineIssuesRaw.map((issue) => issue.parentId));
+    return [
+      ...mineSnapshot.issues.filter((issue) => !sourceIds.has(issue.id) && parentIds.has(issue.id)),
+      ...mineSnapshot.contextIssues.filter((issue) => parentIds.has(issue.id) || mineSnapshot.failureIssueIds.includes(issue.id)),
+      ...(issueContext?.issues ?? []),
+    ] as Issue[];
+  }, [tab, mineSnapshot, mineIssuesRaw, issueContext]);
+  const knownFailureContextIds = useMemo(() => new Set([
+    ...(tab === "mine" ? mineSnapshot?.failureIssueIds ?? [] : []), ...(issueContext?.failureIssueIds ?? []),
+  ]), [tab, mineSnapshot, issueContext]);
   const issues = useMemo(() => [...mineIssuesRaw, ...touchedIssuesRaw, ...contextIssues], [mineIssuesRaw, touchedIssuesRaw, contextIssues]);
   const liveRunsQueryKey = queryKeys.liveRuns(selectedCompanyId!);
   const sharedLiveRuns = useSharedPollingQuery({
@@ -1141,7 +1167,6 @@ function StreamlinedInbox({
     queryFn: () => accessApi.listUserDirectory(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
-  const currentUserId = session?.user.id ?? session?.session.userId ?? null;
   const [archivingIssueIds, setArchivingIssueIds] = useState<Set<string>>(new Set());
   const [undoableArchiveIssueIds, setUndoableArchiveIssueIds] = useState<string[]>([]);
   const [unarchivingIssueIds, setUnarchivingIssueIds] = useState<Set<string>>(new Set());
@@ -1172,7 +1197,7 @@ function StreamlinedInbox({
     [locallyArchivedIssueIds, touchedIssuesRaw],
   );
   const sourceSearchIds = useMemo(() => [...new Set([...mineIssuesRaw, ...touchedIssuesRaw].map((issue) => issue.id))].sort(), [mineIssuesRaw, touchedIssuesRaw]);
-  const { data: sourceSearchMatches = [], isLoading: isSourceSearchLoading, error: sourceSearchError } = useQuery<Issue[]>({
+  const sourceSearchQuery = useQuery<Issue[]>({
     queryKey: [...queryKeys.issues.list(selectedCompanyId!), "inbox-source-search", normalizedSearchQuery, sourceSearchIds],
     queryFn: async ({ signal }) => {
       const matches: Issue[] = [];
@@ -1186,6 +1211,8 @@ function StreamlinedInbox({
     },
     enabled: !!selectedCompanyId && normalizedSearchQuery.length > 0 && sourceSearchIds.length > 0,
   });
+  const { data: sourceSearchMatches = [], isLoading: isSourceSearchLoading, error: sourceSearchError } = sourceSearchQuery;
+  const sourceSearchView = useQueryView(sourceSearchQuery);
   const sourceSearchMatchIds = useMemo(() => new Set(sourceSearchMatches.map((issue) => issue.id)), [sourceSearchMatches]);
   const shouldUseIssueSearchSupplement =
     !!selectedCompanyId
@@ -1891,7 +1918,7 @@ function StreamlinedInbox({
       queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     },
     onError: (err) => {
-      setActionError(err instanceof Error ? err.message : "Failed to approve join request");
+      setActionError(describeError(err).body);
     },
   });
 
@@ -1904,7 +1931,7 @@ function StreamlinedInbox({
       queryClient.invalidateQueries({ queryKey: queryKeys.sidebarBadges(selectedCompanyId!) });
     },
     onError: (err) => {
-      setActionError(err instanceof Error ? err.message : "Failed to reject join request");
+      setActionError(describeError(err).body);
     },
   });
 
@@ -1941,6 +1968,7 @@ function StreamlinedInbox({
     },
     onSuccess: ({ newRun, originalRun }) => {
       retryRequestKeys.current.delete(originalRun.id);
+      queryClient.invalidateQueries({ queryKey: queryKeys.issues.listMineByMe(originalRun.companyId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(originalRun.companyId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(originalRun.companyId, originalRun.agentId) });
       if (newRun.runId)
@@ -2023,7 +2051,7 @@ function StreamlinedInbox({
       return { companyId: selectedCompanyId, previousData };
     },
     onError: (err, id, context) => {
-      setActionError(err instanceof Error ? err.message : "Failed to archive task");
+      setActionError(describeError(err).body);
       if (context?.companyId) clearLocalInboxArchive(context.companyId, id);
       setArchivingIssueIds((prev) => {
         const next = new Set(prev);
@@ -2064,7 +2092,7 @@ function StreamlinedInbox({
       return { companyId: selectedCompanyId };
     },
     onError: (err, id, context) => {
-      setActionError(err instanceof Error ? err.message : "Failed to undo inbox archive");
+      setActionError(describeError(err).body);
       if (context?.companyId) {
         beginLocalInboxArchive(context.companyId, id);
         boundLocalInboxArchive(context.companyId, id);
@@ -2498,6 +2526,7 @@ function StreamlinedInbox({
   ].filter((key): key is SectionKey => key !== null);
 
   const initialSourcesSettled =
+    ![sourceSearchView, mineIssuesView, touchedIssuesView].some(view => view.kind === "reconnecting") &&
     !isSourceSearchLoading && !isSessionLoading && !isSettingsLoading && !isDismissalsLoading && !isAgentsLoading && !isProjectsLoading && !isMembersLoading && !isWorkspacesLoading &&
     !isJoinRequestsLoading &&
     !isApprovalsLoading &&
@@ -2509,16 +2538,24 @@ function StreamlinedInbox({
     !isRunsLoading
     && (!issueFilters.liveOnly || !isLiveRunsLoading)
     && (issueFilters.externalObjectStatuses.length === 0 || externalObjectSummariesReady || !!externalObjectSummariesError);
-  const listError = sourceSearchError ?? (tab === "mine" ? mineIssuesError : touchedIssuesError)
+  const sourceView = tab === "mine" ? mineIssuesView : touchedIssuesView;
+  const listError = (sourceSearchView.kind === "error" ? sourceSearchError : null)
+    ?? (sourceView.kind === "error" ? sourceView.error : null)
     ?? (issueFilters.externalObjectStatuses.length > 0 ? externalObjectSummariesError : null);
-  const optionalSourceError = dismissalsError ?? approvalsError ?? joinRequestsError ?? runsError ?? contextIssuesError;
+  const rawOptionalSourceError = dismissalsError ?? approvalsError ?? joinRequestsError ?? runsError ?? contextIssuesError
+    ?? (tab === "mine" ? mineIssuesError : touchedIssuesError);
+  const optionalSourceError = isTransientError(rawOptionalSourceError) ? null : rawOptionalSourceError;
   const retryFailedSources = () => {
+    // Optional failures belong to the aggregate read, whose task rows stay usable.
+    if (tab === "mine" && (mineSnapshot?.failureError || mineSnapshot?.contextError)) {
+      void queryClient.refetchQueries({ queryKey: mineIssuesQueryKey, exact: true });
+    }
     // Retry only failed reads for this company; settled rows stay visible.
     void queryClient.refetchQueries({ predicate: (query) => query.state.status === "error"
       && query.queryKey.includes(selectedCompanyId), type: "active" });
   };
 
-  const revealScope = JSON.stringify([selectedCompanyId, tab, normalizedSearchQuery, issueFilters]);
+  const revealScope = JSON.stringify([currentUserId, selectedCompanyId, tab, normalizedSearchQuery, issueFilters]);
   const [revealedScope, setRevealedScope] = useState<string | null>(null);
   useEffect(() => {
     if (initialSourcesSettled && !listError) setRevealedScope(revealScope);
@@ -2856,7 +2893,7 @@ function StreamlinedInbox({
 
       {listError && (
         <div role="alert" className="flex items-center gap-2 text-sm text-destructive">
-          <p>Unable to load the inbox: {listError.message}</p>
+          <p>Unable to load the inbox: {describeError(listError).body}</p>
           <Button variant="outline" size="sm" onClick={() => { retryFailedSources(); if (externalObjectSummariesError) retryExternalObjectSummaries(); }}>Retry</Button>
         </div>
       )}
@@ -2962,7 +2999,7 @@ function StreamlinedInbox({
                     && blockerAttention?.state === "covered"
                   );
                   const rowStatusIcon = (
-                    <StatusIcon status={issue.status} displayStatus={issue.displayStatus} externalConversationState={issue.externalConversationState} blockerAttention={blockerAttention} size="md" />
+                    <StatusIcon {...taskStatusIconProps(issue)} blockerAttention={blockerAttention} size="md" />
                   );
                   return (
                     <IssueRow
@@ -3062,10 +3099,11 @@ function StreamlinedInbox({
                             <ChevronRight className={cn("h-3.5 w-3.5 transition-transform", isExpanded && "rotate-90")} />
                           </button>
                         ) : (
-                          <StatusIcon status={issue.status} displayStatus={issue.displayStatus} externalConversationState={issue.externalConversationState} blockerAttention={blockerAttention} size="md" />
+                          <StatusIcon {...taskStatusIconProps(issue)} blockerAttention={blockerAttention} size="md" />
                         )
                       ) : undefined}
                       unreadState={isUnread ? "visible" : isFading ? "fading" : "hidden"}
+                      showUnreadIndicator={false}
                       onMarkRead={() => markReadMutation.mutate(issue.id)}
                       onArchive={allowArchive ? () => archiveIssueMutation.mutate(issue.id) : undefined}
                       archiveDisabled={isArchiving}

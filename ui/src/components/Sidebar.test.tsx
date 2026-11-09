@@ -8,6 +8,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Sidebar } from "./Sidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
+vi.mock("@/hooks/useCoordinatorWorkspaceEnabled", () => ({
+  useCoordinatorWorkspaceEnabled: () => ({ enabled: false, loaded: true, userId: "viewer" }),
+}));
+
 const mockHeartbeatsApi = vi.hoisted(() => ({
   liveRunsForCompany: vi.fn(),
 }));
@@ -359,11 +363,11 @@ describe("Sidebar", () => {
     });
   });
 
-  it("keeps the Inbox row, Workspaces and no chat surfaces while both PAP-670 flags are off", async () => {
+  it("keeps Chat, Inbox and Workspaces without the combined Tasks experiment", async () => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: true });
     const root = await renderSidebar();
 
-    expect([...container.querySelectorAll("a")].some((anchor) => anchor.getAttribute("href") === "/chats")).toBe(false);
+    expect([...container.querySelectorAll("a")].some((anchor) => anchor.getAttribute("href") === "/chats")).toBe(true);
     expect([...container.querySelectorAll("a")].some((anchor) => anchor.getAttribute("href") === "/inbox")).toBe(true);
     expect([...container.querySelectorAll("a")].some((anchor) => anchor.getAttribute("href") === "/workspaces")).toBe(true);
 
@@ -401,12 +405,12 @@ describe("Sidebar", () => {
       });
     });
 
-    it("does not render Workspaces anywhere in the nav, even with isolated workspaces on", async () => {
+    it("keeps Workspaces available beside Chat when isolated workspaces are on", async () => {
       mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableAgentChat: true, enableIsolatedWorkspaces: true });
       const root = await renderSidebar();
 
-      expect(container.textContent).not.toContain("Workspaces");
-      expect([...container.querySelectorAll("a")].some((anchor) => anchor.getAttribute("href") === "/workspaces")).toBe(false);
+      expect(container.textContent).toContain("Workspaces");
+      expect([...container.querySelectorAll("a")].some((anchor) => anchor.getAttribute("href") === "/workspaces")).toBe(true);
 
       flushSync(() => {
         root.unmount();
@@ -459,11 +463,11 @@ describe("Sidebar", () => {
       });
     });
 
-    it("adds no chat surfaces while Agent Chat is off", async () => {
+    it("keeps Chat available despite a retired off value", async () => {
       mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableCombinedInboxTasks: true, enableAgentChat: false });
       const root = await renderSidebar();
 
-      expect([...container.querySelectorAll("a")].some((anchor) => anchor.getAttribute("href") === "/chats")).toBe(false);
+      expect([...container.querySelectorAll("a")].some((anchor) => anchor.getAttribute("href") === "/chats")).toBe(true);
 
       flushSync(() => {
         root.unmount();
@@ -519,7 +523,7 @@ describe("Sidebar", () => {
     const labels = (section: Element | undefined) => [...(section?.querySelectorAll("a") ?? [])]
       .map((anchor) => anchor.textContent?.trim());
 
-    expect(labels(workSection)).toEqual(["Tasks", "Projects", "Routines", "Artifacts"]);
+    expect(labels(workSection)).toEqual(["Chat", "Tasks", "Projects", "Routines", "Artifacts"]);
     expect(labels(orgSection)).toEqual(["Agents", "Skills", "Connectors", "Usage", "Audit"]);
     // Usage is reachable in the streamlined shell and pinned before Audit.
     expect(orgSection?.querySelector('a[href="/usage"]')).toBeTruthy();
