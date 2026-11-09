@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as codexSecurity from "../drivers/codex/codex-security-config.js";
 
-import { buildNativeModelEnvelope, parseNativeExecutionInput, type NativeExecutionInput, type NativeExecutionInputV1, type NativeExecutionInputV2 } from "../contracts/native-execution.js";
+import { buildNativeModelEnvelope, parseNativeExecutionInput, type NativeExecutionInput, type NativeExecutionInputV1, type NativeExecutionInputV2, type NativeExecutionInputV5 } from "../contracts/native-execution.js";
 import { NATIVE_RUNTIME_ASSET_SCHEMA, PAPERCLIP_EXECUTION_PROMPT, PAPERCLIP_EXECUTION_PROMPT_REVISION, nativeRuntimePromptDigest, canonicalNativeRuntimeContextDigest, composeNativeSystemInstructions } from "../contracts/runtime-context.js";
 
 const contextRoots: string[] = [];
@@ -833,7 +833,7 @@ describe("native backend factory", () => {
   it("keeps the durable OpenCode effort on the transport channel instead of the Codex driver session", async () => {
     const input = preparedExecution({
       ...opencodeExecution(),
-      provider: { kind: "opencode", model: "paperclip/team/model", permissionMode: "allow", reasoningEffort: "high" },
+      provider: { kind: "opencode", model: "paperclip/team/model", permissionMode: "allow", reasoningEffort: "high" } as NativeExecutionInputV5["provider"],
     }, "v9");
     if (input.schema !== "paperclip.native-execution-input.v9" || input.provider.kind !== "opencode" || input.provider.reasoningEffort !== "high") throw new Error("invalid fixture");
     const transport = new FakeCodexTransport("thread-1", "provider-session-1", {
@@ -845,7 +845,7 @@ describe("native backend factory", () => {
       environment: { PAPERCLIP_WORKSPACE_CWD: WORKSPACE },
     });
     const session = await backend.openSession({
-      identity: { companyId: "company", agentId: "agent", runId: "run", sessionId: "session" },
+      identity: { companyId: "company", issueId: "issue", agentId: "agent", runId: "run", sessionId: "session" },
       workingDirectory: WORKSPACE,
     });
     try {

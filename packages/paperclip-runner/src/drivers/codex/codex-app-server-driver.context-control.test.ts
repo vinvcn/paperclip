@@ -59,8 +59,7 @@ describe("Codex app-server Codex driver", () => {
   });
 
   it("selects the durable OpenCode task effort for the requested turn", async () => {
-    const transport = new FakeCodexTransport();
-    transport.supportsTurnReasoning = () => true;
+    const transport = Object.assign(new FakeCodexTransport(), { supportsTurnReasoning: () => true });
     const session = await makeDriver([transport], { model: "paperclip/team/model", reasoningEffort: "max" }).openSession({
       runId: "run-opencode-effort", normalizedSessionId: "normalized-opencode-effort", workingDirectory: WORKSPACE,
     });

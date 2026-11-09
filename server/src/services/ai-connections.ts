@@ -35,6 +35,7 @@ import {
   type AiConnectionBinding,
   type AiConnectionAttribution,
   type AiConnectionMetadata,
+  newAiProviderRoutingModel,
   type AiProviderRoutingModel,
   type AiManagedConnectionSummary,
   type AiConnectionAccountIdentity,
@@ -52,6 +53,7 @@ import { secretService } from "./secrets.js";
 import { resolvePoolSlotValue, selectAssignablePoolSlot } from "./ai-credential-pool.js";
 import { probeAiConnectionUsage } from "./ai-connection-usage.js";
 import { probeAiAccountIdentity } from "./ai-account-identity.js";
+import { assertAiCredentialCleanupSettled } from "./retained-ai-credential-cleanup.js";
 
 /** Same human audience displayed by the existing Connections identity controls. */
 function canUseCredential(
@@ -191,8 +193,10 @@ export function aiConnectionService(db: Db) {
       if (!current) throw notFound("AI connection not found");
       const metadata = aiConnectionMetadataSchema.parse(current.config.ai);
       if (!metadata.routing) throw unprocessable("This connection does not have a model catalog");
+      const existingIds = new Set(metadata.routing.models.map(model => model.id));
+      const updatedModels = models.map(model => existingIds.has(model.id) ? model : newAiProviderRoutingModel(model));
       await tx.update(toolConnections).set({
-        config: { ...current.config, ai: { ...metadata, routing: { ...metadata.routing, models } } },
+        config: { ...current.config, ai: { ...metadata, routing: { ...metadata.routing, models: updatedModels } } },
         updatedAt: new Date(),
       }).where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, companyId)));
       await logActivity(tx as unknown as Db, {
@@ -309,6 +313,8 @@ export function aiConnectionService(db: Db) {
     binding: AiConnectionBinding;
   }) {
     const { companyId, userId, agentId, binding } = input;
+    if (binding.mode !== "responsible_user" && binding.mode !== "delegated" && binding.mode !== "shared")
+      throw aiConnectionConfigurationFailure("ai_connection_incompatible", "Select a supported AI connection binding");
     if (
       !isAiConnectionCompatible(
         binding,
@@ -1081,12 +1087,11 @@ export function aiConnectionService(db: Db) {
       };
     }
     if (!metadata.success || !["openai", "google"].includes(metadata.data.provider) || metadata.data.method !== "subscription") return credential(row);
-    // Only an existing pending recovery needs the transaction/mutation fences.
-    // Ordinary reads must not take a company file lock or database row lock.
     if (!(await quotaCredentialRecovery(row.connection.companyId, row.grant.id).read()))
       return credential(row);
     let savingReplacement = false;
     return withAccountHomeSecretMutationLock(undefined, row.connection.companyId, async () => {
+      assertAiCredentialCleanupSettled({ companyId: row.connection.companyId, accountKey: row.grant.id });
       if (metadata.data.provider === "google") {
         const recovery = quotaCredentialRecovery(row.connection.companyId, row.grant.id);
         const pending = await recovery.read();

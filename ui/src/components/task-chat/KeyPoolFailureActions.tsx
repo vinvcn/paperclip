@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/popover";
 import { KeyPoolSlotList } from "@/components/ai-connections/KeyPoolSlotList";
 import { useConnectionModels } from "@/components/ai-connections/useConnectionModels";
+import { QueryErrorState, useQueryView } from "@/components/QueryView";
 
 /**
  * The four dedicated recovery actions on a pooled-key failure (ticket 06):
@@ -51,6 +52,7 @@ export function KeyPoolFailureActions({
     queryFn: ({ signal }) => aiConnectionsApi.keySlots(companyId, connectionId!, { signal }),
     enabled: statusOpen && Boolean(connectionId),
   });
+  const statusView = useQueryView(status);
   const models = connectionModels?.models ?? [];
   // "Try again" re-runs the exact failed request while the assignment matrix
   // steers around the just-failed slot for that one wakeup. Only meaningful
@@ -133,12 +135,12 @@ export function KeyPoolFailureActions({
             <p className="mb-2 text-xs text-muted-foreground">
               Live slot status for this connection's key pool.
             </p>
-            {status.isPending ? (
+            {statusView.kind === "loading" || statusView.kind === "reconnecting" ? (
               <p role="status" className="text-sm text-muted-foreground">Loading keys…</p>
-            ) : status.isError ? (
-              <p role="alert" className="text-sm text-destructive">Key status could not be loaded.</p>
+            ) : statusView.kind === "error" ? (
+              <QueryErrorState size="inline" error={status.error} action="load key status" onRetry={statusView.retry} retrying={statusView.isFetching} />
             ) : (
-              <KeyPoolSlotList slots={status.data?.slots ?? []} />
+              <KeyPoolSlotList slots={statusView.data?.slots ?? []} />
             )}
           </PopoverContent>
         </Popover>

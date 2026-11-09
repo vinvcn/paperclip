@@ -98,7 +98,10 @@ export function readComposerRunSettings(overrides: IssueAssigneeAdapterOverrides
     model: typeof config.model === "string" ? config.model : null,
     effort: typeof effortValue === "string" ? effortValue : null,
     fast: adapterType === "codex_local" && config.fastMode === true,
-    keySlot: typeof overrides?.keySlot === "number" ? overrides.keySlot : null,
+    // Persisted preferences omit an untouched pin rather than turning it into
+    // a write of private override options; composer controls retain null for
+    // their automatic-assignment display default.
+    ...(overrides?.keySlot === null || typeof overrides?.keySlot === "number" ? { keySlot: overrides.keySlot } : {}),
   };
 }
 

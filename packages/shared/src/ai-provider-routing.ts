@@ -12,6 +12,13 @@ export const aiProviderRoutingModelSchema = z.object({
   }).strict().optional(),
 }).strict();
 export type AiProviderRoutingModel = z.infer<typeof aiProviderRoutingModelSchema>;
+export function newAiProviderRoutingModel(model: Pick<AiProviderRoutingModel, "id"> & Partial<Omit<AiProviderRoutingModel, "id">>): AiProviderRoutingModel {
+  return {
+    ...model,
+    limit: { context: 262144, output: 65536, ...model.limit },
+    options: { reasoningEffort: "max", ...model.options },
+  };
+}
 export const aiConnectionModelsUpdateSchema = z.object({
   models: z.array(aiProviderRoutingModelSchema).max(200),
 }).strict();

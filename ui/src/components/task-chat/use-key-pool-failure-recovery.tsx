@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   aiConnectionBindingSchema,
   aiRoutingHarness,
@@ -7,12 +7,12 @@ import {
   type IssueAssigneeAdapterOverrides,
   type KeyPoolFailureSnapshot,
 } from "@paperclipai/shared";
-import { agentsApi } from "@/api/agents";
 import { issuesApi } from "@/api/issues";
 import { useToastActions } from "@/context/ToastContext";
 import { queryKeys } from "@/lib/queryKeys";
 import { switchModelRetryOverrides } from "./composer-run-settings";
 import { KeyPoolFailureActions } from "./KeyPoolFailureActions";
+import { useFailedRunRetry } from "./use-failed-run-retry";
 
 /** The failed-run context a key-pool recovery action needs: which agent owns
  * the run (the wake route revalidates the run↔agent pairing server-side) and
@@ -41,47 +41,7 @@ export function useKeyPoolFailureRecovery(options: {
   const { companyId, issueId, runsQueryRef, assigneeAdapterOverrides, resolveFailedRun } = options;
   const queryClient = useQueryClient();
   const { pushToast } = useToastActions();
-  const retryFailedRun = useMutation({
-    mutationFn: async ({ runId, avoidKeySlot }: { runId: string; avoidKeySlot?: number | null }) => {
-      const failedRun = resolveFailedRun(runId);
-      if (!failedRun) throw new Error("Failed run is no longer available.");
-      return agentsApi.retryFailedRun(
-        failedRun.agentId,
-        runId,
-        companyId,
-        // "Try again" avoids the failed pool slot once; a switch-key retry
-        // passes null and the pool picks freely.
-        { avoidKeySlot },
-      );
-    },
-    onSuccess: (result) => {
-      if (!result.runId) {
-        pushToast({
-          title: "Retry queued",
-          body: "The exact request will retry when this task is ready.",
-          tone: "success",
-        });
-      }
-    },
-    onSettled: () => {
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.issues.runs(runsQueryRef),
-      });
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.issues.liveRuns(runsQueryRef),
-      });
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.issues.activeRun(runsQueryRef),
-      });
-    },
-    onError: (error) => {
-      pushToast({
-        title: "Run retry failed",
-        body: error instanceof Error ? error.message : "Unable to retry run",
-        tone: "error",
-      });
-    },
-  });
+  const retryFailedRun = useFailedRunRetry({ companyId, runsQueryRef, resolveFailedRun });
 
   const renderActions = useCallback((input: {
     snapshot?: KeyPoolFailureSnapshot | null;
@@ -106,7 +66,7 @@ export function useKeyPoolFailureRecovery(options: {
         snapshot={snapshot}
         binding={binding}
         harness={harness}
-        retryPending={retryFailedRun.isPending && retryFailedRun.variables?.runId === runId}
+        retryPending={retryFailedRun.isPending && (typeof retryFailedRun.variables === "string" ? retryFailedRun.variables : retryFailedRun.variables?.runId) === runId}
         onRetry={({ avoidKeySlot }) =>
           retryFailedRun.mutateAsync({ runId, avoidKeySlot }).then(() => undefined)
         }

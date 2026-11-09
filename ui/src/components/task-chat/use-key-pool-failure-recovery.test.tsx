@@ -8,6 +8,7 @@ import { agentsApi } from "@/api/agents";
 import { issuesApi } from "@/api/issues";
 import { queryKeys } from "@/lib/queryKeys";
 import { useKeyPoolFailureRecovery } from "./use-key-pool-failure-recovery";
+import { useFailedRunRetry } from "./use-failed-run-retry";
 
 // Radix Popover relies on Pointer Capture APIs that jsdom omits.
 beforeAll(() => {
@@ -105,7 +106,7 @@ describe("useKeyPoolFailureRecovery", () => {
     runId?: string | null;
     resolveFailedRun?: (runId: string) => { agentId: string; agent?: Agent } | undefined;
   } = {}) => {
-    const observedRuns = new Map([["run-observed", { agentId: "agent-1", agent }]]);
+    const observedRuns = new Map([["runId", { agentId: "agent-1", agent }]]);
     const resolve = props.resolveFailedRun ?? ((runId: string) => observedRuns.get(runId));
     const component = (
       <QueryClientProvider client={client}>
@@ -118,7 +119,7 @@ describe("useKeyPoolFailureRecovery", () => {
             resolveFailedRun: resolve,
           }}
           snapshot={"snapshot" in props ? props.snapshot ?? null : snapshot}
-          runId={"runId" in props ? props.runId ?? null : "run-observed"}
+          runId={"runId" in props ? props.runId ?? null : "runId"}
         />
       </QueryClientProvider>
     );
@@ -143,7 +144,7 @@ describe("useKeyPoolFailureRecovery", () => {
     container.querySelector<HTMLElement>('[data-testid="key-pool-try-again"]')!.click();
     await flush();
     expect(retryFailedRun).toHaveBeenCalledExactlyOnceWith(
-      "agent-1", "run-observed", companyId, { avoidKeySlot: 3 },
+      "agent-1", "runId", companyId, { avoidKeySlot: 3 },
     );
     // The re-dispatch refreshes the runs surfaces the marker and banner read.
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.issues.runs(issueId) });
@@ -156,7 +157,7 @@ describe("useKeyPoolFailureRecovery", () => {
     container.querySelector<HTMLElement>('[data-testid="key-pool-switch-key"]')!.click();
     await flush();
     expect(retryFailedRun).toHaveBeenCalledExactlyOnceWith(
-      "agent-1", "run-observed", companyId, { avoidKeySlot: null },
+      "agent-1", "runId", companyId, { avoidKeySlot: null },
     );
     expect(updateIssue).not.toHaveBeenCalled();
   });
@@ -174,7 +175,7 @@ describe("useKeyPoolFailureRecovery", () => {
       assigneeAdapterOverrides: { adapterConfig: { model: "paperclip/model-two" } },
     });
     expect(retryFailedRun).toHaveBeenCalledExactlyOnceWith(
-      "agent-1", "run-observed", companyId, { avoidKeySlot: null },
+      "agent-1", "runId", companyId, { avoidKeySlot: null },
     );
   });
 
@@ -183,7 +184,27 @@ describe("useKeyPoolFailureRecovery", () => {
     expect(container.querySelector('[data-testid="key-pool-failure-actions"]')).toBeNull();
     expect(retryFailedRun).not.toHaveBeenCalled();
   });
+
+  it("keeps ordinary retry available without pool slot avoidance", async () => {
+  const invalidate = vi.spyOn(client, "invalidateQueries").mockResolvedValue(undefined as never);
+  await act(async () => {
+    root = createRoot(container);
+    root.render(<QueryClientProvider client={client}><OrdinaryRetryHarness /></QueryClientProvider>);
+  });
+  container.querySelector<HTMLButtonElement>("button")!.click();
+  await flush();
+  expect(retryFailedRun).toHaveBeenCalledExactlyOnceWith("agent-1", "run-observed", companyId, { avoidKeySlot: undefined });
+  expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.issues.runs(issueId) });
+  expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.issues.liveRuns(issueId) });
+  expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.issues.activeRun(issueId) });
+  expect(updateIssue).not.toHaveBeenCalled();
+  });
 });
+
+function OrdinaryRetryHarness() {
+  const retry = useFailedRunRetry({ companyId, runsQueryRef: issueId, resolveFailedRun: (id: string) => id === "run-observed" ? { agentId: "agent-1" } : undefined });
+  return <button onClick={() => retry.mutate("run-observed")}>Retry</button>;
+}
 
 function HookHarness(props: {
   options: Parameters<typeof useKeyPoolFailureRecovery>[0];

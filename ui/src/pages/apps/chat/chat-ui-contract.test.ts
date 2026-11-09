@@ -28,10 +28,12 @@ describe("chat connector UI contract", () => {
       expect(page).toContain("newRun.issueId");
     }
     const issue = source("../../IssueDetail.tsx");
-    expect(issue).toMatch(
-      /agentsApi\.retryFailedRun\(\s*failedRun\.agentId,\s*failedRun\.runId,\s*companyId/,
+    expect(issue).toContain("useFailedRunRetry({");
+    const retry = source("../../../components/task-chat/use-failed-run-retry.tsx");
+    expect(retry).toMatch(
+      /agentsApi\.retryFailedRun\(failedRun\.agentId,\s*runId,\s*companyId,\s*\{\s*avoidKeySlot\s*\}/,
     );
-    expect(issue).toContain("Retry queued");
+    expect(retry).toContain("Retry queued");
     for (const file of ["Inbox.tsx", "LegacyInbox.tsx"]) {
       const page = source(`../../${file}`);
       expect(page).toMatch(

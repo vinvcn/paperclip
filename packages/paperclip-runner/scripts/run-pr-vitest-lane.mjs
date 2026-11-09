@@ -91,6 +91,9 @@ if (laneMatch) {
 const plannedCommands = [
   { command: "pnpm", args: ["run", "ensure:eval-build-deps"], cwd: packageRoot },
   { command: "pnpm", args: ["run", "build:rust"], cwd: packageRoot },
+  ...(runNativeRunnerGroup
+    ? [{ command: "pnpm", args: ["run", "build:binary"], cwd: packageRoot }]
+    : []),
   ...(runPackageTests
     ? [{ command: "pnpm", args: ["exec", "vitest", "run", ...packageArgs], cwd: packageRoot }]
     : []),

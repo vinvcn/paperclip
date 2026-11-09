@@ -13,6 +13,7 @@ describe("usage capture sink", () => {
     ttftMs: 40,
     httpStatus: 200,
     providerRequestId: "up-1",
+    usageMissing: false,
     usage: { inputTokens: 10, cachedInputTokens: null, cacheWriteTokens: null, outputTokens: 4 },
   };
 

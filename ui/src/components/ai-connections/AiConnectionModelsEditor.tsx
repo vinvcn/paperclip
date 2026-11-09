@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import type { AiProviderRoutingModel } from "@paperclipai/shared";
+import { newAiProviderRoutingModel, type AiProviderRoutingModel } from "@paperclipai/shared";
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { QueryErrorState } from "@/components/QueryView";
 
 const efforts = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 
@@ -51,7 +52,7 @@ export function AiConnectionModelsEditor({ companyId, connectionId, models: init
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium">Model settings</h3>
-        <Button type="button" size="sm" variant="outline" onClick={() => { save.reset(); setModels(current => [...current, { id: "" }]); }}>Add model</Button>
+        <Button type="button" size="sm" variant="outline" onClick={() => { save.reset(); setModels(current => [...current, newAiProviderRoutingModel({ id: "" })]); }}>Add model</Button>
       </div>
       {models.length === 0 ? <p className="text-xs text-muted-foreground">No models declared.</p> : null}
       <div className="space-y-3">
@@ -69,7 +70,7 @@ export function AiConnectionModelsEditor({ companyId, connectionId, models: init
       <div className="flex items-center justify-between"><Button type="button" variant="outline" size="sm" onClick={() => { save.reset(); setModels(cloneModels(initialModels)); }}>Reset</Button><Button type="button" size="sm" disabled={save.isPending || models.some(model => !model.id.trim()) || duplicate} onClick={() => save.mutate()}>{save.isPending ? "Saving…" : "Save models"}</Button></div>
       {ids.some(id => !id) ? <p role="alert" className="text-xs text-destructive">Model ID is required.</p> : null}
       {new Set(ids).size !== ids.length ? <p role="alert" className="text-xs text-destructive">Model IDs must be unique.</p> : null}
-      {save.isError ? <p role="alert" className="text-xs text-destructive">{save.error instanceof Error ? save.error.message : "Could not save models"}</p> : null}
+      {save.error ? <QueryErrorState size="inline" error={save.error} action="save models" /> : null}
       {save.isSuccess ? <p role="status" className="text-xs text-muted-foreground">Model settings saved.</p> : null}
     </div>
   );

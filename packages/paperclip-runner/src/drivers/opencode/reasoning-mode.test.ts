@@ -96,7 +96,7 @@ describe("per-turn OpenCode reasoning", () => {
       const config = JSON.parse(await readFile(join(root, "effort/config/opencode/opencode.json"), "utf8"));
       expect(config.provider.paperclip.models["team/model"].variants.max).toEqual({ reasoningEffort: "max" });
     } finally {
-      try { await session?.close(); }
+      try { await session?.close({ reason: "fixture complete" }); }
       finally { await rm(root, { recursive: true, force: true }); }
     }
   });

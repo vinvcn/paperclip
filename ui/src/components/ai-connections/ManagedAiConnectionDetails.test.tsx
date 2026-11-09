@@ -23,6 +23,7 @@ const account: AiManagedConnectionSummary = {
   name: "My account", ownership: "personal", isDefault: true, status: "connected",
 };
 const connection = { id: account.id, companyId: account.companyId } as ToolConnection;
+const session = { session: { id: "session", userId: "user" }, user: { id: "user", email: null, name: "User", image: null }, sentryDsn: null };
 const accounts = { currentUserId: "user", connections: [account], pools: [], canManageConnections: true };
 const grants = { currentUserId: "user", grants: [{ id: account.grantId }] };
 let root: ReturnType<typeof createRoot>;
@@ -40,7 +41,7 @@ beforeEach(() => {
   blocked = null;
   denied = false;
   signals = [];
-  vi.mocked(authApi.getSession).mockReset().mockResolvedValue({ user: { id: "user" } } as Awaited<ReturnType<typeof authApi.getSession>>);
+  vi.mocked(authApi.getSession).mockReset().mockResolvedValue(session);
   fetchMock.mockReset().mockImplementation((url: string, init: RequestInit) => {
     if (url.endsWith("/active-runs")) return Promise.resolve(Response.json([]));
     const kind = url.endsWith("/grants") ? "grants" : "accounts";
@@ -124,7 +125,7 @@ it("waits for session recovery before retrying an earlier account error", async 
   expect(host.querySelector('[aria-label="AI account settings"]')).toBeNull();
   denied = false;
   await act(async () => {
-    recover({ user: { id: "user" } } as Awaited<ReturnType<typeof authApi.getSession>>);
+    recover(session);
     await vi.advanceTimersByTimeAsync(10);
   });
   await act(async () => { await vi.advanceTimersByTimeAsync(10); });
@@ -208,9 +209,10 @@ it("shows the key slot pool for keyed connections and hides it for subscriptions
   await act(async () => {
     root.render(<QueryClientProvider client={client}><ManagedAiConnectionDetails connection={connection} /></QueryClientProvider>);
   });
-  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
-  expect(host.textContent).toContain("Keys");
-  expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/keys"))).toBe(true);
+  await vi.waitFor(() => {
+    expect(host.textContent).toContain("Keys");
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/keys"))).toBe(true);
+  });
 
   // Subscription connections pool nothing: no keys fetch, no Keys block.
   fetchMock.mockClear();

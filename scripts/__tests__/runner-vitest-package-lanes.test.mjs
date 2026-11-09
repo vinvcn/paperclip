@@ -51,6 +51,7 @@ test("package lanes form a complete, non-overlapping, balanced cover of the Vite
     assert.equal(plan.runNativeRunnerGroup, false);
     assert.deepEqual(plan.plannedCommands.slice(0, 2), prepCommands, "every package lane prepares debug fixtures");
     assert.ok(!plan.plannedCommands.some((command) => command.args.includes("general-server-native-runner")));
+    assert.ok(!plan.plannedCommands.some((command) => command.args.includes("build:binary")), "package lanes do not build the release binary");
     assert.equal(plan.packageLane.inventory, inventory.length);
     const vitest = plan.plannedCommands.filter((command) => command.args[0] === "exec");
     assert.equal(vitest.length, 1);
