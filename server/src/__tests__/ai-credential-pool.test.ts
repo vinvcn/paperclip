@@ -140,7 +140,7 @@ describe("runtimeCredential pool assignment", () => {
     const row = { connection, grant };
 
     // No pool: the original single-credential path is untouched.
-    await expect(service.runtimeCredential(row)).resolves.toMatchObject({ value: connectionKey, keySlot: null });
+    await expect(service.runtimeCredential(row)).resolves.toBe(connectionKey);
 
     // Pool with slots 2 and 1 (inserted out of order): selection is slot-ascending
     // for an untouched pool (no lease context → selection only, no lease writes).
@@ -162,7 +162,7 @@ describe("runtimeCredential pool assignment", () => {
     // Zero enabled slots: the pool is switched off, so the connection's own
     // credential serves again (ticket-01 fall-through, kept by ticket 02).
     await db.update(credentialPool).set({ enabled: false }).where(and(eq(credentialPool.companyId, companyId), eq(credentialPool.connectionId, account.connectionId), eq(credentialPool.slot, 2)));
-    await expect(service.runtimeCredential(row)).resolves.toMatchObject({ value: connectionKey, keySlot: null });
+    await expect(service.runtimeCredential(row)).resolves.toBe(connectionKey);
   });
 
   it("fast-fails provider_key_pool_exhausted when enabled slots exist but none can serve", async () => {
@@ -310,8 +310,11 @@ describe("key pool assignment matrix (ticket 02)", () => {
   };
   const newRun = async (agentId: string) => (await db.insert(heartbeatRuns).values({ companyId, agentId }).returning({ id: heartbeatRuns.id }))[0]!.id;
   /** Assignment inside a run: pin → sticky → exclusive lease → fast-fail. */
-  const lease = async (runId: string, agentId: string, pinnedSlot?: number, model: string = MODEL_A) =>
-    service.runtimeCredential(await connectionRow(), { pool: { heartbeatRunId: runId, agentId, pinnedSlot, model } });
+  const lease = async (runId: string, agentId: string, pinnedSlot?: number, model: string = MODEL_A): Promise<{ value: string; keySlot: number | null }> => {
+    const resolution = await service.runtimeCredential(await connectionRow(), { pool: { heartbeatRunId: runId, agentId, pinnedSlot, model } });
+    if (typeof resolution === "string") throw new Error("Expected a pooled slot resolution");
+    return resolution;
+  };
   /** Selection outside a run (no lease context, cooldowns still judged). */
   const select = async (model: string = MODEL_A) =>
     service.runtimeCredential(await connectionRow(), { pool: { model } });
@@ -562,10 +565,13 @@ describe("key pool one-shot avoid slot (ticket 06)", () => {
     return { connection, grant };
   };
   const newRun = async () => (await db.insert(heartbeatRuns).values({ companyId, agentId: agentA }).returning({ id: heartbeatRuns.id }))[0]!.id;
-  const lease = async (runId: string, input: { pinnedSlot?: number | null; avoidSlot?: number | null; model?: string } = {}) =>
-    service.runtimeCredential(await connectionRow(), {
+  const lease = async (runId: string, input: { pinnedSlot?: number | null; avoidSlot?: number | null; model?: string } = {}): Promise<{ value: string; keySlot: number | null }> => {
+    const resolution = await service.runtimeCredential(await connectionRow(), {
       pool: { heartbeatRunId: runId, agentId: agentA, pinnedSlot: input.pinnedSlot ?? null, avoidSlot: input.avoidSlot ?? null, model: input.model ?? MODEL_A },
     });
+    if (typeof resolution === "string") throw new Error("Expected a pooled slot resolution");
+    return resolution;
+  };
   const resetPool = async () => {
     await db.update(credentialPool).set({
       state: "healthy", cooldownUntil: null, cooldownReason: null, enabled: true,

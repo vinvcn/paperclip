@@ -68,6 +68,7 @@ const diagnosticNativeFixture = vi.hoisted(() => ({
   beforeWarmClose: undefined as (() => Promise<void>) | undefined,
   backendOptions: undefined as Parameters<typeof import("../../vendor/paperclip-runner/index.js").createNativeSessionBackend>[1],
 }));
+vi.mock("../native-runtime/native-codex-runner.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../native-runtime/native-codex-runner.js")>();
   return { ...actual, resolvePaperclipRunnerBinary: () => diagnosticNativeFixture.enabled ? process.execPath : actual.resolvePaperclipRunnerBinary() };
 });

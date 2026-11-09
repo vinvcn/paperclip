@@ -519,7 +519,7 @@ describe("managed AI connections", () => {
       expect(cleanup).not.toHaveBeenCalled();
       retired.resolve(); await reconcileRetainedAiCleanup(scope);
       expect(cleanup).toHaveBeenCalledOnce();
-      await expect(service.runtimeCredential(row)).resolves.toMatchObject({ value: auth });
+      await expect(service.runtimeCredential(row)).resolves.toBe(auth);
     } finally { retired.resolve(); await reconcileRetainedAiCleanup(scope).catch(() => {}); }
   });
 
@@ -798,7 +798,7 @@ describe("managed AI connections", () => {
         ownership: "personal", name: owner, loginSessionId: "fixture", agentIds: [], allAgents: true }, signedIn);
       const [current] = await receiver.quotaAccounts(companyId, owner);
       expect(current.grant.status).toBe("active");
-      expect(await receiver.runtimeCredential(current)).toMatchObject({ value: signedIn });
+      expect(await receiver.runtimeCredential(current)).toBe(signedIn);
       expect(request).toHaveBeenCalledTimes(1);
       expect((await db.select().from(companySecretVersions).where(eq(companySecretVersions.secretId, ref.secretId))).map(version => version.version).sort()).toEqual([1, 2]);
     } finally {
@@ -945,7 +945,7 @@ describe("managed AI connections", () => {
     const signedIn = JSON.stringify({ tokens: { access_token: "process-sign-in", refresh_token: "process-new-login" } });
     await receiver.save(companyId, owner, { connectionId: row.connection.id, provider: "openai", method: "subscription", ownership: "personal", name: owner, loginSessionId: "fixture", agentIds: [], allAgents: true }, signedIn);
     const [current] = await receiver.quotaAccounts(companyId, owner);
-    expect(await receiver.runtimeCredential(current)).toMatchObject({ value: signedIn });
+    expect(await receiver.runtimeCredential(current)).toBe(signedIn);
   }, 40_000);
 
   it("does not exchange a token when a required database transaction fails", async () => {
@@ -1214,7 +1214,7 @@ describe("managed AI connections", () => {
     } else if (kind === "recovery") {
       const recovery = quotaCredentialRecovery(companyId, row.grant.id);
       await recovery.write({ companyId, grantId: row.grant.id, connectionId: row.connection.id, secretId: ref.secretId, baseHash: quotaCredentialHash(auth("old", 10)), value: auth("fresh", 11) });
-      expect(await service.runtimeCredential(row)).toMatchObject({ value: auth("fresh", 11) });
+      expect(await service.runtimeCredential(row)).toBe(auth("fresh", 11));
     } else {
       const runtime = await prepareManagedAiRuntime(db, { companyId, agentId, responsibleUserId: owner, adapterType: "codex_local", binding: { provider: "openai", method: "subscription", mode: "responsible_user" }, config: {} });
       await writeFile(path.join(String(runtime.config.env.CODEX_HOME), "auth.json"), auth("fresh", 11));
@@ -1710,7 +1710,7 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     await db.update(toolConnections).set({ config: { ...before.config, ai: { provider: "openai", method: "api_key", routing: { kind: "gateway", protocol: "responses", auth: "bearer", baseUrl: "https://catalog.example/v1" } } } as never }).where(eq(toolConnections.id, account.connectionId));
     const [legacy] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
     expect(legacy.config.ai).not.toHaveProperty("models");
-    expect(legacy.config.ai.routing).not.toHaveProperty("models");
+    expect((legacy.config.ai as { routing: Record<string, unknown> }).routing).not.toHaveProperty("models");
     const models = [{ id: "new-model", label: "New model", limit: { context: 8192, output: 1024 } }];
     await service.updateModels(companyId, account.connectionId, models);
     const [after] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
@@ -1728,7 +1728,7 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     const routed = await service.save(companyId, "alice", { provider: "openrouter", method: "api_key", name: "Scope guard", ownership: "personal", allAgents: true, agentIds: [], routing: { kind: "openrouter", protocol: "chat", auth: "bearer", models: [] } }, "scoped-credential");
     await expect(service.updateModels(otherCompanyId, routed.connectionId, [])).rejects.toMatchObject({ status: 404 });
     const [unchanged] = await db.select().from(toolConnections).where(eq(toolConnections.id, routed.connectionId));
-    expect(unchanged.config.ai.routing.models).toEqual([]);
+    expect((unchanged.config.ai as { routing: { models: unknown[] } }).routing.models).toEqual([]);
   });
 
   it("records model changes and rolls back when activity logging fails", async () => {
@@ -1736,7 +1736,7 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     const account = await service.save(companyId, "alice", { provider: "openrouter", method: "api_key", name: "Audited catalog", ownership: "personal", allAgents: true, agentIds: [], routing: { ...routing, models: [...routing.models] } }, "catalog-audit-credential");
     await service.updateModels(companyId, account.connectionId, [{ id: "after-model" }], { audit: { actorType: "user", actorId: "alice" } } as never);
     const [updated] = await db.select().from(toolConnections).where(eq(toolConnections.id, account.connectionId));
-    expect(updated.config.ai.routing.models).toEqual([{ id: "after-model" }]);
+    expect((updated.config.ai as { routing: { models: unknown[] } }).routing.models).toEqual([{ id: "after-model" }]);
     const audits = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, account.connectionId), eq(activityLog.action, "ai_connection.models_updated")));
     expect(audits).toHaveLength(1);
     await db.execute(sql`create function ai_models_audit_failure() returns trigger language plpgsql as $$ begin raise exception 'model audit failure'; end $$`);

@@ -72,7 +72,6 @@ export const AI_AUTH_ENV_KEYS = [
   "OPENCODE_CONFIG",
   "OPENCODE_CONFIG_DIR",
   "PAPERCLIP_OPENCODE_PROVIDERS",
-  "PAPERCLIP_OPENCODE_MODEL_CONFIG",
   "PAPERCLIP_PI_PROVIDERS",
   "ANTHROPIC_BASE_URL",
   "OPENAI_BASE_URL",
@@ -335,9 +334,7 @@ export async function prepareManagedAiRuntime(
       // against a concurrent reconnect or explicit rotation.
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const before = await readFreshness();
-        const ownership = managedProbeCredentialLocks.getStore();
         const resolution = await service.runtimeCredential(selection, {
-          ...(ownership?.active && ownership.companyId === input.companyId ? { credentialLockHeld: true as const } : {}),
           // The run's exclusive key-pool lease: assignment, stickiness and the
           // projected PAPERCLIP_AI_PROVIDER_KEY_SLOT all key off this context.
           // The target model drives (slot, model) cooldown eligibility.
@@ -349,7 +346,13 @@ export async function prepareManagedAiRuntime(
             model: typeof input.config.model === "string" ? input.config.model : null,
           },
         });
-        const value = resolution.value;
+        const value = typeof resolution === "string" ? resolution : resolution.value;
+        const keySlot = typeof resolution === "string" ? null : resolution.keySlot;
+        const after = await readFreshness();
+        if (before && after && before.version === after.version && before.epoch === after.epoch) {
+          return { value, freshness: after, keySlot };
+        }
+        if (!before || before.epoch !== after?.epoch) break;
       }
       throw unprocessable("The AI credential changed during preparation; retry this execution");
     })();
@@ -461,15 +464,7 @@ export async function prepareManagedAiRuntime(
       .digest("hex")
       .slice(0, 16);
     const identity = `${selection.grant.id}:${input.responsibleUserId ?? "shared"}:${generation}`;
-    // Pooled credentials must bind the warm session to its slot: the session
-    // captured one key at creation (opencode driver builds the provider proxy
-    // from the session-time environment once), so a later run resolved to a
-    // different slot gets a different sessionIdentity and the stored identity
-    // comparison forces a session rebuild instead of reusing the old key.
-    // per_turn lifecycle sessions are short-lived and unaffected by default.
-    const sessionIdentity = `${selection.grant.id}:${input.responsibleUserId ?? "shared"}:${
-      noAuth ? "no-auth" : keySlot !== null ? `pool-slot-${keySlot}:${credentialRef!.secretId}:${freshness!.epoch}` : `${credentialRef!.secretId}:${freshness!.epoch}`
-    }`;
+    const sessionIdentity = `${selection.grant.id}:${input.responsibleUserId ?? "shared"}:${noAuth ? "no-auth" : keySlot !== null ? `pool-slot-${keySlot}:${credentialRef!.secretId}:${freshness!.epoch}` : `${credentialRef!.secretId}:${freshness!.epoch}`}`;
     let homeRemoved = false;
     let ownsGoogleRecovery = false;
     let removalOnly = false;
@@ -642,8 +637,6 @@ export async function prepareManagedAiRuntime(
     })().finally(() => { cleanupRunning = undefined; });
     return {
       sessionIdentity,
-      // The key-pool slot this runtime's credential came from (null when the
-      // connection has no pool); mirrored into env.PAPERCLIP_AI_PROVIDER_KEY_SLOT.
       keySlot,
       ...(retainedCleanupScope ? { retainedCleanupScope } : {}),
       ...(subscriptionFile && input.binding.provider === "openai" && credentialRef && freshness ? {

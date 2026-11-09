@@ -166,7 +166,7 @@ describeEmbeddedPostgres("heartbeat plugin storage local execution", () => {
       throw new Error(`Unexpected storage provider call: ${method}`);
     });
     const workerManager = { isRunning: () => true, getWorker: () => ({ supportedMethods: ["workspaceOperation"] }), call } as unknown as PluginWorkerManager;
-    const entered = vi.fn(() => { throw new Error("synthetic_native_boundary_reached"); });
+    const entered = vi.fn((..._args: unknown[]) => { throw new Error("synthetic_native_boundary_reached"); });
     const heartbeat = heartbeatService(db, { pluginWorkerManager: workerManager, nativeSessionBackendFactory: entered });
     heartbeats.push(heartbeat);
     const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", contextSnapshot: { issueId, projectId } });
@@ -229,7 +229,7 @@ describeEmbeddedPostgres("heartbeat plugin storage local execution", () => {
       throw new Error(`Unexpected storage provider call: ${method}`);
     });
     const workerManager = { isRunning: () => true, getWorker: () => ({ supportedMethods: ["workspaceOperation"] }), call } as unknown as PluginWorkerManager;
-    const entered = vi.fn(() => { throw new Error("synthetic_native_boundary_reached"); });
+    const entered = vi.fn((..._args: unknown[]) => { throw new Error("synthetic_native_boundary_reached"); });
     const heartbeat = heartbeatService(db, { pluginWorkerManager: workerManager, nativeSessionBackendFactory: entered });
     heartbeats.push(heartbeat);
     const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", contextSnapshot: { issueId, projectId } });

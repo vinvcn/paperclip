@@ -501,7 +501,6 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     }
     const runStatus = HEARTBEAT_RUN_STATUSES.find(status => status === run?.status);
     const changedAt = taskInterruptionChangedAt(facts);
-    const changedAt = taskInterruptionChangedAt(facts);
     if (presentation?.responsibility === "system" && presentation.state === "failed" && run && runStatus
         && (changedAt === null || changedAt > now - TASK_INTERRUPTION_REPORT_WINDOW_MS)) {
       captureTaskInterruptionFailure({ companyId, taskId: issue.id, agentId: run.agentId,

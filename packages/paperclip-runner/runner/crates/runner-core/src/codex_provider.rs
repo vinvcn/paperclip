@@ -1637,11 +1637,6 @@ impl CodexProvider {
                                 bounded_method(&method)
                             )));
                         }
-                            return Err(LocalRunnerError::invalid(format!(
-                                "Codex warm run attachment observed unsafe post-terminal provider method {}",
-                                bounded_method(&method)
-                            )));
-                        }
                         if matches!(
                             method.as_str(),
                             "thread/tokenUsage/updated"
@@ -1656,12 +1651,12 @@ impl CodexProvider {
                         }
                         if let Some(frame_id) = self.take_provider_trace_frame_id() {
                             self.record_provider_trace_interpretation(
-                            frame_id,
-                            "codex.warm_attachment.completed_turn_tail",
-                            "ignored",
-                            Vec::new(),
-                            "Provider emitted a bounded tail notification after the prior turn terminal and before run attachment",
-                        );
+                                frame_id,
+                                "codex.warm_attachment.completed_turn_tail",
+                                "ignored",
+                                Vec::new(),
+                                "Provider emitted a bounded tail notification after the prior turn terminal and before run attachment",
+                            );
                         }
                     }
                     Some(CodexProviderEvent::ResourceLimit { .. }) => {

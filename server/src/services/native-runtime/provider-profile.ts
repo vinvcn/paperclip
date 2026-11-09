@@ -239,7 +239,6 @@ export function validatePaperclipRunnerGrokConfig(config: Record<string, unknown
 
 /** A task may change a Runner model (and supported effort), but not provider identity. */
 export function projectPaperclipRunnerTaskConfig(
-export function projectPaperclipRunnerTaskConfig(
   backend: "codex_app_server" | "opencode_server" | "acpx_runtime" | "cursor_cloud_api",
   agentConfig: unknown,
   taskOverrides: unknown,

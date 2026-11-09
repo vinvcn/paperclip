@@ -3,6 +3,7 @@ import { classifyRunRateLimitFailure, releaseRunPoolLease } from "../ai-credenti
 import { allocateRunCosts, sweepRunUsageRequestLogEvents } from "../usage-request-logs.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
+import { nativeTaskSessionPublicationHandled } from "../native-runtime/native-task-session-publication.js";
 import { boundOriginalMessage, describeRefusedExactResume, interruptedExactResumeCause } from "../native-runtime/native-exact-resume-failure.js";
 import { settledResponsePublicationSql } from "../native-runtime/native-response-publication-receipt.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";

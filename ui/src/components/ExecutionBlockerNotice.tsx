@@ -1,3 +1,4 @@
+import { describeError } from "../api/errors";
 import type { TaskInterruptionPresentation } from "@paperclipai/shared";
 import { keyPoolFailureCopy } from "@paperclipai/shared";
 import { AlertCircle } from "lucide-react";
@@ -5,6 +6,13 @@ import { Button } from "./ui/button";
 import { cn } from "../lib/utils";
 import { useSecondTick } from "../hooks/useSecondTick";
 import { TaskProjectAccessNotice } from "./TaskProjectAccessNotice";
+import { ProviderFailureNotice } from "./ProviderFailureNotice";
+
+const recoveryStepText: Record<NonNullable<TaskInterruptionPresentation["recoveryStep"]>, string> = {
+  checking_previous_run: "Checking that the previous attempt stopped",
+  saving_previous_files: "Saving files from the previous attempt",
+  finishing_recovery: "Finishing recovery of saved work",
+};
 
 /** One ordinary interruption surface. Technical records remain in diagnostics. */
 export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, agentName, projectName, keyPoolActions }: {
@@ -26,7 +34,7 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
   if (presentation?.projectAccess && !optimistic && !takingLonger) return <TaskProjectAccessNotice
     access={presentation.projectAccess} issueId={issueId} agentName={agentName} projectName={projectName}
     canRetry={canRetry && presentation.canRetry} onRetry={onRetry} error={error} className={className} />;
-  if (error && !optimistic && !takingLonger) return <div role="alert" className={cn("flex items-center justify-between gap-2 text-sm text-destructive", className)}><span>{error.message}</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>}</div>;
+  if (error && !optimistic && !takingLonger) return <div role="alert" className={cn("flex items-center justify-between gap-2 text-sm text-destructive", className)}><span>{describeError(error).body}</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>}</div>;
   if (takingLonger) return <div role="status" className={cn("flex items-center justify-between gap-2 text-sm text-muted-foreground", className)}><span>Taking longer than usual…</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry}>Retry</Button>}</div>;
   // Ticket 05 (demo): pooled-key failures surface the pool snapshot inline.
   // Ticket 06: the host supplies the dedicated recovery actions through

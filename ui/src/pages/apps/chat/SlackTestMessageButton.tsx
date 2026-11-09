@@ -49,7 +49,6 @@ export function SlackTestMessageButton({ endpointId }: { endpointId: string }) {
   }, [confirmed, send.isPending, send.error]);
   const reset = () => { setRequestId(randomId()); send.reset(); };
   const startTest = () => {
-  const startTest = () => {
     if (invitationExpired) {
       const next = randomId(); setRequestId(next);
       send.mutate({ requestId: next, slackUserId: selected });

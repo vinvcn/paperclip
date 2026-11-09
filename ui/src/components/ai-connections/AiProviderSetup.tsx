@@ -16,6 +16,7 @@ import { QueryErrorState, useQueryView } from "@/components/QueryView";
 import { ConnectionChoiceList } from "@/features/connections/ConnectionChoiceList";
 import { ConnectionAccessDefaults, connectionDefaultSummarySentence } from "@/features/connections/ConnectionSetupFlow";
 import { AppLogo } from "@/pages/apps/AppLogo";
+import { queryKeys } from "@/lib/queryKeys";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -166,7 +167,11 @@ export function AiProviderSetup({
     method?: "api_key" | "subscription";
   }) => {
     void client.invalidateQueries({ queryKey: ["ai-connections", companyId] });
-    void client.invalidateQueries({ queryKey: ["tools"] });
+    void Promise.all([
+      queryKeys.tools.connections(companyId),
+      queryKeys.tools.applications(companyId),
+      queryKeys.tools.gateways(companyId),
+    ].map(queryKey => client.invalidateQueries({ queryKey })));
     onComplete({
       provider: nativeProvider,
       method: result.method ?? "api_key",

@@ -46,7 +46,6 @@ import { forbidden, notFound, unprocessable } from "../errors.js";
 import { aiConnectionConfigurationFailure, aiConnectionCredentialNotSharedFailure } from "./ai-connection-configuration-failure.js";
 import { quotaCredentialRecovery, quotaCredentialHash } from "./quota-credential-recovery.js";
 import { prepareAntigravityCredentialRecovery } from "./native-runtime/antigravity-runner-credentials.js";
-import { assertAiCredentialCleanupSettled, reconcileRetainedAiCleanup } from "./retained-ai-credential-cleanup.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { secretService } from "./secrets.js";
@@ -177,7 +176,7 @@ export function aiConnectionService(db: Db) {
                   : ("connected" as const),
         },
       ];
-    });
+    }).sort((a, b) => a.id.localeCompare(b.id) || a.grantId.localeCompare(b.grantId));
   }
   async function updateModels(
     companyId: string,
@@ -480,6 +479,36 @@ export function aiConnectionService(db: Db) {
       if (!install) throw forbidden("Connection is not permitted for this agent");
     }
     return { ...row, provider };
+  }
+  async function selectImageGeneration(input: {
+    companyId: string; connectionId: string; grantId: string;
+    userId: string | null; agentId: string;
+  }) {
+    const [row] = await db.select({ connection: toolConnections, grant: connectionGrants })
+      .from(toolConnections).innerJoin(connectionGrants, and(
+        eq(connectionGrants.connectionId, toolConnections.id), eq(connectionGrants.companyId, toolConnections.companyId),
+      )).where(and(eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, input.connectionId),
+        eq(connectionGrants.id, input.grantId), eq(toolConnections.connectionPurpose, "ai"))).limit(1);
+    if (!row) throw unprocessable("AI connection unavailable", { code: "connection_unavailable" });
+    const metadata = aiConnectionMetadataSchema.safeParse(row.connection.config.ai);
+    if (!metadata.success || metadata.data.provider !== "openai" || metadata.data.method !== "api_key" || metadata.data.routing)
+      throw unprocessable("Image generation needs an OpenAI API-key connection", { code: "incompatible_connection" });
+    if (row.grant.status !== "active" || !row.connection.enabled || row.connection.status !== "active" || row.connection.healthStatus !== "ok")
+      throw unprocessable("Reconnect or enable this connection", { code: "connection_unavailable" });
+    if (!input.userId || !(await membership(input.companyId, input.userId))) throw forbidden("Active responsible user required");
+    if (row.grant.kind === "user" && !(await membership(input.companyId, row.grant.subjectUserId)))
+      throw forbidden("The account owner is no longer an active company member");
+    const audience = await db.select().from(connectionGrantMembers).where(and(
+      eq(connectionGrantMembers.companyId, input.companyId), eq(connectionGrantMembers.grantId, input.grantId),
+    ));
+    if (!canUseCredential(row.grant, input.userId, audience)) throw forbidden("Connection is not shared with this user");
+    const [install] = await db.select({ id: toolConnectionInstalls.id }).from(toolConnectionInstalls).where(and(
+      eq(toolConnectionInstalls.companyId, input.companyId), eq(toolConnectionInstalls.connectionId, input.connectionId),
+      or(and(eq(toolConnectionInstalls.targetType, "company"), eq(toolConnectionInstalls.targetId, input.companyId)),
+        and(eq(toolConnectionInstalls.targetType, "agent"), eq(toolConnectionInstalls.targetId, input.agentId))),
+    )).limit(1);
+    if (!install) throw forbidden("Connection is not permitted for this agent");
+    return row;
   }
   /** Internal fast-response use has its own capability check, never a pretend CLI harness. */
   async function selectFastResponse(input: {
@@ -1017,7 +1046,6 @@ export function aiConnectionService(db: Db) {
 
   /** Never hand a consumed token to a new provider while its replacement awaits commit. */
   async function runtimeCredential(row: Parameters<typeof credential>[0], options?: {
-    credentialLockHeld?: true;
     /** Key-pool assignment context: the run taking the exclusive lease, its
      * agent, the key-slot pin resolved from agent adapterConfig.keySlot or
      * the task's assigneeAdapterOverrides.keySlot, the one-shot avoid slot a
@@ -1025,7 +1053,7 @@ export function aiConnectionService(db: Db) {
      * model) cooldown governs eligibility. Omitted for resolutions outside a
      * run (selection only, no lease). */
     pool?: { agentId?: string | null; heartbeatRunId?: string | null; pinnedSlot?: number | null; avoidSlot?: number | null; model?: string | null };
-  }): Promise<{ value: string; keySlot: number | null }> {
+  }): Promise<string | { value: string; keySlot: number | null }> {
     const metadata = aiConnectionMetadataSchema.safeParse(row.connection.config.ai);
     // Key pool: a connection with pool slots resolves its key through the
     // ticket-02 assignment matrix (pin → sticky → exclusive lease → fast-fail)
@@ -1052,17 +1080,13 @@ export function aiConnectionService(db: Db) {
         keySlot: slot.slot,
       };
     }
-    if (!metadata.success || !["openai", "google"].includes(metadata.data.provider) || metadata.data.method !== "subscription") return { value: await credential(row), keySlot: null };
-    // Retirement callbacks acquire this same mutation lock to persist their
-    // final generation. Join them before taking the lock they need. A caller
-    // already holding it must only check, for both rotated-credential lanes.
-    const scope = { companyId: row.connection.companyId, accountKey: row.grant.id };
-    if (options?.credentialLockHeld) assertAiCredentialCleanupSettled(scope);
-    else await reconcileRetainedAiCleanup(scope);
+    if (!metadata.success || !["openai", "google"].includes(metadata.data.provider) || metadata.data.method !== "subscription") return credential(row);
+    // Only an existing pending recovery needs the transaction/mutation fences.
+    // Ordinary reads must not take a company file lock or database row lock.
+    if (!(await quotaCredentialRecovery(row.connection.companyId, row.grant.id).read()))
+      return credential(row);
     let savingReplacement = false;
     return withAccountHomeSecretMutationLock(undefined, row.connection.companyId, async () => {
-      // An owner can arrive while lock acquisition waits. Never join under it.
-      assertAiCredentialCleanupSettled(scope);
       if (metadata.data.provider === "google") {
         const recovery = quotaCredentialRecovery(row.connection.companyId, row.grant.id);
         const pending = await recovery.read();
@@ -1109,7 +1133,7 @@ export function aiConnectionService(db: Db) {
       });
       if (recovered) await quotaCredentialRecovery(row.connection.companyId, row.grant.id).clear()
         .catch(error => logger.warn({ err: error, grantId: row.grant.id }, "Saved runtime credential recovery cleanup pending"));
-      return { value, keySlot: null };
+      return value;
     }).catch(error => {
       // Once a matching replacement is found, a failed write or commit must
       // defer execution. Keep its journal so the next attempt can save it.
@@ -1300,5 +1324,5 @@ export function aiConnectionService(db: Db) {
       return [{ ...row, summary }];
     });
   }
-  return { list, selectDecision, selectFastResponse, selectPromptInjectionPrevention, quotaAccounts, subscriptionAccounts: (companyId: string, userId: string) => quotaAccounts(companyId, userId, true), refreshQuotaCredential, select, credential, runtimeCredential, probeUsage, accountIdentity, save, updateModels, setDefault, membership, markAuthenticationFailed };
+  return { list, selectDecision, selectFastResponse, selectImageGeneration, selectPromptInjectionPrevention, quotaAccounts, subscriptionAccounts: (companyId: string, userId: string) => quotaAccounts(companyId, userId, true), refreshQuotaCredential, select, credential, runtimeCredential, probeUsage, accountIdentity, save, updateModels, setDefault, membership, markAuthenticationFailed };
 }

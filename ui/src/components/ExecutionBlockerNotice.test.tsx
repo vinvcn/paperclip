@@ -139,6 +139,8 @@ describe("ordinary task interruption", () => {
     expect(container.textContent).toBe("");
     await render(rateLimited, { takingLonger: true });
     expect(container.textContent).toContain("Taking longer than usual…");
+  });
+
   it("shows workspace preparation failures as plain text while keeping retry permissions", async () => {
     const workspaceFailure = { message: 'Could not prepare the project folder <img src=x onerror=alert(1)>.' };
     await render({ ...failed, workspaceFailure }, { canRetry: false });

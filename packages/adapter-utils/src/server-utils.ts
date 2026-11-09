@@ -3772,10 +3772,13 @@ export async function resolvePaperclipSkillsDir(
   additionalCandidates: string[] = [],
 ): Promise<string | null> {
   const candidates = [
+    // Callers know their own packaged/source layout. Prefer that explicit root
+    // over the broad fallbacks: some of those can climb above a checkout into
+    // an unrelated sibling `skills` directory on the operator's machine.
+    ...additionalCandidates.map((candidate) => path.resolve(candidate)),
     ...PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES.map((relativePath) =>
       path.resolve(moduleDir, relativePath),
     ),
-    ...additionalCandidates.map((candidate) => path.resolve(candidate)),
   ];
   const seenRoots = new Set<string>();
 

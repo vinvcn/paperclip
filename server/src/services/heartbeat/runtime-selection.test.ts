@@ -768,7 +768,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(input.nativeRuntimeResolution.kind).toBe("native");
     const attribution = { connectionId: randomUUID(), grantId: randomUUID(), provider: credentialProvider, method,
       mode: "responsible_user" as const, responsibleUserId: "task-owner" };
-    input.config.managedAiRuntime = { sessionIdentity: "account:epoch-1", identity: "account:generation-1",
+    input.config.managedAiRuntime = { sessionIdentity: "account:epoch-1", identity: "account:generation-1", keySlot: null,
       config: { env: {}, managedAiConnection: { ...attribution, identity: "account:generation-1", sessionIdentity: "account:epoch-1" } },
       attribution, accountName: "Saved account", accountOwnerUserId: "task-owner", home: instructionRoot, cleanup: async () => {} };
     const selected = await selectHeartbeatRuntime(db, input);

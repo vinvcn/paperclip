@@ -78,7 +78,6 @@ export function useTaskRetry(issue: Issue | undefined) {
     mutation.reset();
     request.current ??= { issueId: issue.id, identifier: issue.identifier, idempotencyKey: randomId(),
       observedRunId: issue.interruption?.observedRunId ?? issue.executionBlocker?.runId ?? null };
-      observedRunId: issue.interruption?.observedRunId ?? issue.executionBlocker?.runId ?? null };
     setOptimistic(true);
     setTakingLonger(false);
     mutation.mutate(request.current);

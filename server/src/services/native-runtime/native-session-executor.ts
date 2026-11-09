@@ -90,7 +90,6 @@ import { bindAntigravityCredentialTurn, bindAntigravityTransportRetirement, prep
 import { copyBackGrokAuth } from "@paperclipai/adapter-grok-local/server";
 
 import { inferOpenAiCompatibleBiller, type AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
-import { logger } from "../../middleware/logger.js";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { parseCodexCliVersion } from "./codex-runtime-compatibility.js";
 import { createNativeToolTrace, type NativeToolTrace } from "./native-tool-trace.js";

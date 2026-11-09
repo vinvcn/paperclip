@@ -295,6 +295,23 @@ describe("Connectors landing page", () => {
     expect(navigateMock).toHaveBeenCalledWith("/apps/connect?source=bedrock");
   });
 
+  it("keeps a live local endpoint visible when its application was archived", async () => {
+    listGalleryMock.mockResolvedValue({ apps: [getAppStoreDefinition("local")] });
+    listApplicationsMock.mockResolvedValue({ applications: [application({
+      id: "local-app", name: "Local endpoint", applicationKey: "app-gallery:local",
+      metadata: { sourceTemplateKey: "local" }, status: "archived",
+    })] });
+    listConnectionsMock.mockResolvedValue({ connections: [connection({
+      id: "local-connection", name: "Local Kimi", applicationId: "local-app", connectionPurpose: "ai",
+      config: { sourceTemplateKey: "local", ai: { provider: "openai", method: "api_key", routing: { kind: "local", protocol: "chat", auth: "bearer", baseUrl: "http://127.0.0.1:8001/v1", models: [] } } },
+    })] });
+    await renderBrowse();
+    const local = container.querySelector('[data-app-slug="local"]')!;
+    expect(local.textContent).toContain("Local endpoint");
+    expect(local.textContent).toContain("Local Kimi");
+    expect(local.querySelector('button[aria-label="Connect Local endpoint"]')).toBeNull();
+  });
+
   it("offers assistant setup from Connections without choosing an agent", async () => {
     await renderBrowse();
     const button = container.querySelector<HTMLButtonElement>('[aria-label="Set up Assistant Connection (MCP)"]');

@@ -49,6 +49,7 @@ describe("LCA-05 explicit native work mode", () => {
       runtimeContext: nativeRuntimeContextFixture(),
     });
     expect(input.provider).toEqual({ kind: "opencode", model: "paperclip/team/model", permissionMode: "deny", reasoningEffort: "max" });
+  });
 
   it.each(["standard", "planning", "ask"] as const)("preserves Cursor Cloud %s intent independently of its native harness mode", workMode => {
     const planningContext = workMode === "planning" ? { documentId: "plan-document", baseRevisionId: "plan-revision-3", baseRevisionNumber: 3,
@@ -64,7 +65,6 @@ describe("LCA-05 explicit native work mode", () => {
         contract: { revision: "1", objective: "Deliver the requested work", criteria: [{ id: "output", requirement: "Deliver the requested work" }] } },
       runtimeContext: nativeRuntimeContextFixture(),
     });
-    expect(input).toMatchObject({ task: { workMode }, executionMode: workMode === "planning" ? "plan" : "default", planningContext });
     expect(input).toMatchObject({ task: { workMode }, executionMode: workMode === "planning" ? "plan" : "default", planningContext });
     expect(buildNativeModelEnvelope(input)).toMatchObject({ task: { workMode }, executionMode: workMode === "planning" ? "plan" : "default", planningContext });
   });
