@@ -63,7 +63,7 @@ describe("composer run settings", () => {
       .toEqual({ adapterConfig: { chrome: true, model: "claude-opus", effort: "high" }, useProjectWorkspace: true });
     const reset = mergeComposerRunSettings(previous, "claude_local", { model: null, effort: null, fast: false, keySlot: null });
     expect(reset).toEqual({ adapterConfig: { chrome: true }, useProjectWorkspace: true });
-    expect(readComposerRunSettings(reset, "claude_local")).toEqual({ model: null, effort: null, fast: false, keySlot: null });
+    expect(readComposerRunSettings(reset, "claude_local")).toEqual({ model: null, effort: null, fast: false });
     expect(readComposerRunSettings({ adapterConfig: { reasoningEffort: "xhigh" } }, "codex_local").effort).toBe("xhigh");
     expect(mergeComposerRunSettings(previous, "codex_local", { model: "gpt-6-astra", effort: "ultra", fast: true, keySlot: null }, true))
       .toEqual({ adapterConfig: { model: "gpt-6-astra", modelReasoningEffort: "ultra", fastMode: true } });
@@ -93,7 +93,7 @@ describe("composer run settings", () => {
     expect(mergeComposerRunSettings(pinned, "claude_local", { model: "new", effort: null, fast: false }, true))
       .toEqual({ adapterConfig: { model: "new" } });
     expect(readComposerRunSettings(pinned, "claude_local").keySlot).toBe(3);
-    expect(readComposerRunSettings(null, "claude_local").keySlot).toBe(null);
+    expect(readComposerRunSettings(null, "claude_local")).not.toHaveProperty("keySlot");
   });
 
   // Ticket 06: the switch-model retry's override write — model set, effort

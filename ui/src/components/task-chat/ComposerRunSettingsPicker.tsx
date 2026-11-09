@@ -170,7 +170,7 @@ export function ComposerRunSettingsPicker({
     ?? fetchedModels;
   const catalogPending = modelsPending && !modelOptionsOverride && !routedCatalog;
   const base = assigneeValue === currentAssigneeValue
-    ? readComposerRunSettings(overrides, agent?.adapterType)
+    ? { ...readComposerRunSettings(overrides, agent?.adapterType), keySlot: overrides?.keySlot ?? null }
     : DEFAULT_COMPOSER_RUN_SETTINGS;
   const selected = settings ?? base;
   const pinnedSlot = selected.keySlot != null
