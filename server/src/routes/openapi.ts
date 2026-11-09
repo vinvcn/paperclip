@@ -14,6 +14,7 @@ import {
   gitHubRepositoryPageQuerySchema,
   toggleAllGitHubRepositoriesSchema,
   createAiConnectionSchema,
+  aiConnectionModelsUpdateSchema,
   aiConnectionKeySlotCreateSchema,
   aiConnectionKeySlotUpdateSchema,
   updateDecisionModelSchema,
@@ -11468,6 +11469,17 @@ registerCurrentRoute({
   summary: "Probe the selected AI account’s provider usage limits on demand",
   query: z.object({ grantId: z.string().uuid().optional() }),
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  "x-paperclip-transport": "rest",
+  "x-paperclip-connection-management": "connections:configure",
+  method: "patch",
+  path: "/api/companies/{companyId}/ai-connections/{connectionId}/models",
+  tags: ["ai-connections"],
+  summary: "Update the routed AI connection's model catalog",
+  body: aiConnectionModelsUpdateSchema,
+  responses: { 200: r.ok(z.object({ ok: z.literal(true) })), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
 });
 
 registerCurrentRoute({

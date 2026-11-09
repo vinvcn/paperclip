@@ -313,6 +313,8 @@ export function aiConnectionService(db: Db) {
     binding: AiConnectionBinding;
   }) {
     const { companyId, userId, agentId, binding } = input;
+    if (binding.mode !== "responsible_user" && binding.mode !== "delegated" && binding.mode !== "shared")
+      throw aiConnectionConfigurationFailure("ai_connection_incompatible", "Select a supported AI connection binding");
     if (
       !isAiConnectionCompatible(
         binding,

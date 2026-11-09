@@ -4,6 +4,7 @@ import { newAiProviderRoutingModel, type AiProviderRoutingModel } from "@papercl
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { QueryErrorState } from "@/components/QueryView";
 
 const efforts = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 
@@ -69,7 +70,7 @@ export function AiConnectionModelsEditor({ companyId, connectionId, models: init
       <div className="flex items-center justify-between"><Button type="button" variant="outline" size="sm" onClick={() => { save.reset(); setModels(cloneModels(initialModels)); }}>Reset</Button><Button type="button" size="sm" disabled={save.isPending || models.some(model => !model.id.trim()) || duplicate} onClick={() => save.mutate()}>{save.isPending ? "Saving…" : "Save models"}</Button></div>
       {ids.some(id => !id) ? <p role="alert" className="text-xs text-destructive">Model ID is required.</p> : null}
       {new Set(ids).size !== ids.length ? <p role="alert" className="text-xs text-destructive">Model IDs must be unique.</p> : null}
-      {save.isError ? <p role="alert" className="text-xs text-destructive">{save.error instanceof Error ? save.error.message : "Could not save models"}</p> : null}
+      {save.error ? <QueryErrorState size="inline" error={save.error} action="save models" /> : null}
       {save.isSuccess ? <p role="status" className="text-xs text-muted-foreground">Model settings saved.</p> : null}
     </div>
   );

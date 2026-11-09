@@ -25,6 +25,7 @@ import { DispositionRecoveryProvider } from "../components/DispositionRecoveryNo
 import { AgentAvatar } from "@/components/AgentAvatar";
 import { mergeComposerRunSettings, type ComposerRunSettings } from "@/components/task-chat/composer-run-settings";
 import { useKeyPoolFailureRecovery } from "@/components/task-chat/use-key-pool-failure-recovery";
+import { useFailedRunRetry } from "@/components/task-chat/use-failed-run-retry";
 import type { TaskChatMarkerItem } from "@/components/task-chat/task-chat-model";
 import { AgentIdentity } from "@/components/AgentIdentity";
 import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
@@ -1685,6 +1686,11 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     }, [agentMap, resolvedLinkedRuns]),
   });
   const { retryFailedRun, renderActions: renderResolvedKeyPoolActions } = keyPoolRecovery;
+  const retryRun = useFailedRunRetry({
+    companyId,
+    runsQueryRef: issueQueryRef,
+    resolveFailedRun: (runId: string) => resolvedLinkedRuns.find((run) => run.runId === runId),
+  });
   const renderKeyPoolActions = useCallback((item: TaskChatMarkerItem) =>
     renderResolvedKeyPoolActions({ snapshot: item.keyPool, runId: item.runId }),
   [renderResolvedKeyPoolActions]);
@@ -2657,10 +2663,12 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             feedbackTermsUrl={feedbackTermsUrl}
             linkedRuns={timelineRuns}
             onRetryFailedRun={(runId) =>
-              retryFailedRun.mutateAsync({ runId }).then(() => undefined)
+              retryRun.mutateAsync(runId).then(() => undefined)
             }
             retryFailedRunId={
-              retryFailedRun.isPending ? retryFailedRun.variables.runId : null
+              retryRun.isPending
+                ? typeof retryRun.variables === "string" ? retryRun.variables : retryRun.variables?.runId
+                : null
             }
             renderKeyPoolActions={renderKeyPoolActions}
             timelineEvents={timelineEvents}

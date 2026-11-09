@@ -27,8 +27,8 @@ export function AgentKeySlotPin({
     queryKey: ["ai-connection-key-slots", connectionId],
     queryFn: ({ signal }) => aiConnectionsApi.keySlots(companyId, connectionId, { signal }),
     // A permission denial or a pool-less connection both resolve to "no rows";
-    // either way the pin has nothing to target and stays hidden.
-    retry: false,
+    // either way the pin has nothing to target and stays hidden. Transient
+    // failures use the shared retry policy so a recoverable pool is not hidden.
   });
   const rows = slots.data?.slots ?? [];
   if (slots.isPending || !rows.length) return null;

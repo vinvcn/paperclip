@@ -1602,36 +1602,10 @@ impl CodexProvider {
                         }
                         let names_other_turn = notification_turn_id(&params)
                             .is_some_and(|turn_id| turn_id != completed_turn_id);
-                        let safe_tail_method = matches!(
-                            method.as_str(),
-                            "warning"
-                            | "configWarning"
-                            | "remoteControl/status/changed"
-                            | "mcpServer/startupStatus/updated"
-                            | "account/rateLimits/updated"
-                            | "item/started"
-                            | "item/completed"
-                            | "item/agentMessage/delta"
-                            | "rawResponseItem/completed"
-                            | "rawResponse/completed"
-                            | "thread/goal/updated"
-                            | "thread/goal/cleared"
-                            | "thread/tokenUsage/updated"
-                            // poll() normalizes usage from this settled turn.
-                            // It remains an accounting snapshot, not new work.
-                            | "paperclip/resumeUsageSnapshot"
-                            | "thread/status/changed"
-                            | "turn/diff/updated"
-                            | "turn/plan/updated"
-                            // A usage record can complete just after its turn
-                            // went terminal; it is data for the settled run,
-                            // never new work, and carries no turn identity.
-                            | "paperclip/providerRequestUsage"
-                        );
                         // A notification about the settled turn is history. Only
                         // a new turn means something is live; a provider request
                         // or process exit has its own fail-closed arm below.
-                        if names_other_turn || !safe_tail_method || method == "turn/started" {
+                        if names_other_turn || method == "turn/started" {
                             return Err(LocalRunnerError::invalid(format!(
                                 "Codex warm run attachment observed unsafe post-terminal provider method {}",
                                 bounded_method(&method)
@@ -1640,7 +1614,6 @@ impl CodexProvider {
                         if matches!(
                             method.as_str(),
                             "thread/tokenUsage/updated"
-                                | "thread/tokenUsage/updated"
                                 | "paperclip/resumeUsageSnapshot"
                                 | "paperclip/providerRequestUsage"
                                 | "thread/goal/updated"
