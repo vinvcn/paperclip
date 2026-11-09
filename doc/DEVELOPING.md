@@ -431,7 +431,12 @@ from that manifest get the median weight. The legacy `--shard=1/2` and
 `--shard=2/2` commands keep their earlier PR behavior: the first runs the whole
 package inventory and the second runs the native group. Other workflow names and
 shard counts keep their existing coverage. Every lane still prepares debug
-binaries. A separate exact-key debug cache holds
+binaries. The native lane additionally runs `build:binary` before integration:
+its Dot suite consumes the release `paperclip-runnerd` and deliberately does
+not compile it again during `beforeAll`. Direct local Dot integration runs
+require `pnpm --filter @paperclipai/paperclip-runner build:binary` first. The
+release preparation is native-only; package lanes retain their debug-only cost.
+A separate exact-key debug cache holds
 the workspace library and every Cargo binary target. Its key includes source,
 protocol and fixture content, Cargo configuration, compiler flags, toolchain
 and checkout path. Only the Rust lane of a verified master push saves it.
