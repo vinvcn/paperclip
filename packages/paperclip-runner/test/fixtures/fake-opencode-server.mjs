@@ -449,8 +449,10 @@ const server = createServer(async (request, response) => {
   if (
     request.method === "POST" &&
     request.url === `/session/${session.id}/abort`
-  )
+  ) {
+    await writeFile(join(process.cwd(), "fake-tool-loop-abort.json"), "");
     return json(response, 200, true);
+  }
   if (
     request.method === "POST" &&
     request.url === `/session/${session.id}/prompt_async`
@@ -547,6 +549,24 @@ const server = createServer(async (request, response) => {
             name: "paperclip_probe", arguments: [],
           }));
           await writeFile(join(process.cwd(), "fake-tool-loop-receipt.json"), "");
+          emit({ type: "session.error", properties: {
+            sessionID: session.id,
+            error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+          } });
+          return;
+        }
+
+        if (String(parsedPrompt.message ?? "").includes("schema-repair")) {
+          const invalid = await mcpRequest("tools/call", {
+            name: "paperclip_request_human_input", arguments: { interactionKind: "questions", idempotencyKey: "repair-1", title: "Choose", prompt: "Choose", payload: { version: 1 } },
+          });
+          const repaired = await mcpRequest("tools/call", {
+            name: "paperclip_request_human_input", arguments: {
+              idempotencyKey: "repair-v1", interactionKind: "questions", title: "Repair", prompt: "Choose", resolverPolicy: "human_only", continuationPolicy: "wake_assignee",
+              payload: { version: 1, questionSet: { schema: "paperclip.question_set.v1", questions: [{ id: "next", prompt: "Next?", required: true, answerMode: "text" }] } },
+            },
+          });
+          await writeFile(join(process.cwd(), "fake-tool-repair-receipt.json"), JSON.stringify(repaired));
           await callTerminalTool(promptPayload);
           emit({ type: "session.idle", properties: { sessionID: session.id } });
           return;

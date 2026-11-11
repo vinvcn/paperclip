@@ -1,6 +1,7 @@
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { describe, expect, it } from "vitest";
 
+import { requestHumanInputAction } from "./request-human-input.js";
 import { PAPERCLIP_CORE_PROTOCOL_ACTIONS } from "./core.js";
 
 describe("core Paperclip protocol action contracts", () => {
@@ -8,10 +9,7 @@ describe("core Paperclip protocol action contracts", () => {
 
   it("advertises a complete typed form for mixed text and choice questions", () => {
     const action = PAPERCLIP_CORE_PROTOCOL_ACTIONS.find(action => action.id === "request_human_input")!;
-    const payload = { version: 1, questionSet: { schema: "paperclip.question_set.v1", questions: [
-      { id: "repo", prompt: "Repository URL?", required: true, answerMode: "text" },
-      { id: "scope", prompt: "Review scope?", required: true, answerMode: "single_select", options: [{ id: "all", label: "All changes" }, { id: "selected", label: "Selected changes" }] },
-    ] } };
+    const payload = requestHumanInputAction.examples.questions.payload;
     for (const schema of [action.live!.descriptor.inputSchema, action.scenario!.descriptor.inputSchema]) {
       const input = { ...action.examples.call.input, interactionKind: "questions", payload };
       if (schema === action.scenario!.descriptor.inputSchema) delete (input as { idempotencyKey?: string }).idempotencyKey;

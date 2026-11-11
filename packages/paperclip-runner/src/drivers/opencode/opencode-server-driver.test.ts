@@ -1,5 +1,6 @@
 import {
   chmod,
+  access,
   copyFile,
   lstat,
   mkdir,
@@ -173,7 +174,28 @@ describe("OpenCodeServerDriver", () => {
       expect(events.filter(event => event.eventType === "item.completed"
         && (event.payload.item as { is_error?: boolean } | undefined)?.is_error)).toHaveLength(2);
       expect(handler).not.toHaveBeenCalled();
-      expect(await readFile(join(root, "fake-tool-loop-receipt.json"), "utf8")).toBe("");
+      expect(await readFile(join(root, "fake-tool-loop-abort.json"), "utf8")).toBe("");
+      await expect(access(join(root, "fake-tool-loop-third-call.json"))).rejects.toThrow();
+    } finally { await session.close({ reason: "test" }); }
+  });
+
+  it("keeps a corrected question call usable after one schema rejection", async () => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), "paperclip-tool-repair-")); roots.push(root);
+    const handler = vi.fn(async () => ({ accepted: true }));
+    const driver = new OpenCodeServerDriver({ model: "openrouter/test-model", command: fixture, runtimeDirectory: root,
+      environment: { PATH: process.env.PATH },
+      dynamicTools: [{ name: "request_human_input", inputSchema: (await import("../../protocol-actions/request-human-input.js")).requestHumanInputAction.live!.descriptor.inputSchema }],
+      dynamicToolHandler: handler,
+    });
+    const session = await driver.openSession({ runId: "tool-repair", normalizedSessionId: "tool-repair", workingDirectory: root });
+    try {
+      await session.startTurn({ message: { role: "user", text: "schema-repair" } });
+      const events = await collectTurnEvents(session.events());
+      expect(events.at(-1)?.eventType).toBe("turn.completed");
+      expect(handler).toHaveBeenCalledOnce();
+      expect(JSON.parse(await readFile(join(root, "fake-tool-repair-receipt.json"), "utf8"))).toMatchObject({ result: { content: [{ text: JSON.stringify({ accepted: true }) }] } });
+      expect(events.filter(event => event.eventType === "turn.failed")).toHaveLength(0);
     } finally { await session.close({ reason: "test" }); }
   });
 

@@ -29,7 +29,7 @@ export interface OpenCodeMcpBridgeOptions {
   /** Runner-owned operations callable only by a trusted harness extension and never advertised to the model. */
   privateTools?: readonly Readonly<Record<string, unknown>>[];
   handler: (call: OpenCodeMcpCall) => Promise<unknown>;
-  onRejectedCall?: (call: Pick<OpenCodeMcpCall, "tool" | "callId" | "arguments">, error: string) => void;
+  onRejectedCall?: (call: Pick<OpenCodeMcpCall, "tool" | "callId" | "arguments">, error: string, kind?: "schema_validation" | "call_identity_conflict") => void | Promise<void>;
   /** Null leaves durable requests with the owning Runner lease and bridge close. */
   timeoutMs?: number | null;
   /** Human-gated private operations may remain pending much longer than model tool calls. */
@@ -290,7 +290,7 @@ async function handleRequest(
       ? " For interactionKind='questions', send payload.version=1 with payload.questionSet (schema:'paperclip.question_set.v1', questions:[{id,prompt,required,answerMode:'text'}]); choice questions need at least two options. Preserve all required fields and use a stable idempotencyKey; do not retry identical arguments."
       : "";
     const error = `Invalid tool input${detail ? `: ${detail}` : "."}${remediation}`;
-    try { context.onRejectedCall?.({ tool, callId, arguments: args }, error); } catch {}
+    try { await context.onRejectedCall?.({ tool, callId, arguments: args }, error, "schema_validation"); } catch {}
     writeRpc(response, id, {
       isError: true,
       content: [{ type: "text", text: error }],
@@ -300,7 +300,7 @@ async function handleRequest(
   const fingerprint = canonicalJson({ tool, args });
   const existing = context.calls.get(callId);
   if (existing && existing.fingerprint !== fingerprint) {
-    try { context.onRejectedCall?.({ tool, callId, arguments: args }, "Duplicate call identity conflict."); } catch {}
+    try { context.onRejectedCall?.({ tool, callId, arguments: args }, "Duplicate call identity conflict.", "call_identity_conflict"); } catch {}
     writeRpc(response, id, { isError: true, content: [{ type: "text", text: "Duplicate call identity conflict." }] });
     return;
   }
