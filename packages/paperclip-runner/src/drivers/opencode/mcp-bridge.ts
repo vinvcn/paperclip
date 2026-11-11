@@ -30,6 +30,7 @@ export interface OpenCodeMcpBridgeOptions {
   privateTools?: readonly Readonly<Record<string, unknown>>[];
   handler: (call: OpenCodeMcpCall) => Promise<unknown>;
   onRejectedCall?: (call: Pick<OpenCodeMcpCall, "tool" | "callId" | "arguments">, error: string, kind?: "schema_validation" | "call_identity_conflict") => void | Promise<void>;
+  isToolCallBlocked?: () => boolean;
   /** Null leaves durable requests with the owning Runner lease and bridge close. */
   timeoutMs?: number | null;
   /** Human-gated private operations may remain pending much longer than model tool calls. */
@@ -105,6 +106,7 @@ export async function startOpenCodeMcpBridge(
       controllers,
       handler: options.handler,
       onRejectedCall: options.onRejectedCall,
+      isToolCallBlocked: options.isToolCallBlocked,
       diagnoseFinishInput,
       timeoutMs: options.timeoutMs === null ? null : options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       privateToolTimeoutMs: options.privateToolTimeoutMs ?? options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
@@ -189,6 +191,7 @@ async function handleRequest(
     controllers: Map<string, AbortController>;
     handler: OpenCodeMcpBridgeOptions["handler"];
     onRejectedCall: OpenCodeMcpBridgeOptions["onRejectedCall"];
+    isToolCallBlocked: OpenCodeMcpBridgeOptions["isToolCallBlocked"];
     timeoutMs: number | null;
     privateToolTimeoutMs: number;
     privateToolNames: ReadonlySet<string>;
@@ -277,6 +280,10 @@ async function handleRequest(
   }
   const callId = typeof id === "string" || typeof id === "number" ? String(id) : randomBytes(12).toString("hex");
   const args = params.arguments ?? {};
+  if (context.isToolCallBlocked?.()) {
+    writeRpc(response, id, { isError: true, content: [{ type: "text", text: "opencode_tool_input_loop" }] });
+    return;
+  }
   const validator = context.validators.get(tool);
   if (validator === undefined || !validator(args)) {
     if (tool === PRP_COMPLETION_TOOL_NAME) {
@@ -300,7 +307,7 @@ async function handleRequest(
   const fingerprint = canonicalJson({ tool, args });
   const existing = context.calls.get(callId);
   if (existing && existing.fingerprint !== fingerprint) {
-    try { context.onRejectedCall?.({ tool, callId, arguments: args }, "Duplicate call identity conflict.", "call_identity_conflict"); } catch {}
+    try { await context.onRejectedCall?.({ tool, callId, arguments: args }, "Duplicate call identity conflict.", "call_identity_conflict"); } catch {}
     writeRpc(response, id, { isError: true, content: [{ type: "text", text: "Duplicate call identity conflict." }] });
     return;
   }

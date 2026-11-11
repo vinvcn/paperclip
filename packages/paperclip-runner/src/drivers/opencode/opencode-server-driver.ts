@@ -434,6 +434,7 @@ export class OpenCodeServerDriver implements HarnessDriver {
           cwd,
           trace,
           onRejectedCall: async (call, error, kind) => { await session?.observeRejectedToolCall(call, error, kind); },
+          isToolCallBlocked: () => session?.isToolInputLoopStopped ?? false,
           dispatch: (call) => {
             if (session === null)
               throw new Error("OpenCode session is not ready for tool calls");
@@ -592,6 +593,7 @@ class OpenCodeHarnessSession implements HarnessSession {
   #lastSchemaRejection: { tool: string; error: string } | null = null;
   #consecutiveSchemaRejections = 0;
   #toolInputLoop = false;
+  #toolInputLoopSettlement: Promise<void> | null = null;
   readonly #runningNativeToolParts = new Set<string>();
   #abort = new AbortController();
 
@@ -1202,9 +1204,13 @@ class OpenCodeHarnessSession implements HarnessSession {
     );
   }
 
+  get isToolInputLoopStopped(): boolean {
+    return this.#toolInputLoop;
+  }
+
   async observeRejectedToolCall(call: { tool: string; callId: string; arguments: unknown }, error: string, kind?: "schema_validation" | "call_identity_conflict"): Promise<void> {
     const turnId = this.#activeTurnId;
-    if (!turnId || this.#closed) return;
+    if (!turnId || this.#closed || this.#toolInputLoop) return;
     const itemId = `${call.callId}:rejected:${randomBytes(12).toString("hex")}`;
     this.#emit("item.started", {
       kind: "dynamicToolCall", item: { type: "tool_call", id: itemId, name: call.tool, arguments: call.arguments },
@@ -1223,19 +1229,26 @@ class OpenCodeHarnessSession implements HarnessSession {
     if (!same || this.#consecutiveSchemaRejections < OPENCODE_TOOL_INPUT_LOOP_MAX_REJECTIONS) return;
     const message = `Stopped ${call.tool} after ${OPENCODE_TOOL_INPUT_LOOP_MAX_REJECTIONS} consecutive identical schema validation errors. Correct the tool arguments before resuming; no operation was dispatched.`;
     this.#toolInputLoop = true;
-    this.#interruptedTurnId = turnId;
     this.#settlePendingRuntimeRequestsForTurn(turnId);
-    let failureMessage = message;
-    try { await this.interrupt({ turnId }); }
-    catch (error) {
-      const detail = redact(String(error), this.#runtime.sensitiveValues);
-      failureMessage += ` OpenCode abort failed: ${detail}`;
-    }
+    const interrupted = api(
+      this.#fetch,
+      this.#runtime,
+      `/session/${encodeURIComponent(this.#providerSessionId)}/abort`,
+      { method: "POST" },
+    ).catch((error) => {
+      this.#emit("harness.diagnostic", {
+        code: "opencode_tool_input_loop_abort_failed",
+        message: redact(String(error), this.#runtime.sensitiveValues),
+      });
+    });
+    this.#toolInputLoopSettlement = interrupted.then(() => undefined);
+    await interrupted;
     this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
     this.#emit("turn.failed", {
       status: "failed",
-      error: { code: OPENCODE_TOOL_INPUT_LOOP_CODE, message: failureMessage, recoverable: false, retryable: false },
+      error: { code: OPENCODE_TOOL_INPUT_LOOP_CODE, message, recoverable: false, retryable: false },
     }, { turnId });
+    this.#activeTurnId = null;
   }
 
   async dispatchTool(call: {
@@ -1244,6 +1257,7 @@ class OpenCodeHarnessSession implements HarnessSession {
     arguments: unknown;
     signal?: AbortSignal;
   }): Promise<unknown> {
+    if (this.#toolInputLoop) throw new Error(OPENCODE_TOOL_INPUT_LOOP_CODE);
     this.#pendingToolCalls += 1;
     this.#clearEmptyResponseAckTimer();
     try { return await this.#dispatchToolCall(call); }
@@ -1713,6 +1727,11 @@ class OpenCodeHarnessSession implements HarnessSession {
             message: redact(String(error), this.#runtime.sensitiveValues),
             failure,
           });
+          if (this.#toolInputLoop) {
+            await this.#toolInputLoopSettlement;
+            attempts = 0;
+            continue;
+          }
           this.#failActiveTurnOnStreamLoss(failure);
           this.#events.fail(error);
           return;
@@ -1820,6 +1839,7 @@ class OpenCodeHarnessSession implements HarnessSession {
     );
     if (sessionId && sessionId !== this.#providerSessionId) return;
     const turnId = this.#activeTurnId;
+    if (this.#toolInputLoop && (idle || type === "session.error")) return;
     if (this.#emptyResponseRecovery?.responseStarted && type === "session.status" && text(record(properties.status).type) === "busy")
       this.#clearEmptyResponseAckTimer();
     if (type === "question.asked" && turnId) {
@@ -2053,7 +2073,6 @@ class OpenCodeHarnessSession implements HarnessSession {
         text(providerErrorData.message, text(providerError.message)) ===
           "Aborted"
       ) {
-        if (this.#toolInputLoop) return;
         // OpenCode reports its normal /abort control path as session.error. That
         // endpoint is also how Paperclip parks a provider turn after a durable
         // governed interaction is created, so presenting it as a provider
@@ -2457,6 +2476,7 @@ async function startRuntime(input: {
   cwd: string;
   trace: ProviderTraceFileSink | null;
   onRejectedCall?: OpenCodeMcpBridgeOptions["onRejectedCall"];
+  isToolCallBlocked?: OpenCodeMcpBridgeOptions["isToolCallBlocked"];
   dispatch: (call: {
     tool: string;
     callId: string;
@@ -2497,6 +2517,7 @@ async function startRuntime(input: {
     tools: input.options.dynamicTools,
     handler: input.dispatch,
     onRejectedCall: input.onRejectedCall,
+    isToolCallBlocked: input.isToolCallBlocked,
     onDiagnostic: input.options.onDiagnostic,
     ...(input.options.durableToolRequests ? { timeoutMs: null } : {}),
   }).catch(async (error) => {

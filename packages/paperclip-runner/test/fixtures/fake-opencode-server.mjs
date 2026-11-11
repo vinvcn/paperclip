@@ -133,6 +133,8 @@ let promptTurnSeq = 0;
 // test can place the stale frame's arrival after several more turns have
 // sealed.
 let lateStragglerRemaining = 0;
+let schemaLoopAbortMode = "success";
+let schemaLoopCallCount = 0;
 function emit(value) {
   if (value.type === "session.idle" && runtimeConfig.experimental?.openTelemetry) {
     const now=Date.now();
@@ -175,6 +177,11 @@ function parsedPromptText(promptBody) {
 }
 
 async function mcpRequest(method, params, signal) {
+  const id = mcpRequestId++;
+  if (params?.name === "paperclip_probe") {
+    schemaLoopCallCount += 1;
+    await appendFile(join(process.cwd(), "fake-tool-loop-receipt.json"), JSON.stringify({ attempts: schemaLoopCallCount }) + "\n");
+  }
   const response = await fetch(mcp.url, {
     signal: signal ?? AbortSignal.timeout(mcp.timeout),
     method: "POST",
@@ -185,7 +192,7 @@ async function mcpRequest(method, params, signal) {
     },
     body: JSON.stringify({
       jsonrpc: "2.0",
-      id: mcpRequestId++,
+      id,
       method,
       ...(params ? { params } : {}),
     }),
@@ -451,6 +458,20 @@ const server = createServer(async (request, response) => {
     request.url === `/session/${session.id}/abort`
   ) {
     await writeFile(join(process.cwd(), "fake-tool-loop-abort.json"), "");
+    if (schemaLoopAbortMode === "delay") await new Promise(resolve => setTimeout(resolve, 50));
+    emit({ type: "session.error", properties: {
+      sessionID: session.id,
+      error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+    } });
+    emit({ type: "session.idle", properties: { sessionID: session.id } });
+    emit({ type: "session.error", properties: {
+      sessionID: session.id,
+      error: { name: "APIError", data: { message: "Synthetic competing provider failure" } },
+    } });
+    emit({ type: "session.idle", properties: { sessionID: session.id } });
+    if (schemaLoopAbortMode === "delay" || schemaLoopAbortMode === "disconnect") await new Promise(resolve => setTimeout(resolve, 2500));
+    else await new Promise(resolve => setTimeout(resolve, 20));
+    if (schemaLoopAbortMode === "fail") return json(response, 500, { error: "abort failed" });
     return json(response, 200, true);
   }
   if (
@@ -543,21 +564,27 @@ const server = createServer(async (request, response) => {
           emit({ type: "session.idle", properties: { sessionID: session.id } });
           return;
         }
+        if (String(parsedPrompt.message ?? "").includes("native-question-schema-loop")) {
+          pendingQuestion = nativeQuestion();
+          emit({ type: "question.asked", id: "event-question-native-1", properties: pendingQuestion });
+          schemaLoopAbortMode = "success";
+        }
         if (String(parsedPrompt.message ?? "").includes("schema-loop")) {
-          const receipts = [];
-          for (let attempt = 0; receipts.length < 2; attempt++) receipts.push(await mcpRequest("tools/call", {
+          schemaLoopAbortMode = String(parsedPrompt.message ?? "").includes("fail") ? "fail"
+            : String(parsedPrompt.message ?? "").includes("disconnect") ? "disconnect"
+            : String(parsedPrompt.message ?? "").includes("delay") ? "delay" : "success";
+          for (let attempt = 0; attempt < 2; attempt++) await mcpRequest("tools/call", {
             name: "paperclip_probe", arguments: [],
-          }));
-          await writeFile(join(process.cwd(), "fake-tool-loop-receipt.json"), "");
-          emit({ type: "session.error", properties: {
-            sessionID: session.id,
-            error: { name: "MessageAbortedError", data: { message: "Aborted" } },
-          } });
+          });
+          const thirdResponse = await mcpRequest("tools/call", {
+            name: "paperclip_probe", arguments: [],
+          });
+          await writeFile(join(process.cwd(), "fake-tool-loop-third-call.json"), JSON.stringify(thirdResponse));
           return;
         }
 
         if (String(parsedPrompt.message ?? "").includes("schema-repair")) {
-          const invalid = await mcpRequest("tools/call", {
+          await mcpRequest("tools/call", {
             name: "paperclip_request_human_input", arguments: { interactionKind: "questions", idempotencyKey: "repair-1", title: "Choose", prompt: "Choose", payload: { version: 1 } },
           });
           const repaired = await mcpRequest("tools/call", {
@@ -648,16 +675,8 @@ const server = createServer(async (request, response) => {
         }
         if (String(parsedPrompt.message ?? "").includes("native-question")) {
           pendingQuestion = nativeQuestion();
-          emit({
-            type: "question.asked",
-            id: "event-question-native-1",
-            properties: pendingQuestion,
-          });
-          emit({
-            type: "question.asked",
-            id: "event-question-native-1",
-            properties: pendingQuestion,
-          });
+          emit({ type: "question.asked", id: "event-question-native-1", properties: pendingQuestion });
+          emit({ type: "question.asked", id: "event-question-native-1", properties: pendingQuestion });
           return;
         }
         if (String(parsedPrompt.message ?? "").includes("native-permission")) {

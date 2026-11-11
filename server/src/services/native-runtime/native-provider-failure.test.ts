@@ -251,7 +251,9 @@ describe("native provider failure observation", () => {
     observed.observe({ ...event, payload: { status: "failed", recoverable: false, error: {
       code, message: "OpenCode stopped the turn.", retryable: false,
     } } });
-    expect(observed.unclassifiedTurnFailure("turn", terminal)).toEqual({ provider: "opencode", category: "turn_failed", runnerFailureCode: code });
+    const diagnostic = observed.unclassifiedTurnFailure("turn", terminal);
+    expect(diagnostic).toEqual({ provider: "opencode", category: "turn_failed", runnerFailureCode: code });
+    expect(readNativeTurnFailureDiagnostic(diagnostic)).toEqual(diagnostic);
   });
 
   it.each([{ kind: "claude", model }, { kind: "codex" }, { kind: "codex", model: "other" }])(

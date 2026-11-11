@@ -1,6 +1,5 @@
 import {
   chmod,
-  access,
   copyFile,
   lstat,
   mkdir,
@@ -155,27 +154,86 @@ afterAll(async () => {
 });
 
 describe("OpenCodeServerDriver", () => {
-  it("fails repeated identical schema rejections instead of allowing another provider turn", async () => {
+  it.each(["schema-loop", "schema-loop-delay", "schema-loop-fail", "schema-loop-disconnect"])("fails repeated identical schema rejections despite competing provider terminals: %s", async (scenario) => {
     await chmod(fixture, 0o755);
     const root = await mkdtemp(join(tmpdir(), "paperclip-tool-input-loop-")); roots.push(root);
     const handler = vi.fn();
+    let eventRequests = 0;
     const driver = new OpenCodeServerDriver({ model: "openrouter/test-model", command: fixture, runtimeDirectory: root,
       environment: { PATH: process.env.PATH },
+      fetch: async (input, init) => {
+        if (scenario === "schema-loop-disconnect" && new URL(String(input)).pathname === "/event") {
+                    eventRequests += 1;
+          if (eventRequests > 1 && eventRequests <= 5) {
+            return new Response(new ReadableStream({ start(controller) { controller.close(); } }), {
+              status: 200, headers: { "Content-Type": "text/event-stream" },
+            });
+          }
+        }
+        return globalThis.fetch(input, init);
+      },
       dynamicTools: [{ name: "probe", inputSchema: { type: "object" } }],
       dynamicToolHandler: handler,
     });
     const session = await driver.openSession({ runId: "tool-loop", normalizedSessionId: "tool-loop", workingDirectory: root });
     try {
-      await session.startTurn({ message: { role: "user", text: "schema-loop" } });
+      await session.startTurn({ message: { role: "user", text: scenario } });
       const events = await collectTurnEvents(session.events());
-      const terminal = events.at(-1);
-      expect(terminal).toMatchObject({ eventType: "turn.failed",
+      expect(events.filter(event => ["turn.failed", "turn.cancelled", "turn.completed"].includes(event.eventType))).toHaveLength(1);
+      expect(events.at(-1)).toMatchObject({ eventType: "turn.failed",
         payload: { error: { code: "opencode_tool_input_loop", recoverable: false, retryable: false } } });
+      if (scenario === "schema-loop-fail") expect(events).toContainEqual(expect.objectContaining({ eventType: "harness.diagnostic",
+        payload: { code: "opencode_tool_input_loop_abort_failed", message: expect.stringContaining("abort") } }));
+      if (scenario === "schema-loop-disconnect") expect(events).toContainEqual(expect.objectContaining({ eventType: "harness.diagnostic",
+        payload: expect.objectContaining({ code: "opencode_sse_failed" }) }));
       expect(events.filter(event => event.eventType === "item.completed"
         && (event.payload.item as { is_error?: boolean } | undefined)?.is_error)).toHaveLength(2);
       expect(handler).not.toHaveBeenCalled();
-      expect(await readFile(join(root, "fake-tool-loop-abort.json"), "utf8")).toBe("");
-      await expect(access(join(root, "fake-tool-loop-third-call.json"))).rejects.toThrow();
+      await expect.poll(() => readFile(join(root, "fake-tool-loop-abort.json"), "utf8")).toBe("");
+      await expect.poll(() => readFile(join(root, "fake-tool-loop-receipt.json"), "utf8").then(text => text.trim().split("\n").map(JSON.parse))).toEqual([{ attempts: 1 }, { attempts: 2 }, { attempts: 3 }]);
+      await expect.poll(() => readFile(join(root, "fake-tool-loop-third-call.json"), "utf8").then(JSON.parse)).toMatchObject({ result: {
+      } });
+      if (scenario === "schema-loop-disconnect") {
+        await session.startTurn({ message: { role: "user", text: "ordinary next turn" } });
+        expect((await collectTurnEvents(session.events())).at(-1)?.eventType).toBe("turn.completed");
+      }
+    } finally { await session.close({ reason: "test" }); }
+  });
+
+  it("settles pending runtime requests before the loop failure", async () => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), "paperclip-loop-pending-")); roots.push(root);
+    const driver = new OpenCodeServerDriver({ model: "openrouter/test-model", command: fixture, runtimeDirectory: root,
+      environment: { PATH: process.env.PATH },
+      dynamicTools: [{ name: "probe", inputSchema: { type: "object" } }], dynamicToolHandler: vi.fn(),
+    });
+    const session = await driver.openSession({ runId: "pending-loop", normalizedSessionId: "pending-loop", workingDirectory: root });
+    try {
+      await session.startTurn({ message: { role: "user", text: "native-question-schema-loop" } });
+      const events = await collectTurnEvents(session.events());
+      expect(events.map(event => event.eventType)).toContain("runtime_request.created");
+      const settlement = events.findIndex(event => ["runtime_request.expired", "runtime_request.cancelled"].includes(event.eventType));
+      const terminal = events.findIndex(event => event.eventType === "turn.failed");
+      expect(settlement).toBeGreaterThanOrEqual(0);
+      expect(settlement).toBeLessThan(terminal);
+      expect(events.at(-1)).toMatchObject({ eventType: "turn.failed", payload: { error: { code: "opencode_tool_input_loop" } } });
+      expect(events.filter(event => ["turn.completed", "turn.cancelled", "turn.failed"].includes(event.eventType))).toHaveLength(1);
+    } finally { await session.close({ reason: "test" }); }
+  });
+
+  it("allows a new successful turn after a loop failure", async () => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), "paperclip-loop-next-turn-")); roots.push(root);
+    const driver = new OpenCodeServerDriver({ model: "openrouter/test-model", command: fixture, runtimeDirectory: root,
+      environment: { PATH: process.env.PATH }, dynamicTools: [{ name: "probe", inputSchema: { type: "object" } }],
+      dynamicToolHandler: vi.fn(),
+    });
+    const session = await driver.openSession({ runId: "loop-next-turn", normalizedSessionId: "loop-next", workingDirectory: root });
+    try {
+      await session.startTurn({ message: { role: "user", text: "schema-loop" } });
+      expect((await collectTurnEvents(session.events())).at(-1)?.eventType).toBe("turn.failed");
+      await session.startTurn({ message: { role: "user", text: "ordinary next turn" } });
+      expect((await collectTurnEvents(session.events())).at(-1)?.eventType).toBe("turn.completed");
     } finally { await session.close({ reason: "test" }); }
   });
 

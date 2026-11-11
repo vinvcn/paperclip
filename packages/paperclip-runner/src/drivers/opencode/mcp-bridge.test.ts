@@ -405,6 +405,18 @@ it("keeps schema rejection intact when its observer fails", async () => {
   expect(await (await rpc(bridge, { id: 1, method: "tools/call", params: { name: "paperclip_finish", arguments: {} } })).json()).toMatchObject({ result: { isError: true } });
   expect(handler).not.toHaveBeenCalled();
 });
+it("keeps an identity conflict intact when its async observer fails", async () => {
+  const handler = vi.fn(async () => ({ accepted: true }));
+  const bridge = await startOpenCodeMcpBridge({
+    tools: [{ name: "probe", inputSchema: { type: "object" } }], handler,
+    onRejectedCall: async () => { throw new Error("observer unavailable"); },
+  });
+  bridges.push(bridge);
+  const body = { id: "same", method: "tools/call", params: { name: "probe", arguments: { name: "first" } } };
+  await rpc(bridge, body);
+  expect(await (await rpc(bridge, { ...body, params: { name: "probe", arguments: { name: "second" } } })).json()).toMatchObject({ result: { isError: true } });
+  expect(handler).toHaveBeenCalledOnce();
+});
 it("reports conflicting request IDs without repeating the accepted action", async () => {
   const handler = vi.fn(async () => ({ accepted: true }));
   const rejected = vi.fn();
