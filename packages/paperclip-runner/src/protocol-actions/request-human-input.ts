@@ -1,5 +1,7 @@
 import { questionPayloadSchema, questionsPayloadRequirement } from "./question-payload-schema.js";
 
+const description = "Create a durable human question or approval card on the current Paperclip task bound to this run; Paperclip renders it and authenticates the response. Use questions with continuationPolicy='wake_assignee' when an answer is needed, including otherwise tool-free chat turns. Supply a stable idempotencyKey and reuse it on retries. When you need several inputs that do not depend on each other's answers, ask them together in one questions card (one questionSet) instead of one card per question; ask a follow-up card only when it depends on an earlier answer. If the user asks for one question at a time, ask only the next unanswered question and wait for its real answer. Never fabricate answers or treat ambiguous clarification as approval. For an ordinary confirmation or checkbox card, record a clear user chat answer with call_api POST /api/issues/{id}/interactions/{interactionId}/resolve-from-comment, using the source commentId and decision (accept/reject), plus explicit selectedOptionIds for checkbox acceptance. Existing resolver permissions still apply; governed tool, secret, and connection approvals are excluded. Question forms retain their dedicated answer workflow. Preserve existing review gates. Call this tool before claiming a question was asked; if creation fails, report the failure. Do not fabricate answer links or Markdown buttons, post duplicate cards, or use call_api to create the card. Use one complete payload.questionSet for text and choice questions. Paperclip generates compatibility questions; see the complete payload in examples.questions and the payload schema for formats.";
+
 /** Canonical definition and documentation for `request_human_input`. */
 export const requestHumanInputAction = {
   "id": "request_human_input",
@@ -29,7 +31,7 @@ export const requestHumanInputAction = {
   },
   "documentation": {
     "title": "Request structured human input",
-    "description": "Create a durable human question or approval card on the current Paperclip task bound to this run; Paperclip renders it and authenticates the response. Use questions with continuationPolicy='wake_assignee' when an answer is needed, including otherwise tool-free chat turns. Supply a stable idempotencyKey and reuse it on retries. When you need several inputs that do not depend on each other's answers, ask them together in one questions card (one questionSet) instead of one card per question; ask a follow-up card only when it depends on an earlier answer. If the user asks for one question at a time, ask only the next unanswered question and wait for its real answer. Never fabricate answers or treat ambiguous clarification as approval. For an ordinary confirmation or checkbox card, record a clear user chat answer with call_api POST /api/issues/{id}/interactions/{interactionId}/resolve-from-comment, using the source commentId and decision (accept/reject), plus explicit selectedOptionIds for checkbox acceptance. Existing resolver permissions still apply; governed tool, secret, and connection approvals are excluded. Question forms retain their dedicated answer workflow. Preserve existing review gates. Call this tool before claiming a question was asked; if creation fails, report the failure. Do not fabricate answer links or Markdown buttons, post duplicate cards, or use call_api to create the card. Use one complete payload.questionSet for text and choice questions. Paperclip generates compatibility questions; see the payload schema for formats.",
+    "description": description,
     "note": null
   },
   "examples": {
@@ -41,6 +43,38 @@ export const requestHumanInputAction = {
         "title": "example",
         "prompt": "example",
         "continuationPolicy": "none"
+      }
+    },
+    "questions": {
+      "idempotencyKey": "question:task:dirty-tree:v1",
+      "interactionKind": "questions",
+      "title": "Choose how to preserve local changes",
+      "prompt": "How should the local changes be handled?",
+      "resolverPolicy": "human_only",
+      "continuationPolicy": "wake_assignee",
+      "payload": {
+        "version": 1,
+        "questionSet": {
+          "schema": "paperclip.question_set.v1",
+          "questions": [
+            {
+              "id": "details",
+              "prompt": "What context should be preserved?",
+              "required": true,
+              "answerMode": "text"
+            },
+            {
+              "id": "resolution",
+              "prompt": "Choose the next action",
+              "required": true,
+              "answerMode": "single_select",
+              "options": [
+                { "id": "preserve", "label": "Preserve the changes before continuing" },
+                { "id": "pause", "label": "Pause without changing files" }
+              ]
+            }
+          ]
+        }
       }
     },
     "scenarioCall": {
@@ -76,7 +110,7 @@ export const requestHumanInputAction = {
       "operationId": "request_human_input",
       "version": 1,
       "title": "Request structured human input",
-      "description": "Create a durable human question or approval card on the current Paperclip task bound to this run; Paperclip renders it and authenticates the response. Use questions with continuationPolicy='wake_assignee' when an answer is needed, including otherwise tool-free chat turns. Supply a stable idempotencyKey and reuse it on retries. When you need several inputs that do not depend on each other's answers, ask them together in one questions card (one questionSet) instead of one card per question; ask a follow-up card only when it depends on an earlier answer. If the user asks for one question at a time, ask only the next unanswered question and wait for its real answer. Never fabricate answers or treat ambiguous clarification as approval. For an ordinary confirmation or checkbox card, record a clear user chat answer with call_api POST /api/issues/{id}/interactions/{interactionId}/resolve-from-comment, using the source commentId and decision (accept/reject), plus explicit selectedOptionIds for checkbox acceptance. Existing resolver permissions still apply; governed tool, secret, and connection approvals are excluded. Question forms retain their dedicated answer workflow. Preserve existing review gates. Call this tool before claiming a question was asked; if creation fails, report the failure. Do not fabricate answer links or Markdown buttons, post duplicate cards, or use call_api to create the card. Use one complete payload.questionSet for text and choice questions. Paperclip generates compatibility questions; see the payload schema for formats.",
+      "description": description,
       "exposure": "always",
       "requiredClaims": [],
       "allowedModes": [

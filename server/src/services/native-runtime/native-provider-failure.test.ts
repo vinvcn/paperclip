@@ -246,13 +246,13 @@ describe("native provider failure observation", () => {
       .toEqual({ provider: "opencode", category: "turn_failed", providerFailureCategory: "overloaded" });
   });
 
-  it("names the OpenCode empty-response failure the driver writes", () => {
+  it.each(["opencode_empty_response", "opencode_tool_input_loop"])("names the OpenCode terminal failure the driver writes: %s", (code) => {
     const observed = createNativeProviderFailureObservation({ kind: "opencode", model });
-    observed.observe({ ...event, payload: { status: "failed", error: {
-      code: "opencode_empty_response", message: "OpenCode ended the turn without a final response.", retryable: false,
+    observed.observe({ ...event, payload: { status: "failed", recoverable: false, error: {
+      code, message: "OpenCode stopped the turn.", retryable: false,
     } } });
     const diagnostic = observed.unclassifiedTurnFailure("turn", terminal);
-    expect(diagnostic).toEqual({ provider: "opencode", category: "turn_failed", runnerFailureCode: "opencode_empty_response" });
+    expect(diagnostic).toEqual({ provider: "opencode", category: "turn_failed", runnerFailureCode: code });
     expect(readNativeTurnFailureDiagnostic(diagnostic)).toEqual(diagnostic);
   });
 

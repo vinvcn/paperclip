@@ -5,7 +5,7 @@ import {
   PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA,
   PRP_COMPLETION_TOOL_DESCRIPTION,
 } from "../../contracts/completion-result.js";
-
+import { requestHumanInputAction } from "../../protocol-actions/request-human-input.js";
 import { canonicalOpenCodeMcpToolName, startOpenCodeMcpBridge, type OpenCodeMcpBridge } from "./mcp-bridge.js";
 
 const bridges: OpenCodeMcpBridge[] = [];
@@ -375,15 +375,47 @@ it("reports admitted schema rejections without invoking handlers or widening aut
   await rpc(bridge, { ...body, params: { name: "unassigned", arguments: [] } });
   expect(rejected).not.toHaveBeenCalled();
   expect(await (await rpc(bridge, body)).json()).toMatchObject({ result: { isError: true } });
-  expect(rejected).toHaveBeenCalledExactlyOnceWith({ tool: "probe", callId: "bad", arguments: [] }, expect.stringContaining("Invalid tool input"));
+  expect(rejected).toHaveBeenCalledExactlyOnceWith({ tool: "probe", callId: "bad", arguments: [] }, expect.stringContaining("Invalid tool input"), "schema_validation");
   expect(handler).not.toHaveBeenCalled();
 });
+it("explains the questionSet repair for a missing question form", async () => {
+  const handler = vi.fn(async () => ({ accepted: true }));
+  const bridge = await startOpenCodeMcpBridge({
+    tools: [{ name: "request_human_input", inputSchema: requestHumanInputAction.live!.descriptor.inputSchema }],
+    handler,
+  });
+  bridges.push(bridge);
+  const rejected = await rpc(bridge, { id: "question", method: "tools/call", params: {
+    name: "request_human_input", arguments: { interactionKind: "questions", idempotencyKey: "q1", title: "Question", prompt: "Choose", payload: { version: 1 } },
+  } });
+  expect(await rejected.json()).toMatchObject({ result: { isError: true, content: [{ text: expect.stringContaining("payload.questionSet") }] } });
+  expect(await (await rpc(bridge, { id: "corrected", method: "tools/call", params: {
+    name: "request_human_input", arguments: {
+      idempotencyKey: "q-1", interactionKind: "questions", title: "Choose", prompt: "Choose", continuationPolicy: "wake_assignee",
+      payload: { version: 1, questionSet: { schema: "paperclip.question_set.v1", questions: [{ id: "next", prompt: "Next?", required: true, answerMode: "text" }] } },
+    } },
+  })).json()).toMatchObject({ result: { content: [{ text: expect.stringContaining("accepted") }] } });
+  expect(handler).toHaveBeenCalledOnce();
+});
+
 it("keeps schema rejection intact when its observer fails", async () => {
   const handler = vi.fn(async () => ({}));
-  const bridge = await startOpenCodeMcpBridge({ handler, onRejectedCall: () => { throw new Error("observer unavailable"); } });
+  const bridge = await startOpenCodeMcpBridge({ handler, onRejectedCall: async () => { throw new Error("observer unavailable"); } });
   bridges.push(bridge);
   expect(await (await rpc(bridge, { id: 1, method: "tools/call", params: { name: "paperclip_finish", arguments: {} } })).json()).toMatchObject({ result: { isError: true } });
   expect(handler).not.toHaveBeenCalled();
+});
+it("keeps an identity conflict intact when its async observer fails", async () => {
+  const handler = vi.fn(async () => ({ accepted: true }));
+  const bridge = await startOpenCodeMcpBridge({
+    tools: [{ name: "probe", inputSchema: { type: "object" } }], handler,
+    onRejectedCall: async () => { throw new Error("observer unavailable"); },
+  });
+  bridges.push(bridge);
+  const body = { id: "same", method: "tools/call", params: { name: "probe", arguments: { name: "first" } } };
+  await rpc(bridge, body);
+  expect(await (await rpc(bridge, { ...body, params: { name: "probe", arguments: { name: "second" } } })).json()).toMatchObject({ result: { isError: true } });
+  expect(handler).toHaveBeenCalledOnce();
 });
 it("reports conflicting request IDs without repeating the accepted action", async () => {
   const handler = vi.fn(async () => ({ accepted: true }));
@@ -394,5 +426,5 @@ it("reports conflicting request IDs without repeating the accepted action", asyn
   await rpc(bridge, body);
   expect(await (await rpc(bridge, { ...body, params: { name: "probe", arguments: { name: "second" } } })).json()).toMatchObject({ result: { isError: true } });
   expect(handler).toHaveBeenCalledOnce();
-  expect(rejected).toHaveBeenCalledExactlyOnceWith({ tool: "probe", callId: "same", arguments: { name: "second" } }, "Duplicate call identity conflict.");
+  expect(rejected).toHaveBeenCalledExactlyOnceWith({ tool: "probe", callId: "same", arguments: { name: "second" } }, "Duplicate call identity conflict.", "call_identity_conflict");
 });

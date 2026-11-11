@@ -245,6 +245,9 @@ export interface OpenCodeServerDriverOptions {
   now?: () => Date;
 }
 
+const OPENCODE_TOOL_INPUT_LOOP_CODE = "opencode_tool_input_loop";
+const OPENCODE_TOOL_INPUT_LOOP_MAX_REJECTIONS = 2;
+
 interface OpenCodeRuntime {
   baseUrl: string;
   authHeader: string;
@@ -430,7 +433,8 @@ export class OpenCodeServerDriver implements HarnessDriver {
           root,
           cwd,
           trace,
-          onRejectedCall: (call, error) => session?.observeRejectedToolCall(call, error),
+          onRejectedCall: async (call, error, kind) => { await session?.observeRejectedToolCall(call, error, kind); },
+          isToolCallBlocked: () => session?.isToolInputLoopStopped ?? false,
           dispatch: (call) => {
             if (session === null)
               throw new Error("OpenCode session is not ready for tool calls");
@@ -586,6 +590,10 @@ class OpenCodeHarnessSession implements HarnessSession {
   #emptyResponseAckTimer: ReturnType<typeof setTimeout> | undefined;
   #interruptedTurnId: string | null = null;
   #pendingToolCalls = 0;
+  #lastSchemaRejection: { tool: string; error: string } | null = null;
+  #consecutiveSchemaRejections = 0;
+  #toolInputLoop = false;
+  #toolInputLoopSettlement: Promise<void> | null = null;
   readonly #runningNativeToolParts = new Set<string>();
   #abort = new AbortController();
 
@@ -765,6 +773,9 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#emptyResponseRecovery = null;
     this.#interruptedTurnId = null;
     this.#runningNativeToolParts.clear();
+    this.#lastSchemaRejection = null;
+    this.#consecutiveSchemaRejections = 0;
+    this.#toolInputLoop = false;
     this.#emit("turn.submitted", {
       envelopeSchema: this.#taskEnvelope.schema,
       text: input.message.text,
@@ -1193,9 +1204,13 @@ class OpenCodeHarnessSession implements HarnessSession {
     );
   }
 
-  observeRejectedToolCall(call: { tool: string; callId: string; arguments: unknown }, error: string): void {
+  get isToolInputLoopStopped(): boolean {
+    return this.#toolInputLoop;
+  }
+
+  async observeRejectedToolCall(call: { tool: string; callId: string; arguments: unknown }, error: string, kind?: "schema_validation" | "call_identity_conflict"): Promise<void> {
     const turnId = this.#activeTurnId;
-    if (!turnId || this.#closed) return;
+    if (!turnId || this.#closed || this.#toolInputLoop) return;
     const itemId = `${call.callId}:rejected:${randomBytes(12).toString("hex")}`;
     this.#emit("item.started", {
       kind: "dynamicToolCall", item: { type: "tool_call", id: itemId, name: call.tool, arguments: call.arguments },
@@ -1203,6 +1218,37 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#emit("item.completed", {
       kind: "dynamicToolCall", item: { type: "tool_result", id: itemId, tool_use_id: itemId, is_error: true, error: redact(error) },
     }, { turnId, itemId });
+    if (kind !== "schema_validation") {
+      this.#lastSchemaRejection = null;
+      this.#consecutiveSchemaRejections = 0;
+      return;
+    }
+    const same = this.#lastSchemaRejection?.tool === call.tool && this.#lastSchemaRejection.error === error;
+    this.#lastSchemaRejection = { tool: call.tool, error };
+    this.#consecutiveSchemaRejections = same ? this.#consecutiveSchemaRejections + 1 : 1;
+    if (!same || this.#consecutiveSchemaRejections < OPENCODE_TOOL_INPUT_LOOP_MAX_REJECTIONS) return;
+    const message = `Stopped ${call.tool} after ${OPENCODE_TOOL_INPUT_LOOP_MAX_REJECTIONS} consecutive identical schema validation errors. Correct the tool arguments before resuming; no operation was dispatched.`;
+    this.#toolInputLoop = true;
+    this.#settlePendingRuntimeRequestsForTurn(turnId);
+    const interrupted = api(
+      this.#fetch,
+      this.#runtime,
+      `/session/${encodeURIComponent(this.#providerSessionId)}/abort`,
+      { method: "POST" },
+    ).catch((error) => {
+      this.#emit("harness.diagnostic", {
+        code: "opencode_tool_input_loop_abort_failed",
+        message: redact(String(error), this.#runtime.sensitiveValues),
+      });
+    });
+    this.#toolInputLoopSettlement = interrupted.then(() => undefined);
+    await interrupted;
+    this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
+    this.#emit("turn.failed", {
+      status: "failed",
+      error: { code: OPENCODE_TOOL_INPUT_LOOP_CODE, message, recoverable: false, retryable: false },
+    }, { turnId });
+    this.#activeTurnId = null;
   }
 
   async dispatchTool(call: {
@@ -1211,13 +1257,19 @@ class OpenCodeHarnessSession implements HarnessSession {
     arguments: unknown;
     signal?: AbortSignal;
   }): Promise<unknown> {
+    if (this.#toolInputLoop) throw new Error(OPENCODE_TOOL_INPUT_LOOP_CODE);
     this.#pendingToolCalls += 1;
     this.#clearEmptyResponseAckTimer();
     try { return await this.#dispatchToolCall(call); }
     finally { this.#pendingToolCalls -= 1; }
   }
 
-  async #dispatchToolCall(call: { tool: string; callId: string; arguments: unknown; signal?: AbortSignal }): Promise<unknown> {
+  async #dispatchToolCall(call: {
+    tool: string;
+    callId: string;
+    arguments: unknown;
+    signal?: AbortSignal;
+  }): Promise<unknown> {
     // The authenticated MCP bridge has resolved this against its closed
     // declared catalog. A second prefix strip changes legitimate operation IDs.
     const tool = call.tool;
@@ -1675,6 +1727,11 @@ class OpenCodeHarnessSession implements HarnessSession {
             message: redact(String(error), this.#runtime.sensitiveValues),
             failure,
           });
+          if (this.#toolInputLoop) {
+            await this.#toolInputLoopSettlement;
+            attempts = 0;
+            continue;
+          }
           this.#failActiveTurnOnStreamLoss(failure);
           this.#events.fail(error);
           return;
@@ -1782,6 +1839,7 @@ class OpenCodeHarnessSession implements HarnessSession {
     );
     if (sessionId && sessionId !== this.#providerSessionId) return;
     const turnId = this.#activeTurnId;
+    if (this.#toolInputLoop && (idle || type === "session.error")) return;
     if (this.#emptyResponseRecovery?.responseStarted && type === "session.status" && text(record(properties.status).type) === "busy")
       this.#clearEmptyResponseAckTimer();
     if (type === "question.asked" && turnId) {
@@ -2418,6 +2476,7 @@ async function startRuntime(input: {
   cwd: string;
   trace: ProviderTraceFileSink | null;
   onRejectedCall?: OpenCodeMcpBridgeOptions["onRejectedCall"];
+  isToolCallBlocked?: OpenCodeMcpBridgeOptions["isToolCallBlocked"];
   dispatch: (call: {
     tool: string;
     callId: string;
@@ -2458,6 +2517,7 @@ async function startRuntime(input: {
     tools: input.options.dynamicTools,
     handler: input.dispatch,
     onRejectedCall: input.onRejectedCall,
+    isToolCallBlocked: input.isToolCallBlocked,
     onDiagnostic: input.options.onDiagnostic,
     ...(input.options.durableToolRequests ? { timeoutMs: null } : {}),
   }).catch(async (error) => {
