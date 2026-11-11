@@ -154,6 +154,29 @@ afterAll(async () => {
 });
 
 describe("OpenCodeServerDriver", () => {
+  it("fails repeated identical schema rejections instead of allowing another provider turn", async () => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), "paperclip-tool-input-loop-")); roots.push(root);
+    const handler = vi.fn();
+    const driver = new OpenCodeServerDriver({ model: "openrouter/test-model", command: fixture, runtimeDirectory: root,
+      environment: { PATH: process.env.PATH },
+      dynamicTools: [{ name: "probe", inputSchema: { type: "object" } }],
+      dynamicToolHandler: handler,
+    });
+    const session = await driver.openSession({ runId: "tool-loop", normalizedSessionId: "tool-loop", workingDirectory: root });
+    try {
+      await session.startTurn({ message: { role: "user", text: "schema-loop" } });
+      const events = await collectTurnEvents(session.events());
+      const terminal = events.at(-1);
+      expect(terminal).toMatchObject({ eventType: "turn.failed",
+        payload: { error: { code: "opencode_tool_input_loop", recoverable: false, retryable: false } } });
+      expect(events.filter(event => event.eventType === "item.completed"
+        && (event.payload.item as { is_error?: boolean } | undefined)?.is_error)).toHaveLength(2);
+      expect(handler).not.toHaveBeenCalled();
+      expect(await readFile(join(root, "fake-tool-loop-receipt.json"), "utf8")).toBe("");
+    } finally { await session.close({ reason: "test" }); }
+  });
+
   it("bounds schema rejection errors in events and transcript without changing the MCP receipt", async () => {
     await chmod(fixture, 0o755);
     const root = await mkdtemp(join(tmpdir(), "paperclip-large-rejection-")); roots.push(root);

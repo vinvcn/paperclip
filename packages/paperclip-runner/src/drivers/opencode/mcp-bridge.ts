@@ -286,7 +286,10 @@ async function handleRequest(
       context.diagnoseFinishInput({ input: params.arguments, callId, validationCategory });
     }
     const detail = validator?.errors?.map((error) => `${error.instancePath || "/"} ${error.message ?? "is invalid"}`).join("; ");
-    const error = `Invalid tool input${detail ? `: ${detail}` : "."}`;
+    const remediation = tool === "request_human_input"
+      ? " For interactionKind='questions', send payload.version=1 with payload.questionSet (schema:'paperclip.question_set.v1', questions:[{id,prompt,required,answerMode:'text'}]); choice questions need at least two options. Preserve all required fields and use a stable idempotencyKey; do not retry identical arguments."
+      : "";
+    const error = `Invalid tool input${detail ? `: ${detail}` : "."}${remediation}`;
     try { context.onRejectedCall?.({ tool, callId, arguments: args }, error); } catch {}
     writeRpc(response, id, {
       isError: true,

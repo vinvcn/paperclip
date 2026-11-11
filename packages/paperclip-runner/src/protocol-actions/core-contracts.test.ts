@@ -23,6 +23,14 @@ describe("core Paperclip protocol action contracts", () => {
     expect(action.documentation.description).not.toContain("questions for choices");
   });
 
+  it("includes a complete questions example for text and choice inputs", () => {
+    const action = PAPERCLIP_CORE_PROTOCOL_ACTIONS.find(action => action.id === "request_human_input")!;
+    const example = action.examples.questions;
+    expect(ajv.validate(action.live!.descriptor.inputSchema, example), JSON.stringify(ajv.errors)).toBe(true);
+    expect(action.documentation.description).toContain("examples.questions");
+
+  });
+
   it("tells agents to batch independent questions into one card instead of asking them one by one", () => {
     const action = PAPERCLIP_CORE_PROTOCOL_ACTIONS.find(action => action.id === "request_human_input")!;
     const description = action.live!.descriptor.description;

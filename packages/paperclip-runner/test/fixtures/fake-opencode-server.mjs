@@ -541,6 +541,17 @@ const server = createServer(async (request, response) => {
           emit({ type: "session.idle", properties: { sessionID: session.id } });
           return;
         }
+        if (String(parsedPrompt.message ?? "").includes("schema-loop")) {
+          const receipts = [];
+          for (let attempt = 0; receipts.length < 2; attempt++) receipts.push(await mcpRequest("tools/call", {
+            name: "paperclip_probe", arguments: [],
+          }));
+          await writeFile(join(process.cwd(), "fake-tool-loop-receipt.json"), "");
+          await callTerminalTool(promptPayload);
+          emit({ type: "session.idle", properties: { sessionID: session.id } });
+          return;
+        }
+
         if (String(parsedPrompt.message ?? "").includes("oversized-schema-rejection")) {
           const receipt = await mcpRequest("tools/call", {
             name: "paperclip_large_call", arguments: Array(12_000).fill(0),

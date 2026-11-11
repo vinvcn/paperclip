@@ -5,7 +5,7 @@ import {
   PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA,
   PRP_COMPLETION_TOOL_DESCRIPTION,
 } from "../../contracts/completion-result.js";
-
+import { requestHumanInputAction } from "../../protocol-actions/request-human-input.js";
 import { canonicalOpenCodeMcpToolName, startOpenCodeMcpBridge, type OpenCodeMcpBridge } from "./mcp-bridge.js";
 
 const bridges: OpenCodeMcpBridge[] = [];
@@ -378,7 +378,27 @@ it("reports admitted schema rejections without invoking handlers or widening aut
   expect(rejected).toHaveBeenCalledExactlyOnceWith({ tool: "probe", callId: "bad", arguments: [] }, expect.stringContaining("Invalid tool input"));
   expect(handler).not.toHaveBeenCalled();
 });
-it("keeps schema rejection intact when its observer fails", async () => {
+  it("explains the questionSet repair for a missing question form", async () => {
+    const handler = vi.fn(async () => ({ accepted: true }));
+    const bridge = await startOpenCodeMcpBridge({
+      tools: [{ name: "request_human_input", inputSchema: requestHumanInputAction.live!.descriptor.inputSchema }],
+      handler,
+    });
+    bridges.push(bridge);
+    const rejected = await rpc(bridge, { id: "question", method: "tools/call", params: {
+      name: "request_human_input", arguments: { interactionKind: "questions", idempotencyKey: "q1", title: "Question", prompt: "Choose", payload: { version: 1 } },
+    } });
+    expect(await rejected.json()).toMatchObject({ result: { isError: true, content: [{ text: expect.stringContaining("payload.questionSet") }] } });
+    expect(await (await rpc(bridge, { id: "corrected", method: "tools/call", params: {
+      name: "request_human_input", arguments: {
+        idempotencyKey: "q-1", interactionKind: "questions", title: "Choose", prompt: "Choose", continuationPolicy: "wake_assignee",
+        payload: { version: 1, questionSet: { schema: "paperclip.question_set.v1", questions: [{ id: "next", prompt: "Next?", required: true, answerMode: "text" }] } },
+      } },
+    })).json()).toMatchObject({ result: { content: [{ text: expect.stringContaining("accepted") }] } });
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
+  it("keeps schema rejection intact when its observer fails", async () => {
   const handler = vi.fn(async () => ({}));
   const bridge = await startOpenCodeMcpBridge({ handler, onRejectedCall: () => { throw new Error("observer unavailable"); } });
   bridges.push(bridge);

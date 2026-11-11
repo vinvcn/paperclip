@@ -245,6 +245,9 @@ export interface OpenCodeServerDriverOptions {
   now?: () => Date;
 }
 
+const OPENCODE_TOOL_INPUT_LOOP_CODE = "opencode_tool_input_loop";
+const OPENCODE_TOOL_INPUT_LOOP_MAX_REJECTIONS = 2;
+
 interface OpenCodeRuntime {
   baseUrl: string;
   authHeader: string;
@@ -586,6 +589,9 @@ class OpenCodeHarnessSession implements HarnessSession {
   #emptyResponseAckTimer: ReturnType<typeof setTimeout> | undefined;
   #interruptedTurnId: string | null = null;
   #pendingToolCalls = 0;
+  #lastSchemaRejection: { tool: string; error: string } | null = null;
+  #consecutiveSchemaRejections = 0;
+  #toolInputLoop = false;
   readonly #runningNativeToolParts = new Set<string>();
   #abort = new AbortController();
 
@@ -765,6 +771,9 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#emptyResponseRecovery = null;
     this.#interruptedTurnId = null;
     this.#runningNativeToolParts.clear();
+    this.#lastSchemaRejection = null;
+    this.#consecutiveSchemaRejections = 0;
+    this.#toolInputLoop = false;
     this.#emit("turn.submitted", {
       envelopeSchema: this.#taskEnvelope.schema,
       text: input.message.text,
@@ -1203,6 +1212,26 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#emit("item.completed", {
       kind: "dynamicToolCall", item: { type: "tool_result", id: itemId, tool_use_id: itemId, is_error: true, error: redact(error) },
     }, { turnId, itemId });
+    if (!error.startsWith("Invalid tool input")) {
+      this.#lastSchemaRejection = null;
+      this.#consecutiveSchemaRejections = 0;
+      return;
+    }
+    const same = this.#lastSchemaRejection?.tool === call.tool && this.#lastSchemaRejection.error === error;
+    this.#lastSchemaRejection = { tool: call.tool, error };
+    this.#consecutiveSchemaRejections = same ? this.#consecutiveSchemaRejections + 1 : 1;
+    if (!same || this.#consecutiveSchemaRejections < OPENCODE_TOOL_INPUT_LOOP_MAX_REJECTIONS) return;
+    const message = `Stopped ${call.tool} after ${OPENCODE_TOOL_INPUT_LOOP_MAX_REJECTIONS} consecutive identical schema validation errors. Correct the tool arguments before resuming; no operation was dispatched.`;
+    this.#toolInputLoop = true;
+    this.#interruptedTurnId = turnId;
+    this.#settlePendingRuntimeRequestsForTurn(turnId);
+    this.#emit("turn.failed", {
+      status: "failed",
+      error: { code: OPENCODE_TOOL_INPUT_LOOP_CODE, message, recoverable: false, retryable: false },
+    }, { turnId });
+    this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
+    this.#activeTurnId = null;
+    void this.interrupt({ turnId }).catch(() => undefined);
   }
 
   async dispatchTool(call: {
@@ -1217,7 +1246,12 @@ class OpenCodeHarnessSession implements HarnessSession {
     finally { this.#pendingToolCalls -= 1; }
   }
 
-  async #dispatchToolCall(call: { tool: string; callId: string; arguments: unknown; signal?: AbortSignal }): Promise<unknown> {
+  async #dispatchToolCall(call: {
+    tool: string;
+    callId: string;
+    arguments: unknown;
+    signal?: AbortSignal;
+  }): Promise<unknown> {
     // The authenticated MCP bridge has resolved this against its closed
     // declared catalog. A second prefix strip changes legitimate operation IDs.
     const tool = call.tool;
@@ -2015,6 +2049,9 @@ class OpenCodeHarnessSession implements HarnessSession {
         text(providerErrorData.message, text(providerError.message)) ===
           "Aborted"
       ) {
+        // A repeated invalid-input guard already emitted its authoritative
+        // non-retryable failure. The subsequent abort must not overwrite it.
+        if (this.#toolInputLoop) return;
         // OpenCode reports its normal /abort control path as session.error. That
         // endpoint is also how Paperclip parks a provider turn after a durable
         // governed interaction is created, so presenting it as a provider
