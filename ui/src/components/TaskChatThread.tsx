@@ -2664,7 +2664,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return tailStreaming
       ? liveTps(tailEntries, Date.now())
       : averageTps(tailEntries, tailStartedAtMs, tailFinishedAtMs);
-    // tailEntries is a fresh array each render; tailContentKey tracks its content.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tailRunId, tailContentKey, tailStatus, tailStartedAtMs, tailFinishedAtMs, tailStreaming, tailTick]);
 
