@@ -842,6 +842,13 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     cachedTokens: number;
     costUsd: number;
   } | null = null;
+  const usageTimeline: Array<{
+    ts: string;
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    costUsd: number;
+  }> = [];
   const seenSourceEventIds = new Set<string>();
   const orderedEvents = [...events]
     .sort((a, b) => a.seq - b.seq)
@@ -1398,6 +1405,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
             costUsd: usageSummary.costUsd + next.costUsd,
           }
         : next;
+      if (usageSummary) usageTimeline.push(usageSummary);
       continue;
     }
 
@@ -1516,6 +1524,9 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     entries.push({
       kind: "result",
       ...usageSummary,
+      // Preserve the observation series for live generation speed. The
+      // aggregate remains the run's authoritative token/cost total.
+      usageSamples: usageTimeline,
       text: "",
       subtype: "paperclip_runner_usage",
       isError: false,

@@ -2,6 +2,7 @@ import { groupImageResources } from "./image-resources";
 import { useRef, type ReactNode } from "react";
 import type { ExecutionProjection } from "@paperclipai/shared";
 import { useSecondTick } from "@/hooks/useSecondTick";
+import { formatTps, type TaskChatTps } from "./live-tps";
 import { cn } from "@/lib/utils";
 import type {
   TaskChatItem,
@@ -72,12 +73,14 @@ function RunnerTurnStatus({
   finishedAtMs,
   continuedAfterSteering = false,
   waitingLabel,
+  tps = null,
 }: {
   status: string;
   startedAtMs: number | null;
   finishedAtMs?: number | null;
   continuedAfterSteering?: boolean;
   waitingLabel?: string | null;
+  tps?: TaskChatTps | null;
 }) {
   const terminal = isTerminalRunStatus(status);
   useSecondTick(!terminal && startedAtMs != null);
@@ -106,6 +109,7 @@ function RunnerTurnStatus({
     >
       {continuedAfterSteering ? <span data-conversation-meta="">Continued after steering · </span> : null}
       {label}<span data-conversation-meta="">{suffix}</span>
+      {tps ? <span data-testid="task-chat-tps" data-average={tps.average} data-estimated={tps.estimated} title={tps.average ? "包含 TTFT 的本次 run 平均速度" : "当前生成速度，不含 TTFT"}> · {tps.average ? "平均 " : ""}{formatTps(tps.value)}{tps.estimated ? "（估算）" : ""}</span> : null}
     </span>
   );
 }
@@ -129,6 +133,7 @@ interface RunnerHeaderProps {
   startedAtMs: number | null;
   finishedAtMs?: number | null;
   continuedAfterSteering?: boolean;
+  tps?: TaskChatTps | null;
 }
 
 function runnerWaitingLabel({ runId, status, execution, preparationLabel }: RunnerHeaderProps) {
@@ -143,7 +148,7 @@ export function TaskChatRunnerHeader({ statusContent, ...props }: RunnerHeaderPr
   return <div className="flex min-h-8 min-w-0 items-center gap-2 pb-1 pt-2" data-testid="task-chat-runner-identity-row">
     {props.agentName ? <TaskChatAgentIdentity agentName={props.agentName} agentIcon={props.agentIcon} agent={props.agent} /> : null}
     {statusContent ?? <RunnerTurnStatus status={props.status} startedAtMs={props.startedAtMs} finishedAtMs={props.finishedAtMs}
-      continuedAfterSteering={props.continuedAfterSteering} waitingLabel={runnerWaitingLabel(props)} />}
+      continuedAfterSteering={props.continuedAfterSteering} waitingLabel={runnerWaitingLabel(props)} tps={props.tps} />}
   </div>;
 }
 
@@ -164,6 +169,7 @@ export function TaskChatRunnerTurn({
   waitSummary = null,
   continuedAfterSteering = false,
   showHeader = true,
+  tps = null,
   onRuntimeRequestDecision,
 }: {
   /** Stable identity used to clear replay-latched final text for the next turn. */
@@ -192,6 +198,7 @@ export function TaskChatRunnerTurn({
   continuedAfterSteering?: boolean;
   /** The task thread keeps a shared header across native and legacy discovery. */
   showHeader?: boolean;
+  tps?: TaskChatTps | null;
   onRuntimeRequestDecision?: (
     item: TaskChatRuntimeRequestItem,
     decision: TaskChatRuntimeRequestDecision,
@@ -258,7 +265,7 @@ export function TaskChatRunnerTurn({
     >
       {showHeader ? <TaskChatRunnerHeader runId={runId} agentName={agentName} agentIcon={agentIcon} agent={agent}
         status={status} execution={execution} preparationLabel={preparationLabel} startedAtMs={startedAtMs}
-        finishedAtMs={finishedAtMs} continuedAfterSteering={continuedAfterSteering} /> : null}
+        finishedAtMs={finishedAtMs} continuedAfterSteering={continuedAfterSteering} tps={tps} /> : null}
       <TaskChatRunHealthBanner failures={mcpStartupFailures} />
       {activityUnavailable ? (
         <div

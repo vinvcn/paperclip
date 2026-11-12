@@ -30,6 +30,7 @@ import { keepPreviousDataForSameCompany } from "../lib/query-placeholder-data";
 import { cn, formatCents, formatDateTime, formatDurationMs, formatTokens, providerDisplayName } from "../lib/utils";
 import { UsageTokensChart } from "./usage/UsageTokensChart";
 import type { UsageRequestLogPage, UsageRequestLogRow, UsageSummary } from "@paperclipai/shared";
+import { formatTps, requestTps } from "@/components/task-chat/live-tps";
 
 const NO_COMPANY = "__none__";
 
@@ -742,7 +743,9 @@ export function Usage() {
                             <th scope="col" className="px-4 py-2 text-left font-medium">Key</th>
                             <th scope="col" className="px-4 py-2 text-right font-medium">Cost</th>
                             <th scope="col" className="px-4 py-2 text-right font-medium">Status</th>
-                            <th scope="col" className="py-2 pl-4 text-right font-medium">Duration</th>
+                            <th scope="col" className="px-4 py-2 text-right font-medium">TTFT</th>
+                            <th scope="col" className="px-4 py-2 text-right font-medium">Total time</th>
+                            <th scope="col" className="py-2 pl-4 text-right font-medium">TPS</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -765,8 +768,14 @@ export function Usage() {
                               <td className={`px-4 py-3 text-right tabular-nums${row.httpStatus != null && row.httpStatus >= 400 && row.httpStatus < 600 ? " text-destructive" : ""}`}>
                                 {formatRequestStatus(row.httpStatus)}
                               </td>
-                              <td className="whitespace-nowrap py-3 pl-4 text-right tabular-nums">
+                              <td className="whitespace-nowrap px-4 py-3 text-right tabular-nums">
+                                {formatRequestDuration(row.ttftMs)}
+                              </td>
+                              <td className="whitespace-nowrap px-4 py-3 text-right tabular-nums">
                                 {formatRequestDuration(row.durationMs)}
+                              </td>
+                              <td className="whitespace-nowrap py-3 pl-4 text-right tabular-nums">
+                                {requestTps(row) == null ? "—" : formatTps(requestTps(row)!)}
                               </td>
                             </tr>
                           ))}

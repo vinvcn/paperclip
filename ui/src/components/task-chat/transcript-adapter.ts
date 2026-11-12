@@ -2466,6 +2466,10 @@ export function coalesceSettledTurns(
           items: [...held.items, ...item.items],
           ...(mcpStartupFailures ? { mcpStartupFailures } : {}),
           finalResponse: item.finalResponse ?? held.finalResponse,
+          // Coalescing changes presentation only: retain the latest run's
+          // full-run average rather than combining two runs' TPS.
+          tpsLabel: item.tpsLabel ?? held.tpsLabel,
+          tpsEstimated: item.tpsEstimated,
           animateFold: held.animateFold || item.animateFold || undefined,
           summary: buildMergedTurnSummary(parts),
         });

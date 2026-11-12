@@ -251,7 +251,7 @@ function expectLocationParams(pairs: Record<string, string>) {
     });
 
     const headers = [...container.querySelectorAll("th[scope=col]")].map((th) => th.textContent);
-    expect(headers).toEqual(["Time", "App", "Provider", "Model", "Key", "Cost", "Status", "Duration"]);
+    expect(headers).toEqual(["Time", "App", "Provider", "Model", "Key", "Cost", "Status", "TTFT", "Total time", "TPS"]);
 
     const [first, second] = [...container.querySelectorAll("tbody tr")];
     // Times render in the browser's local timezone via the shared date formatter.
@@ -386,7 +386,9 @@ function expectLocationParams(pairs: Record<string, string>) {
     const cells = [...container.querySelectorAll("tbody tr td")].map((td) => td.textContent);
     expect(cells[5]).toBe("Unpriced");
     expect(cells[6]).toBe("—");
-    expect(cells[7]).toBe("—");
+    expect(cells[8]).toBe("—");
+    expect(cells[7]).toBe("210ms");
+    expect(cells[9]).toBe("—");
   });
 
   it("shows the explanatory empty state when no requests were observed", async () => {

@@ -110,6 +110,7 @@ export function TaskChatTurn({
                 : "Worked"}
           </span> : null}
         </div> : null}
+        {item.tpsLabel ? <span className="text-xs text-muted-foreground/60" data-testid="task-chat-tps" data-average="true" data-estimated={item.tpsEstimated} title="包含 TTFT 的本次 run 平均速度"> · 平均 {item.tpsLabel}{item.tpsEstimated ? "（估算）" : ""}</span> : null}
         <TaskChatRunHealthBanner failures={item.mcpStartupFailures ?? []} />
         {item.items.length > 0 ? (
           <div
@@ -215,6 +216,7 @@ export function TaskChatTurn({
             ? "Stopped"
             : "Worked"}
       </span>
+      {item.tpsLabel ? <span className="whitespace-nowrap text-xs text-muted-foreground/60" data-testid="task-chat-tps" data-average="true" data-estimated={item.tpsEstimated} title="包含 TTFT 的本次 run 平均速度"> · 平均 {item.tpsLabel}{item.tpsEstimated ? "（估算）" : ""}</span> : null}
       {!item.standaloneHeader && turnSummaryMetrics(item.summary) ? (
         // Time/tools/tokens is demoted, not deleted (PAP-502): it stays in the
         // DOM (and the accessible tree) but fades in only on hover/focus so the
