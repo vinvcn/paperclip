@@ -10,6 +10,7 @@ import {
   recordIssueDetailReadiness,
 } from "@/lib/issue-detail-performance";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import type { TranscriptEntry } from "@/adapters";
 import { workspaceRestoreMarkerDetail } from "@/lib/workspace-restore-marker";
 import { credentialAccessNotice } from "@/lib/credential-access-notice";
 import { keyPoolFailureMarkerCopy, keyPoolFailureMarkerLabel, keyPoolFailureMarkerSnapshot } from "@/lib/key-pool-failure-marker";
@@ -152,7 +153,7 @@ import { issuesApi } from "@/api/issues";
 import { queryKeys } from "@/lib/queryKeys";
 import { useQueryClient } from "@tanstack/react-query";
 import { TaskChatPresentationProvider } from "@/components/task-chat/presentation-mode";
-import { averageTps, formatTps, liveTps } from "@/components/task-chat/live-tps";
+import { averageTps, liveTps } from "@/components/task-chat/live-tps";
 import { useSecondTick } from "@/hooks/useSecondTick";
 import { isRunStopConfirmed } from "@/lib/wait-for-stopped-runs";
 
@@ -1620,6 +1621,30 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // heavy assembly memo doesn't recompute on every parent render.
   const hasBrief = Boolean(issueBrief);
 
+  const settledTpsCacheRef = useRef(new Map<string, {
+    entries: readonly TranscriptEntry[];
+    startedAtMs: number | null;
+    finishedAtMs: number | null;
+    tps: ReturnType<typeof averageTps>;
+  }>());
+  const settledTpsByRun = useMemo(() => {
+    const result = new Map<string, ReturnType<typeof averageTps>>();
+    for (const run of runs) {
+      if (!isTerminalRunStatus(run.status) || liveRun?.id === run.id) continue;
+      const meta = linkedRunMetaById.get(run.id);
+      const entries = transcriptByRun.get(run.id) ?? [];
+      const startedAtMs = meta?.startedAt ? toMs(meta.startedAt) : null;
+      const finishedAtMs = meta?.finishedAt ? toMs(meta.finishedAt) : null;
+      const cached = settledTpsCacheRef.current.get(run.id);
+      const tps = cached && cached.entries === entries && cached.startedAtMs === startedAtMs && cached.finishedAtMs === finishedAtMs
+        ? cached.tps
+        : averageTps(entries, startedAtMs, finishedAtMs);
+      settledTpsCacheRef.current.set(run.id, { entries, startedAtMs, finishedAtMs, tps });
+      result.set(run.id, tps);
+    }
+    return result;
+  }, [runs, transcriptByRun, linkedRunMetaById, liveRun]);
+
   const { items, settledRunIds, settledReplyRunIds } = useMemo<{
     items: TaskChatItem[];
     settledRunIds: Set<string>;
@@ -1674,9 +1699,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       if (liveRun && source.id === liveRun.id) continue;
       const entries = transcriptByRun.get(source.id) ?? [];
       const meta = linkedRunMetaById.get(source.id);
-      const settledStartedAtMs = meta?.startedAt ? toMs(meta.startedAt) : null;
-      const settledFinishedAtMs = meta?.finishedAt ? toMs(meta.finishedAt) : null;
-      const settledTps = averageTps(entries, settledStartedAtMs, settledFinishedAtMs);
+      const settledTps = settledTpsByRun.get(source.id) ?? null;
       const credentialAccess = credentialAccessNotice(meta ? {
         ...meta,
         agentName: meta.agentName || agentMap?.get(meta.agentId)?.name,
@@ -2029,8 +2052,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 ? agentMap?.get(meta.agentId)?.icon
                 : undefined,
               standaloneHeader: true,
-              tpsLabel: settledTps ? formatTps(settledTps.value) : undefined,
-              tpsEstimated: settledTps?.estimated,
+              tps: settledTps,
               animateFold: liveSeenRef.current.has(source.id),
               items: [],
               finalResponse: paperclipRunnerFinalResponse([], {
@@ -2249,10 +2271,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               ? agentMap?.get(meta.agentId)?.icon
               : undefined,
             standaloneHeader: sourceIsPaperclipRunner,
-            // The final average belongs to the whole run, not a steering
-            // segment. Keep it on the last segment only.
-            tpsLabel: segmentIndex === lastPopulatedSegmentIndex ? settledTps ? formatTps(settledTps.value) : undefined : undefined,
-            tpsEstimated: settledTps?.estimated,
+            tps: segmentIndex === lastPopulatedSegmentIndex ? settledTps : null,
             continuedAfterSteering: sourceIsPaperclipRunner && segmentIndex > 0,
             animateFold: liveSeenRef.current.has(source.id),
             items: children,
@@ -2431,6 +2450,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     runs,
     liveRun,
     transcriptByRun,
+    settledTpsByRun,
     terminalHydratedRunIds,
     linkedRunMetaById,
     lastCommentIdByRun,
@@ -2637,9 +2657,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [tailRunId, tailContentKey],
   );
-  // TPS uses a live window while working and the full run (including TTFT)
-  // once terminal. Reuse the transcript content key for the scan; the shared
-  // second ticker updates the fallback without rescanning every second.
   const tailTick = useSecondTick(Boolean(tailRunId && !isTerminalRunStatus(tailStatus)));
   const tailTps = useMemo(() => {
     if (!tailRunId || !tailStreaming && !isTerminalRunStatus(tailStatus)) return null;

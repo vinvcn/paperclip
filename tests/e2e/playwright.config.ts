@@ -77,8 +77,6 @@ export default defineConfig({
     stderr: "pipe",
     env: {
       ...process.env,
-      // Keep the host's managed-install shim out of this source-checkout
-      // instance. The install doctor resolves its shim through HOME.
       HOME: PAPERCLIP_HOME,
       NODE_ENV: "test",
       PAPERCLIP_UI_DEV_MIDDLEWARE: "false",

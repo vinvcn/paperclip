@@ -179,8 +179,6 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
         const incoming: HeartbeatRunEvent[] = [];
         for (;;) {
           const page = await readTranscriptRequest(
-            // A visible live run needs provider usage for its current speed;
-            // the compact conversation endpoint intentionally filters it out.
             (signal) => (run.conversationOnly && !needsLiveUsage ? heartbeatsApi.conversationEvents : heartbeatsApi.events)(run.id, cursor, EVENT_PAGE_SIZE, { signal }),
             controller.signal,
           );

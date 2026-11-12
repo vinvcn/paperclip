@@ -30,6 +30,7 @@ import { CoordinatorPresentation } from "./coordinator/CoordinatorPresentation";
 import type { HeartbeatRunEvent } from "@paperclipai/shared";
 import type { HeartbeatRun } from "@paperclipai/shared";
 import { waitForStoppedRuns } from "@/lib/wait-for-stopped-runs";
+import * as liveTpsModule from "./task-chat/live-tps";
 
 const transcriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
@@ -2092,6 +2093,36 @@ describe("TaskChatThread runtime transcript selection", () => {
       container.querySelector('[data-testid="task-chat-final-response"]')
         ?.textContent,
     ).toContain("Same text.");
+  });
+
+  it("computes settled TPS once per run across 300 realistic transcript histories", () => {
+    const linkedRuns = Array.from({ length: 300 }, (_, index) => {
+      const runId = `settled-${index}`;
+      nativeTranscriptState.transcriptByRun.set(runId, [
+        { kind: "assistant", ts: "2026-08-25T18:00:01.000Z", text: `Saved answer ${index}`, channel: "progress" },
+        { kind: "result", ts: "2026-08-25T18:00:09.000Z", text: "", inputTokens: 5, outputTokens: 120,
+          cachedTokens: 0, costUsd: 0, subtype: "paperclip_runner_usage", isError: false, errors: [] },
+      ]);
+      return { runId: `settled-${index}`, runtimeMode: "native" as const, status: "succeeded",
+        agentId: `agent-${index}`, agentName: `Runner ${index}`, adapterType: "paperclip_runner",
+        createdAt: "2026-08-25T18:00:00.000Z", startedAt: "2026-08-25T18:00:00.000Z",
+        finishedAt: "2026-08-25T18:00:10.000Z" };
+    });
+    const props = { comments: [], onAdd: async () => {}, linkedRuns };
+    let calculations = 0;
+    const calculate = liveTpsModule.averageTps;
+    vi.spyOn(liveTpsModule, "averageTps").mockImplementation((...args) => {
+      calculations += 1;
+      if (calculations > 300) throw new Error("Unchanged history triggered another settled TPS scan");
+      return calculate(...args);
+    });
+    render(<TaskChatThread {...props} />);
+    expect(calculations).toBe(300);
+    expect(container.textContent).toContain("平均 12.0 TPS");
+    for (let tick = 0; tick < 3; tick++) {
+      render(<TaskChatThread {...props} />);
+      expect(container.querySelectorAll('[data-testid="task-chat-tps"]')).toHaveLength(300);
+    }
   });
 
   it("recomputes a runner turn when only usage totals change", () => {

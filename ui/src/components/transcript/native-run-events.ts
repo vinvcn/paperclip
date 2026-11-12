@@ -1524,8 +1524,6 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     entries.push({
       kind: "result",
       ...usageSummary,
-      // Preserve the observation series for live generation speed. The
-      // aggregate remains the run's authoritative token/cost total.
       usageSamples: usageTimeline,
       text: "",
       subtype: "paperclip_runner_usage",

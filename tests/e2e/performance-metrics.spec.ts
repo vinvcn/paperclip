@@ -98,8 +98,6 @@ test("Task chat shows a live TPS and a frozen full-run average with TTFT", async
     const rows = await db.select({ seq: heartbeatRunEvents.seq }).from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
     return rows.length;
   }, { timeout: 10_000 }).toBe(3);
-  // This fixture changes the durable event store directly, not the runner's
-  // websocket transport. Re-read the persisted history like a page reopen.
   await page.goto(`/${company.issuePrefix}/issues/${issue.identifier}`);
   await expect(page.getByTestId("task-chat-tps")).toContainText("45.0 TPS", { timeout: 15_000 });
   await page.screenshot({ path: info.outputPath("chat-live-tps.png"), fullPage: true });

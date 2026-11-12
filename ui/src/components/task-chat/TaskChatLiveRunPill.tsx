@@ -7,7 +7,7 @@ import { formatDurationWords } from "@/lib/issue-chat-messages";
 import { isCommandTool } from "@/lib/transcriptPresentation";
 import { isTerminalRunStatus } from "@/components/task-chat/transcript-adapter";
 import { useTaskChatShimmer } from "./TaskChatShimmer";
-import { formatTps, type TaskChatTps } from "./live-tps";
+import { formatTaskChatTps, type TaskChatTps } from "./live-tps";
 
 /**
  * "ran N commands, called M tools" for the live tail's status pill, counted off
@@ -95,7 +95,7 @@ export function TaskChatLiveRunPill({
       </span>
       {suffix ? <span className="text-xs text-muted-foreground/60">{suffix}</span> : null}
       {toolSummary ? <span className="text-xs text-muted-foreground/40">· {toolSummary}</span> : null}
-      {tps ? <span className="text-xs text-muted-foreground/60" data-testid="task-chat-tps" title={tps.average ? "包含 TTFT 的本次 run 平均速度" : "当前生成速度，不含 TTFT"}>· {tps.average ? "平均 " : ""}{formatTps(tps.value)}{tps.estimated ? "（估算）" : ""}</span> : null}
+      {tps ? <span className="text-xs text-muted-foreground/60" data-testid="task-chat-tps" title={tps.average ? "包含 TTFT 的本次 run 平均速度" : "当前生成速度，不含 TTFT"}>· {formatTaskChatTps(tps)}</span> : null}
     </div>
   );
 }

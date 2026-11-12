@@ -2,7 +2,7 @@ import { groupImageResources } from "./image-resources";
 import { useRef, type ReactNode } from "react";
 import type { ExecutionProjection } from "@paperclipai/shared";
 import { useSecondTick } from "@/hooks/useSecondTick";
-import { formatTps, type TaskChatTps } from "./live-tps";
+import { formatTaskChatTps, type TaskChatTps } from "./live-tps";
 import { cn } from "@/lib/utils";
 import type {
   TaskChatItem,
@@ -109,7 +109,7 @@ function RunnerTurnStatus({
     >
       {continuedAfterSteering ? <span data-conversation-meta="">Continued after steering · </span> : null}
       {label}<span data-conversation-meta="">{suffix}</span>
-      {tps ? <span data-testid="task-chat-tps" data-average={tps.average} data-estimated={tps.estimated} title={tps.average ? "包含 TTFT 的本次 run 平均速度" : "当前生成速度，不含 TTFT"}> · {tps.average ? "平均 " : ""}{formatTps(tps.value)}{tps.estimated ? "（估算）" : ""}</span> : null}
+      {tps ? <span data-testid="task-chat-tps" data-average={tps.average} data-estimated={tps.estimated} title={tps.average ? "包含 TTFT 的本次 run 平均速度" : "当前生成速度，不含 TTFT"}> · {formatTaskChatTps(tps)}</span> : null}
     </span>
   );
 }

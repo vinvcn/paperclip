@@ -14,7 +14,6 @@ function timestamp(value: string): number | null {
   return Number.isFinite(ms) ? ms : null;
 }
 
-/** ASCII ≈4 chars/token; non-ASCII one char/token. Never label this exact. */
 export function estimatedTextTokens(text: string): number {
   const ascii = (text.match(/[\x00-\x7F]/g) ?? []).length;
   return (ascii / 4) + (text.length - ascii);
@@ -31,11 +30,10 @@ export function formatTps(value: number): string {
   return `${value >= 100 ? Math.round(value) : value.toFixed(1)} TPS`;
 }
 
-/**
- * Generation speed excludes TTFT. Native usage entries carry the cumulative
- * run total observed at each usage event; the visible aggregate remains one
- * final result entry. Text fallback uses the latest five-second text window.
- */
+export function formatTaskChatTps(tps: NonNullable<TaskChatTps>): string {
+  return `${tps.average ? "平均 " : ""}${formatTps(tps.value)}${tps.estimated ? "（估算）" : ""}`;
+}
+
 export function liveTps(entries: readonly TranscriptEntry[], nowMs: number): TaskChatTps {
   const samples = entries.flatMap((entry): Array<{ atMs: number; outputTokens: number }> => {
     if (entry.kind !== "result") return [];
@@ -45,7 +43,7 @@ export function liveTps(entries: readonly TranscriptEntry[], nowMs: number): Tas
         return atMs == null ? [] : [{ atMs, outputTokens: sample.outputTokens }];
       });
     }
-    if (entry.subtype === "paperclip.usage") return [{ atMs: timestamp(entry.ts) ?? Number.NaN, outputTokens: entry.outputTokens }];
+
     return [];
   });
   const latest = samples.at(-1);
@@ -74,15 +72,10 @@ export function liveTps(entries: readonly TranscriptEntry[], nowMs: number): Tas
   return { value: textTokens * 1000 / (latestMs - firstMs), estimated: true, average: false };
 }
 
-/** Total output / full run duration, including TTFT. */
 export function averageTps(entries: readonly TranscriptEntry[], startedAtMs: number | null, finishedAtMs: number | null): TaskChatTps {
   if (startedAtMs == null || finishedAtMs == null || finishedAtMs <= startedAtMs) return null;
-  const outputTokens = entries.flatMap((entry): number[] => entry.kind === "result" && (entry.subtype === "paperclip_runner_usage" || entry.subtype === "paperclip.usage") ? [entry.outputTokens] : []).reduce((sum, tokens) => sum + tokens, 0);
+  const outputTokens = entries.flatMap((entry): number[] => entry.kind === "result" && entry.subtype === "paperclip_runner_usage" ? [entry.outputTokens] : []).reduce((sum, tokens) => sum + tokens, 0);
   if (outputTokens > 0) return { value: outputTokens * 1000 / (finishedAtMs - startedAtMs), estimated: false, average: true };
   const textTokens = entries.filter(entry => entry.kind === "assistant" || entry.kind === "thinking").reduce((sum, entry) => sum + estimatedTextTokens(entry.text), 0);
   return textTokens > 0 ? { value: textTokens * 1000 / (finishedAtMs - startedAtMs), estimated: true, average: true } : null;
-}
-
-export function tpsLabel(tps: TaskChatTps): string | undefined {
-  return tps ? `${tps.average ? "平均 " : ""}${formatTps(tps.value)}${tps.estimated ? "（估算）" : ""}` : undefined;
 }

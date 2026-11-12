@@ -22,6 +22,14 @@ describe("live TPS", () => {
     expect(liveTps(entries, Date.parse("2026-11-12T08:00:04Z"))).toEqual({ value: 90 / 2, estimated: false, average: false });
   });
 
+  it("estimates text instead of presenting session-cumulative usage as exact", () => {
+    const entries: TranscriptEntry[] = [
+      { kind: "assistant", ts: "2026-11-12T08:00:00Z", text: "a".repeat(32) },
+      { kind: "result", ts: "2026-11-12T08:00:02Z", text: "", inputTokens: 0, outputTokens: 1000, cachedTokens: 0, costUsd: 0, subtype: "paperclip.usage", isError: false, errors: [] },
+    ];
+    expect(liveTps(entries, Date.parse("2026-11-12T08:00:02Z"))).toEqual({ value: 4, estimated: true, average: false });
+  });
+
   it("falls back to an explicitly estimated text speed", () => {
     expect(liveTps([{ kind: "assistant", ts: "2026-11-12T08:00:00Z", text: "a".repeat(32) }], Date.parse("2026-11-12T08:00:02Z"))).toEqual({ value: 4, estimated: true, average: false });
   });
@@ -45,6 +53,14 @@ describe("run average TPS", () => {
     ];
     expect(averageTps(entries, Date.parse("2026-11-12T08:00:00Z"), Date.parse("2026-11-12T08:00:16Z"))).toEqual({ value: 1120 / 16, estimated: false, average: true });
     expect(liveTps([{ kind: "assistant", ts: "2026-11-12T08:00:04Z", text: "answer" }], Date.parse("2026-11-12T08:00:04Z"))).toBeNull();
+  });
+
+  it("does not count legacy session totals as current-run output", () => {
+    const entries: TranscriptEntry[] = [
+      { kind: "assistant", ts: "2026-11-12T00:00:04Z", text: "a".repeat(64) },
+      { kind: "result", ts: "2026-11-12T00:00:10Z", text: "", inputTokens: 1000, outputTokens: 1000, cachedTokens: 0, costUsd: 0, subtype: "paperclip.usage", isError: false, errors: [] },
+    ];
+    expect(averageTps(entries, 0, 16_000)).toEqual({ value: 1, estimated: true, average: true });
   });
 
   it("marks the text-derived final average as estimated", () => {
