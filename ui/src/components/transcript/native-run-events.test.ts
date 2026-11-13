@@ -832,6 +832,10 @@ describe("nativeRunEventsToTranscript", () => {
         outputTokens: 5,
         cachedTokens: 3,
         costUsd: 0.015,
+        usageSamples: [
+          expect.objectContaining({ outputTokens: 3 }),
+          expect.objectContaining({ outputTokens: 5 }),
+        ],
       }),
     ]);
   });

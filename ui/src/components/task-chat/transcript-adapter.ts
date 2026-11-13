@@ -2466,6 +2466,7 @@ export function coalesceSettledTurns(
           items: [...held.items, ...item.items],
           ...(mcpStartupFailures ? { mcpStartupFailures } : {}),
           finalResponse: item.finalResponse ?? held.finalResponse,
+          tps: item.tps,
           animateFold: held.animateFold || item.animateFold || undefined,
           summary: buildMergedTurnSummary(parts),
         });

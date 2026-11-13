@@ -170,15 +170,16 @@ const support = externalDatabase ? { supported: true } : await getEmbeddedPostgr
       event(9, "provider.notice.recorded", { schema: "paperclip.provider.notice.v1", category: "mcp_server_startup_failed",
         summary: "github MCP server failed to start: No such file or directory (os error 2)" }),
       event(10, "provider.notice.recorded", { schema: "paperclip.provider.notice.v1", category: "configWarning", summary: "diagnostic" }),
+      event(11, "usage.reported", { runDeltaAvailable: true, runDelta: { inputTokens: 12, outputTokens: 5 } }),
     ]);
     const service = createHeartbeatRunState(db);
     const first = await service.listEvents(runId, 0, 2, true);
     expect(first.map(e => e.seq)).toEqual([3, 4]);
     const rest = await service.listEvents(runId, 4, 1000, true);
     // A settled run keeps the MCP startup failure that explains missing tools.
-    expect(rest.map(e => e.seq)).toEqual([5, 6, 7, 8, 9]);
+    expect(rest.map(e => e.seq)).toEqual([5, 6, 7, 8, 9, 11]);
     expect(JSON.stringify([...first, ...rest])).not.toContain("large tool arguments");
-    expect(await service.listEvents(runId)).toHaveLength(10);
+    expect(await service.listEvents(runId)).toHaveLength(11);
     await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, status: "succeeded", createdAt: new Date(Date.now() + 1000) });
     const activity = activityService(db);
     await db.insert(activityLog).values(Array.from({ length: 55 }, () => ({

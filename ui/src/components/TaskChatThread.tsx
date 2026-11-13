@@ -10,6 +10,7 @@ import {
   recordIssueDetailReadiness,
 } from "@/lib/issue-detail-performance";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import type { TranscriptEntry } from "@/adapters";
 import { workspaceRestoreMarkerDetail } from "@/lib/workspace-restore-marker";
 import { credentialAccessNotice } from "@/lib/credential-access-notice";
 import { keyPoolFailureMarkerCopy, keyPoolFailureMarkerLabel, keyPoolFailureMarkerSnapshot } from "@/lib/key-pool-failure-marker";
@@ -152,6 +153,8 @@ import { issuesApi } from "@/api/issues";
 import { queryKeys } from "@/lib/queryKeys";
 import { useQueryClient } from "@tanstack/react-query";
 import { TaskChatPresentationProvider } from "@/components/task-chat/presentation-mode";
+import { averageTps, liveTps } from "@/components/task-chat/live-tps";
+import { useSecondTick } from "@/hooks/useSecondTick";
 import { isRunStopConfirmed } from "@/lib/wait-for-stopped-runs";
 
 const EMPTY_BROWSERS: TaskBrowser[] = [];
@@ -1045,9 +1048,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const nativeRuns = useMemo(
     () => transcriptRuns.filter((run) => run.runtimeMode === "native").map((run) => ({
       ...run,
-      conversationOnly: Boolean(props.compactHistory && (!run.createdAt || new Date(run.createdAt).getTime() <= openedAt)),
+      conversationOnly: Boolean(props.compactHistory && deferredTranscriptRunIds.has(run.id) && (!run.createdAt || new Date(run.createdAt).getTime() <= openedAt)),
     })),
-    [transcriptRuns, props.compactHistory, openedAt],
+    [transcriptRuns, props.compactHistory, openedAt, deferredTranscriptRunIds],
   );
   const {
     transcriptByRun: nativeTranscriptByRun,
@@ -1056,7 +1059,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     hydratedRunIds: hydratedNativeRunIds,
     terminalHydratedRunIds,
     retry: retryNativeEvents,
-  } = useNativeRunTranscripts(nativeRuns, { companyId });
+  } = useNativeRunTranscripts(nativeRuns, { companyId, liveUsage: true });
   const logRuns = useMemo(() => transcriptRuns.filter((run) =>
     (!nativeRuns.some((nativeRun) => nativeRun.id === run.id && nativeRun.conversationOnly) ||
       nativeTranscriptErrorsByRun.has(run.id) ||
@@ -1618,6 +1621,30 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // heavy assembly memo doesn't recompute on every parent render.
   const hasBrief = Boolean(issueBrief);
 
+  const settledTpsCacheRef = useRef(new Map<string, {
+    entries: readonly TranscriptEntry[];
+    startedAtMs: number | null;
+    finishedAtMs: number | null;
+    tps: ReturnType<typeof averageTps>;
+  }>());
+  const settledTpsByRun = useMemo(() => {
+    const result = new Map<string, ReturnType<typeof averageTps>>();
+    for (const run of runs) {
+      if (!isTerminalRunStatus(run.status) || liveRun?.id === run.id) continue;
+      const meta = linkedRunMetaById.get(run.id);
+      const entries = transcriptByRun.get(run.id) ?? [];
+      const startedAtMs = meta?.startedAt ? toMs(meta.startedAt) : null;
+      const finishedAtMs = meta?.finishedAt ? toMs(meta.finishedAt) : null;
+      const cached = settledTpsCacheRef.current.get(run.id);
+      const tps = cached && cached.entries === entries && cached.startedAtMs === startedAtMs && cached.finishedAtMs === finishedAtMs
+        ? cached.tps
+        : averageTps(entries, startedAtMs, finishedAtMs);
+      settledTpsCacheRef.current.set(run.id, { entries, startedAtMs, finishedAtMs, tps });
+      result.set(run.id, tps);
+    }
+    return result;
+  }, [runs, transcriptByRun, linkedRunMetaById, liveRun]);
+
   const { items, settledRunIds, settledReplyRunIds } = useMemo<{
     items: TaskChatItem[];
     settledRunIds: Set<string>;
@@ -1672,6 +1699,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       if (liveRun && source.id === liveRun.id) continue;
       const entries = transcriptByRun.get(source.id) ?? [];
       const meta = linkedRunMetaById.get(source.id);
+      const settledTps = settledTpsByRun.get(source.id) ?? null;
       const credentialAccess = credentialAccessNotice(meta ? {
         ...meta,
         agentName: meta.agentName || agentMap?.get(meta.agentId)?.name,
@@ -2024,6 +2052,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 ? agentMap?.get(meta.agentId)?.icon
                 : undefined,
               standaloneHeader: true,
+              tps: settledTps,
               animateFold: liveSeenRef.current.has(source.id),
               items: [],
               finalResponse: paperclipRunnerFinalResponse([], {
@@ -2242,6 +2271,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               ? agentMap?.get(meta.agentId)?.icon
               : undefined,
             standaloneHeader: sourceIsPaperclipRunner,
+            tps: segmentIndex === lastPopulatedSegmentIndex ? settledTps : null,
             continuedAfterSteering: sourceIsPaperclipRunner && segmentIndex > 0,
             animateFold: liveSeenRef.current.has(source.id),
             items: children,
@@ -2420,6 +2450,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     runs,
     liveRun,
     transcriptByRun,
+    settledTpsByRun,
     terminalHydratedRunIds,
     linkedRunMetaById,
     lastCommentIdByRun,
@@ -2626,6 +2657,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [tailRunId, tailContentKey],
   );
+  const tailTick = useSecondTick(Boolean(tailRunId && !isTerminalRunStatus(tailStatus)));
+  const tailTps = useMemo(() => {
+    if (!tailRunId || !tailStreaming && !isTerminalRunStatus(tailStatus)) return null;
+    if (tailStatus === "queued" || !tailEntries.length) return null;
+    return tailStreaming
+      ? liveTps(tailEntries, Date.now())
+      : averageTps(tailEntries, tailStartedAtMs, tailFinishedAtMs);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tailRunId, tailContentKey, tailStatus, tailStartedAtMs, tailFinishedAtMs, tailStreaming, tailTick]);
+
 
   // The tail's clean rows (PAP-463 C1): the streaming transcript parsed through
   // the SAME transcriptToTaskChatItems converter the settled turns use, which
@@ -3451,9 +3492,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                     startedAtMs={tailStartedAtMs}
                                     finishedAtMs={tailFinishedAtMs}
                                     continuedAfterSteering={paperclipRunnerTail && tailTimelineAnchors.length > 0}
+                                    tps={tailTps}
                                     statusContent={tailRunSource?.adapterType !== "paperclip_runner" && !optimisticRunnerStartup ? (
                                       <TaskChatLiveRunPill status={tailStatus} execution={liveRun?.id === tailRunId ? liveRun.execution : null}
-                                        startedAtMs={tailStartedAtMs} finishedAtMs={tailFinishedAtMs} toolSummary={tailToolSummary} />
+                                        startedAtMs={tailStartedAtMs} finishedAtMs={tailFinishedAtMs} toolSummary={tailToolSummary} tps={tailTps} />
                                     ) : undefined}
                                   />
                                   {tailRunSource?.adapterType === "paperclip_runner" ||

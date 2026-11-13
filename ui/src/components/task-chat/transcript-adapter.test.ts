@@ -2571,6 +2571,20 @@ describe("coalesceSettledTurns (PAP-362)", () => {
     ]);
   });
 
+  it("keeps the latest run's complete TPS when settled runs coalesce", () => {
+    const first = turn("run-a:turn", runA, 30_000);
+    const second = turn("run-b:turn", runB, 15_000);
+    expect(first.kind === "turn" && second.kind === "turn").toBe(true);
+    if (first.kind !== "turn" || second.kind !== "turn") return;
+    const latest = { value: 2, estimated: true, average: true } as const;
+    const merged = coalesceSettledTurns([
+      { ...first, tps: { value: 20, estimated: false, average: true } },
+      { ...second, tps: latest },
+    ], metaById);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({ tps: latest });
+  });
+
   it("keeps two rows when a user message sits between the runs", () => {
     const items: TaskChatItem[] = [
       agentBubble("msg-a"),

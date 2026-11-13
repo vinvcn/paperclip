@@ -57,6 +57,7 @@ function compactionUsageCondition(runId: string) {
 export function conversationEventCondition(runId: string) {
   return sql`(
     ${heartbeatRunEvents.eventType} like 'runtime_request.%'
+    or ${heartbeatRunEvents.eventType} = 'usage.reported'
     or (
       ${planWriteCondition(runId)}
     )

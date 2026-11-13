@@ -37,7 +37,7 @@ function isLive(status: string): boolean {
   return status === "queued" || status === "running";
 }
 
-export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource[], options: { companyId?: string | null; enabled?: boolean } = {}) {
+export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource[], options: { companyId?: string | null; enabled?: boolean; liveUsage?: boolean } = {}) {
   const queryClient = useContext(QueryClientContext);
   const { visible } = usePageVisibility();
   const nativeRunsKey = runs
@@ -174,11 +174,12 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
       try {
         const saved = savedHistory.get(run.id);
         let cursor = cursorByRunRef.current.get(run.id) ?? saved?.cursor ?? 0;
+        const needsLiveUsage = options.liveUsage === true && run.conversationOnly === true && isLive(run.status);
         const observedBeforeRead = sequence(run.id).observed;
         const incoming: HeartbeatRunEvent[] = [];
         for (;;) {
           const page = await readTranscriptRequest(
-            (signal) => (run.conversationOnly ? heartbeatsApi.conversationEvents : heartbeatsApi.events)(run.id, cursor, EVENT_PAGE_SIZE, { signal }),
+            (signal) => (run.conversationOnly && !needsLiveUsage ? heartbeatsApi.conversationEvents : heartbeatsApi.events)(run.id, cursor, EVENT_PAGE_SIZE, { signal }),
             controller.signal,
           );
           if (cancelled) return;
@@ -268,7 +269,7 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
       }
       for (const timer of timers.values()) window.clearTimeout(timer);
     };
-  }, [nativeRuns, retryGeneration, visible, options.enabled, options.companyId, stream.healthy, stream.epoch, queryClient, savedHistory]);
+  }, [nativeRuns, retryGeneration, visible, options.enabled, options.companyId, options.liveUsage, stream.healthy, stream.epoch, queryClient, savedHistory]);
 
   const transcriptByRun = useMemo(() => {
     const transcripts = new Map<string, TranscriptEntry[]>();

@@ -37,15 +37,15 @@ function emit(seq: number, signalOnly = false, kind = "agentMessage") {
     : { ...value } };
   for (const listener of listeners) listener(event);
 }
-function Probe({ companyId = "company-1", enabled = true, older = false, compact = false }: { companyId?: string; enabled?: boolean; older?: boolean; compact?: boolean }) {
+function Probe({ companyId = "company-1", enabled = true, older = false, compact = false, liveUsage = false }: { companyId?: string; enabled?: boolean; older?: boolean; compact?: boolean; liveUsage?: boolean }) {
   latest = useNativeRunTranscripts([
     { id: "run-1", status: "running", runtimeMode: "native", conversationOnly: compact },
     ...(older ? [{ id: "older", status: "succeeded", runtimeMode: "native" as const }] : []),
-  ], { companyId, enabled });
+  ], { companyId, enabled, liveUsage });
   return null;
 }
-async function render(companyId = "company-1", enabled = true, older = false, compact = false) {
-  await act(async () => root.render(<LiveEventSubscriptionContext.Provider value={subscription}><Probe companyId={companyId} enabled={enabled} older={older} compact={compact} /></LiveEventSubscriptionContext.Provider>));
+async function render(companyId = "company-1", enabled = true, older = false, compact = false, liveUsage = false) {
+  await act(async () => root.render(<LiveEventSubscriptionContext.Provider value={subscription}><Probe companyId={companyId} enabled={enabled} older={older} compact={compact} liveUsage={liveUsage} /></LiveEventSubscriptionContext.Provider>));
 }
 async function negotiate() {
   await act(async () => {
@@ -64,6 +64,22 @@ beforeEach(() => {
   subscription = { companyId: "company-1", transcripts: store, subscribe(fn) { listeners.add(fn); return () => { listeners.delete(fn); }; } };
 });
 afterEach(async () => { await act(async () => root.unmount()); vi.restoreAllMocks(); vi.useRealTimers(); });
+
+it("reads full events for a compact live run so provider usage stays available", async () => {
+  const usage = row(2);
+  usage.eventType = "usage.reported";
+  const envelope = usage.payload!.prpEvent as Record<string, unknown>;
+  envelope.eventType = "usage.reported";
+  envelope.payload = { runDeltaAvailable: true, runDelta: { inputTokens: 0, outputTokens: 20 } };
+  events.mockResolvedValueOnce([row(1), usage]);
+  await render("company-1", true, false, true, true);
+  expect(events).toHaveBeenCalledWith("run-1", 0, 1_000, expect.anything());
+  expect(conversationEvents).not.toHaveBeenCalled();
+  expect(latest.transcriptByRun.get("run-1")?.find(entry => entry.kind === "result")).toMatchObject({
+    outputTokens: 20,
+    usageSamples: [{ outputTokens: 20 }],
+  });
+});
 
 it("merges history arriving after live output without losing rows or duplicating a sequence", async () => {
   let complete!: (rows: HeartbeatRunEvent[]) => void;
